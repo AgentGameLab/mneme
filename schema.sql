@@ -66,7 +66,19 @@ CREATE TABLE IF NOT EXISTS memories (
   expires_at INTEGER,
 
   -- Soft delete
-  deleted_at INTEGER
+  deleted_at INTEGER,
+
+  -- v2.1: Structured supersede pointer (soft link, no FK cascade)
+  -- See migrations/001-add-superseded-by.sql for the migration source of truth.
+  superseded_by TEXT,
+
+  -- v2.1: Power-law decay weight (periodically updated by runDecayCycle).
+  -- Defaults to 1.0 = no decay yet (backward compatible).
+  decay_score REAL NOT NULL DEFAULT 1.0,
+
+  -- v2.1: Paper trail. On supersede, old content/summary/ts get pushed here.
+  -- Stored as JSON array (SQLite has no JSONB).
+  prior_versions TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE INDEX IF NOT EXISTS idx_mem_type ON memories(memory_type) WHERE deleted_at IS NULL;
@@ -75,6 +87,16 @@ CREATE INDEX IF NOT EXISTS idx_mem_importance ON memories(importance DESC) WHERE
 CREATE INDEX IF NOT EXISTS idx_mem_created ON memories(created_at DESC) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_mem_accessed ON memories(last_accessed DESC) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_mem_source ON memories(source_platform, source) WHERE deleted_at IS NULL;
+
+-- v2.1: Supersede pending-retirement index (paper trail support)
+CREATE INDEX IF NOT EXISTS idx_mem_superseded_by
+  ON memories(superseded_by)
+  WHERE superseded_by IS NOT NULL AND deleted_at IS NULL;
+
+-- v2.1: Surfaced-random cold pool index (importance >= 8 AND 30d untouched AND decay >= 0.3)
+CREATE INDEX IF NOT EXISTS idx_mem_surface_pool
+  ON memories(importance, last_accessed, decay_score)
+  WHERE deleted_at IS NULL AND superseded_by IS NULL AND importance >= 8;
 
 -- FTS5 virtual table (full-text search)
 -- tokenize='simple 0': wangfenjin/simple extension for Chinese word-level segmentation
