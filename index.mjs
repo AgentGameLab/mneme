@@ -22,6 +22,7 @@ import { readFileSync, existsSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
+import { createHash } from 'node:crypto'
 
 const require = createRequire(import.meta.url)
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -472,6 +473,21 @@ export async function recordConversationAsync(msg) {
 
 // ── Memory Storage ──────────────────────────────────────────
 
+// migration 004 (v2.2): 5-min window dedup config
+const DEDUP_WINDOW_MS = 5 * 60_000
+
+// migration 004 (v2.2): event_time accepts ms number, ISO string, or Date object
+function _parseEventTime(v) {
+  if (v == null) return null
+  if (typeof v === 'number' && Number.isFinite(v)) return v
+  if (v instanceof Date) return v.getTime()
+  if (typeof v === 'string') {
+    const ms = Date.parse(v)
+    return Number.isNaN(ms) ? null : ms
+  }
+  return null
+}
+
 /**
  * Store a memory
  * @param {Object} mem
@@ -519,13 +535,47 @@ export function storeMemory(mem) {
     ? mem.supersedes.filter(s => typeof s === 'string' && /^\d+$/.test(s.trim())).map(s => s.trim())
     : []
 
+  // migration 004 (v2.2): content hash + event_time
+  const contentHash = createHash('sha256').update(String(mem.content || '')).digest('hex').slice(0, 16)
+  const eventTime = _parseEventTime(mem.eventTime)
+
+  // migration 004 (v2.2): 5-min window dedup
+  // If the same content was stored within the last DEDUP_WINDOW_MS,
+  // skip INSERT, bump existing row's access_count, return its id.
+  // Avoids retry-store loops bloating the table while preserving the
+  // "told you again" signal via access_count.
+  // Skipped when caller passes supersedes (explicit retraction path takes
+  // precedence) or compressedFrom (compression products are intentionally
+  // new rows even if content overlaps).
+  if (supersedes.length === 0 && compressedFrom.length === 0) {
+    try {
+      const cutoff = now - DEDUP_WINDOW_MS
+      const dup = db.prepare(`
+        SELECT rowid FROM memories
+        WHERE content_hash = ? AND created_at > ?
+          AND deleted_at IS NULL AND superseded_by IS NULL
+        ORDER BY created_at DESC
+        LIMIT 1
+      `).get(contentHash, cutoff)
+      if (dup) {
+        db.prepare(`UPDATE memories SET access_count = access_count + 1, last_accessed = ? WHERE rowid = ?`)
+          .run(now, dup.rowid)
+        log(`storeMemory: dedup hit -> existing rowid=${dup.rowid} (5-min window, access_count bumped)`)
+        return String(dup.rowid)
+      }
+    } catch (e) {
+      // Dedup is best-effort — fall through to insert if the query fails
+      log(`storeMemory: dedup check failed (continuing to insert): ${e.message}`)
+    }
+  }
+
   try {
     const insertStmt = db.prepare(`
       INSERT INTO memories
         (content, summary, memory_type, category, importance, emotional_impact,
          source, source_id, source_platform, tags, metadata, expires_at,
-         compressed_from, is_compressed, memory_level)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         compressed_from, is_compressed, memory_level, content_hash, event_time)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
     const supersedeStmt = db.prepare(
       `UPDATE memories SET superseded_by = ? WHERE rowid = ? AND deleted_at IS NULL AND superseded_by IS NULL`
@@ -557,6 +607,8 @@ export function storeMemory(mem) {
         JSON.stringify(compressedFrom),
         isCompressed,
         memoryLevel,
+        contentHash,    // migration 004 (v2.2)
+        eventTime,      // migration 004 (v2.2)
       )
       newId = info.lastInsertRowid ? String(info.lastInsertRowid) : null
 
@@ -756,7 +808,11 @@ export function recallMemories(opts = {}) {
   const scored = rows.map(row => {
     const ftsScore = row.fts_rank ? Math.min(1, Math.abs(row.fts_rank) / 10) : 0
     const importanceScore = row.importance / 10
-    const age = now - row.created_at
+    // migration 004 (v2.2): age based on event_time when set, else created_at fallback.
+    // Lets temporal queries ("what did I do last June?") match by when the event happened,
+    // not when it was recorded.
+    const effectiveTime = row.event_time != null ? row.event_time : row.created_at
+    const age = now - effectiveTime
     const timeScore = Math.max(0, 1 - age / THIRTY_DAYS_MS)
     const accessScore = Math.min(1, row.access_count / 20)
     const levelWeight = LEVEL_WEIGHT[row.memory_level] || 1.0
@@ -899,7 +955,9 @@ export async function recallMemoriesHybrid(opts = {}) {
   const merged = Array.from(rrfScores.values()).map(({ row, rrf, sources }) => {
     const levelWeight = LEVEL_WEIGHT[row.memory_level] || 1.0
     const importanceScore = row.importance / 10
-    const age = now - row.created_at
+    // migration 004 (v2.2): age based on event_time when set, else created_at fallback
+    const effectiveTime = row.event_time != null ? row.event_time : row.created_at
+    const age = now - effectiveTime
     const timeScore = Math.max(0, 1 - age / THIRTY_DAYS_MS)
     // migration 003: decay_score multiplier (defaults to 1.0 backward-compatible)
     const decay = (row.decay_score != null) ? row.decay_score : 1.0
