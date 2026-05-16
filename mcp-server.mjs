@@ -1,13 +1,25 @@
 #!/usr/bin/env node
 // ============================================================
-// tokenmem MCP Server v2.0.0
-// Exposes recall_memory / store_memory / memory_stats tools
+// tokenmem MCP Server v2.2.0
+// Exposes recall_memory / store_memory / recall_by_id / memory_stats tools
 // On-demand recall for any MCP-compatible AI agent — saves 80-90% memory token costs
+//
+// Transport modes (decided by --transport flag):
+//   default (no flag) — stdio (one server per cc session spawn, legacy)
+//   --transport=http --port=18792 — HTTP Streamable, single daemon-managed
+//     instance shared by all cc clients. Roots out the "N cc sessions ->
+//     N spawned mcp-server processes -> WAL lock contention -> zombie
+//     accumulation" failure mode (2026-04-27 实证 13 个并发 → engram.db 锁
+//     竞争 → MCP disconnected). Required for the "single SQLite connection"
+//     architecture diagram.
 // ============================================================
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { z } from 'zod'
+import http from 'node:http'
+import { randomUUID } from 'node:crypto'
 
 import {
   initMemory,
@@ -21,118 +33,238 @@ import {
   closeMemory,
 } from './index.mjs'
 
-// Initialize memory system
+// Initialize memory system once at startup
 initMemory()
 
-const server = new McpServer({
-  name: 'tokenmem',
-  version: '2.0.0',
-})
+const SERVER_NAME = 'tokenmem'
+const SERVER_VERSION = '2.2.0'
 
-// ── Tool: recall_memory ─────────────────────────────────────
-server.tool(
-  'recall_memory',
-  'Retrieve relevant content from the agent\'s long-term memory. Must call when dealing with personal preferences, past work, project status, relationships, or decisions.',
-  {
-    query: z.string().describe('Query content — describe what you want to find in natural language'),
-    limit: z.number().optional().default(8).describe('Number of results to return, default 8'),
-    category: z.enum(['general', 'people', 'project', 'decision', 'feedback', 'bug', 'relationship', 'skill', 'preference']).optional().describe('Filter by category (optional)'),
-  },
-  async ({ query, limit = 8, category }) => {
-    const ctx = await buildMemoryContext({
-      query,
-      memoryLimit: limit,
-    })
+// ── Factory: each call returns a fresh McpServer with all 4 tools registered ──
+// Why factory: HTTP stateful multi-client mode requires per-session McpServer
+// (SDK design: transport ↔ server is 1:1, sharing tool registry across transports
+// is unsafe). Stdio mode also calls createServer() once for symmetry.
+function createServer() {
+  const s = new McpServer({
+    name: SERVER_NAME,
+    version: SERVER_VERSION,
+  })
 
-    if (!ctx) {
-      return { content: [{ type: 'text', text: '(no relevant memories found)' }] }
+  // ── Tool: recall_memory ─────────────────────────────────────
+  s.tool(
+    'recall_memory',
+    'Retrieve relevant content from the agent\'s long-term memory. Must call when dealing with personal preferences, past work, project status, relationships, or decisions.',
+    {
+      query: z.string().describe('Query content — describe what you want to find in natural language'),
+      limit: z.number().optional().default(8).describe('Number of results to return, default 8'),
+      category: z.enum(['general', 'people', 'project', 'decision', 'feedback', 'bug', 'relationship', 'skill', 'preference']).optional().describe('Filter by category (optional)'),
+    },
+    async ({ query, limit = 8, category }) => {
+      // _source: 'mcp' → recall_log 打点能区分 MCP tool 调用 vs CLI vs hook
+      // _sessionId: HTTP MCP transport 没暴露 cc session id，先 NULL（per-prompt 聚合走时间窗口近似）
+      const ctx = await buildMemoryContext({
+        query,
+        memoryLimit: limit,
+        _source: 'mcp',
+        _sessionId: null,
+      })
+      if (!ctx) {
+        return { content: [{ type: 'text', text: '(no relevant memories found)' }] }
+      }
+      return { content: [{ type: 'text', text: ctx }] }
     }
+  )
 
-    return { content: [{ type: 'text', text: ctx }] }
-  }
-)
+  // ── Tool: store_memory ──────────────────────────────────────
+  s.tool(
+    'store_memory',
+    'Store important information in the agent\'s long-term memory. New preferences, decisions, key facts, and user feedback should be stored promptly. Prefer meta_knowledge level (distilled patterns over concrete steps — higher cross-context reuse value).',
+    {
+      content: z.string().describe('Content to remember'),
+      summary: z.string().optional().describe('One-line summary (optional)'),
+      importance: z.number().min(1).max(10).optional().default(6).describe('Importance 1-10, default 6'),
+      memory_type: z.enum(['working', 'short_term', 'long_term', 'permanent']).optional().default('long_term').describe('Retention level, default long_term'),
+      memory_level: z.enum(['concrete_trace', 'semi_abstract', 'meta_knowledge']).optional().default('semi_abstract').describe('Abstraction level (Memory Transfer Learning): concrete_trace = specific operation logs (low recall weight, prone to negative transfer) / semi_abstract = semi-abstract description (default) / meta_knowledge = patterns/heuristics (high recall weight, most effective cross-context)'),
+      category: z.enum(['general', 'people', 'project', 'decision', 'feedback', 'bug', 'relationship', 'skill', 'preference']).optional().default('general').describe('Category'),
+      tags: z.array(z.string()).optional().describe('Tag list'),
+      supersedes: z.array(z.string()).optional().describe('Old memory rowids this entry replaces (string array, e.g. ["325","348"]). Old rows soft-deleted by next expireMemories run; their content/summary chained into this row\'s prior_versions[] for paper trail. Preferred over the deprecated string convention in summary text.'),
+      event_time: z.union([z.number(), z.string()]).optional().describe('When the event ACTUALLY happened (ISO 8601 string or ms timestamp). Distinct from created_at (when it was recorded). Lets temporal recall match "what did I do last June?" by event_time, not record time. Optional — defaults to NULL (recall falls back to created_at).'),
+    },
+    async ({ content, summary, importance = 6, memory_type = 'long_term', memory_level = 'semi_abstract', category = 'general', tags = [], supersedes, event_time }) => {
+      const id = await storeMemoryAsync({
+        content,
+        summary,
+        importance,
+        memoryType: memory_type,
+        memoryLevel: memory_level,
+        category,
+        source: 'conversation',
+        tags,
+        supersedes,
+        eventTime: event_time,
+      })
 
-// ── Tool: store_memory ──────────────────────────────────────
-server.tool(
-  'store_memory',
-  'Store important information in the agent\'s long-term memory. New preferences, decisions, key facts, and user feedback should be stored promptly. Prefer meta_knowledge level (distilled patterns over concrete steps — higher cross-context reuse value).',
-  {
-    content: z.string().describe('Content to remember'),
-    summary: z.string().optional().describe('One-line summary (optional)'),
-    importance: z.number().min(1).max(10).optional().default(6).describe('Importance 1-10, default 6'),
-    memory_type: z.enum(['working', 'short_term', 'long_term', 'permanent']).optional().default('long_term').describe('Retention level, default long_term'),
-    memory_level: z.enum(['concrete_trace', 'semi_abstract', 'meta_knowledge']).optional().default('semi_abstract').describe('Abstraction level (Memory Transfer Learning): concrete_trace = specific operation logs (low recall weight, prone to negative transfer) / semi_abstract = semi-abstract description (default) / meta_knowledge = patterns/heuristics (high recall weight, most effective cross-context)'),
-    category: z.enum(['general', 'people', 'project', 'decision', 'feedback', 'bug', 'relationship', 'skill', 'preference']).optional().default('general').describe('Category'),
-    tags: z.array(z.string()).optional().describe('Tag list'),
-    event_time: z.union([z.number(), z.string()]).optional().describe('When the event ACTUALLY happened (ISO 8601 string or ms timestamp). Distinct from created_at (when it was recorded). Lets temporal recall match "what did I do last June?" by event_time, not record time. Optional — defaults to NULL (recall falls back to created_at).'),
-  },
-  async ({ content, summary, importance = 6, memory_type = 'long_term', memory_level = 'semi_abstract', category = 'general', tags = [], event_time }) => {
-    const id = await storeMemoryAsync({
-      content,
-      summary,
-      importance,
-      memoryType: memory_type,
-      memoryLevel: memory_level,
-      category,
-      source: 'conversation',
-      tags,
-      eventTime: event_time,
-    })
+      if (!id) {
+        return { content: [{ type: 'text', text: 'Storage failed' }] }
+      }
 
-    if (!id) {
-      return { content: [{ type: 'text', text: 'Storage failed' }] }
+      return { content: [{ type: 'text', text: `Stored memory (id: ${id}, importance: ${importance}, type: ${memory_type}, level: ${memory_level})` }] }
     }
+  )
 
-    return { content: [{ type: 'text', text: `Stored memory (id: ${id}, importance: ${importance}, type: ${memory_type}, level: ${memory_level})` }] }
-  }
-)
-
-// ── Tool: recall_by_id ──────────────────────────────────────
-server.tool(
-  'recall_by_id',
-  'Retrieve specific memories by their rowid(s). Use when you have an id from a previous recall_memory hit and want the full content (not the truncated preview), when you need to inspect a memory before supersede/merge/audit operations, or when following prior_versions[].source_rowid pointers. Returns raw content + summary + full metadata with no truncation; does NOT increment access_count.',
-  {
-    ids: z.array(z.union([z.number(), z.string()])).describe('Memory rowid(s) to fetch (numbers or numeric strings)'),
-    include_deleted: z.boolean().optional().default(false).describe('Include soft-deleted memories. Default false. Use true for audit / prior_versions chain inspection.'),
-  },
-  async ({ ids, include_deleted = false }) => {
-    const rows = getMemoriesByIds(ids, { includeDeleted: include_deleted })
-    if (rows.length === 0) {
-      return { content: [{ type: 'text', text: '(no memories found for the given ids)' }] }
+  // ── Tool: recall_by_id ──────────────────────────────────────
+  s.tool(
+    'recall_by_id',
+    'Retrieve specific memories by their rowid(s). Use when you have an id from a previous recall_memory hit and want the full content (not the truncated preview), when you need to inspect a memory before supersede/merge/audit operations, or when following prior_versions[].source_rowid pointers. Returns raw content + summary + full metadata with no truncation; does NOT increment access_count.',
+    {
+      ids: z.array(z.union([z.number(), z.string()])).describe('Memory rowid(s) to fetch (numbers or numeric strings)'),
+      include_deleted: z.boolean().optional().default(false).describe('Include soft-deleted memories. Default false. Use true for audit / prior_versions chain inspection.'),
+    },
+    async ({ ids, include_deleted = false }) => {
+      const rows = getMemoriesByIds(ids, { includeDeleted: include_deleted })
+      if (rows.length === 0) {
+        return { content: [{ type: 'text', text: '(no memories found for the given ids)' }] }
+      }
+      const text = rows.map(r => {
+        const tags = r.tags?.length ? ` [${r.tags.join(', ')}]` : ''
+        const priors = r.prior_versions?.length ? ` (${r.prior_versions.length} prior versions)` : ''
+        return `[id:${r.rowid} ★${r.importance} ${r.memory_type} ${r.memory_level}]${tags}${priors}\n${r.summary ? '📌 ' + r.summary + '\n' : ''}${r.content}`
+      }).join('\n\n---\n\n')
+      return { content: [{ type: 'text', text }] }
     }
-    const text = rows.map(r => {
-      const tags = r.tags?.length ? ` [${r.tags.join(', ')}]` : ''
-      const priors = r.prior_versions?.length ? ` (${r.prior_versions.length} prior versions)` : ''
-      return `[id:${r.rowid} ★${r.importance} ${r.memory_type} ${r.memory_level}]${tags}${priors}\n${r.summary ? '📌 ' + r.summary + '\n' : ''}${r.content}`
-    }).join('\n\n---\n\n')
-    return { content: [{ type: 'text', text }] }
-  }
-)
+  )
 
-// ── Tool: memory_stats ──────────────────────────────────────
-server.tool(
-  'memory_stats',
-  'View agent memory system statistics: total memories, layer distribution, conversations, active goals, health metrics.',
-  {},
-  async () => {
-    const stats = getMemoryStats()
-    const text = [
-      `Total memories: ${stats.memories.total_active}`,
-      `  working: ${stats.memories.working} | short_term: ${stats.memories.short_term} | long_term: ${stats.memories.long_term} | permanent: ${stats.memories.permanent}`,
-      `Conversations: ${stats.conversations}`,
-      `Active goals: ${stats.activeGoals}`,
-      `Compression pressure: ${stats.compressionPressure} ${stats.compressionPressure > 1 ? '(warning: temporary memories piling up)' : '(normal)'}`,
-      `Dead knowledge (30d unaccessed): ${stats.deadKnowledge}${stats.deadKnowledge > 10 ? ' (consider cleanup)' : ''}`,
-      `Search misses (7d): ${stats.recentSearchMisses}${stats.recentSearchMisses > 5 ? ' (knowledge blind spots detected)' : ''}`,
-      `Vector search: ${stats.embeddingConfigured ? 'configured' : 'not configured (FTS5 only)'}`,
-    ].join('\n')
-    return { content: [{ type: 'text', text }] }
-  }
-)
+  // ── Tool: memory_stats ──────────────────────────────────────
+  s.tool(
+    'memory_stats',
+    'View agent memory system statistics: total memories, layer distribution, conversations, active goals, health metrics.',
+    {},
+    async () => {
+      const stats = getMemoryStats()
+      const text = [
+        `Total memories: ${stats.memories.total_active}`,
+        `  working: ${stats.memories.working} | short_term: ${stats.memories.short_term} | long_term: ${stats.memories.long_term} | permanent: ${stats.memories.permanent}`,
+        `Conversations: ${stats.conversations}`,
+        `Active goals: ${stats.activeGoals}`,
+        `Compression pressure: ${stats.compressionPressure} ${stats.compressionPressure > 1 ? '(warning: temporary memories piling up)' : '(normal)'}`,
+        `Dead knowledge (30d unaccessed): ${stats.deadKnowledge}${stats.deadKnowledge > 10 ? ' (consider cleanup)' : ''}`,
+        `Search misses (7d): ${stats.recentSearchMisses}${stats.recentSearchMisses > 5 ? ' (knowledge blind spots detected)' : ''}`,
+        `Vector search: ${stats.embeddingConfigured ? 'configured' : 'not configured (FTS5 only)'}`,
+      ].join('\n')
+      return { content: [{ type: 'text', text }] }
+    }
+  )
 
-// Start server
-const transport = new StdioServerTransport()
-await server.connect(transport)
+  return s
+}
 
-process.on('SIGINT', () => { closeMemory(); process.exit(0) })
-process.on('SIGTERM', () => { closeMemory(); process.exit(0) })
+// ── Transport selection ─────────────────────────────────────
+// Default: stdio (legacy, one mcp-server per cc session spawn).
+// `--transport=http --port=18792`: HTTP Streamable, single daemon-managed
+// instance shared by all cc clients (recommended for production).
+const args = process.argv.slice(2)
+const useHttp = args.includes('--transport=http')
+const portArg = args.find(a => a.startsWith('--port='))
+const PORT = portArg ? parseInt(portArg.split('=')[1], 10) : 18792
+const HOST = '127.0.0.1' // Hard-bind localhost only (per MCP spec, prevents DNS rebinding)
+
+let httpServer = null
+
+const gracefulExit = (reason) => {
+  try { if (httpServer) httpServer.close() } catch {}
+  try { closeMemory() } catch {}
+  process.exit(0)
+}
+
+if (useHttp) {
+  // ── HTTP transport (stateful, per-session transport map) ───────
+  // Multi-client: each cc client gets its own transport instance keyed by sessionId
+  //   - First init request: sessionIdGenerator assigns a uuid, transport added to map
+  //   - Subsequent requests carry Mcp-Session-Id header → look up transport in map
+  //   - SDK note: stateless mode requires fresh transport per request (high overhead),
+  //     so we go stateful here.
+  const sessions = new Map() // sessionId → { transport, server }
+
+  httpServer = http.createServer(async (req, res) => {
+    // Origin check: only localhost allowed (MCP spec hard requirement)
+    const origin = req.headers.origin
+    if (origin && !/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain' })
+      res.end('Forbidden origin')
+      return
+    }
+    // Health check endpoint (independent of MCP protocol)
+    if (req.url === '/health' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({
+        ok: true, server: SERVER_NAME, version: SERVER_VERSION, transport: 'http',
+        active_sessions: sessions.size,
+      }))
+      return
+    }
+    // MCP endpoint
+    if (req.url === '/mcp' || req.url?.startsWith('/mcp?')) {
+      try {
+        const sessionId = req.headers['mcp-session-id']
+        let entry = sessionId ? sessions.get(sessionId) : null
+
+        if (!entry) {
+          // New session: open transport + connect a fresh server instance
+          // Note: a single McpServer instance shared across multiple transports
+          // is unsafe for tool registry (SDK design), so each session gets a new
+          // server with the same tools registered.
+          const newServer = createServer()
+          const newTransport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => randomUUID(),
+            onsessioninitialized: (newSessionId) => {
+              sessions.set(newSessionId, { transport: newTransport, server: newServer })
+              console.error(`[tokenmem] session opened: ${newSessionId.slice(0, 8)} (total=${sessions.size})`)
+            },
+            onsessionclosed: (closedSessionId) => {
+              sessions.delete(closedSessionId)
+              console.error(`[tokenmem] session closed: ${closedSessionId.slice(0, 8)} (total=${sessions.size})`)
+            },
+          })
+          await newServer.connect(newTransport)
+          entry = { transport: newTransport, server: newServer }
+        }
+        await entry.transport.handleRequest(req, res)
+      } catch (e) {
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'text/plain' })
+          res.end(`MCP transport error: ${e.message}`)
+        }
+        console.error(`[tokenmem] handler error: ${e.message}`)
+      }
+      return
+    }
+    res.writeHead(404, { 'Content-Type': 'text/plain' })
+    res.end('Not Found')
+  })
+
+  httpServer.listen(PORT, HOST, () => {
+    console.error(`[tokenmem] HTTP MCP server listening on http://${HOST}:${PORT}/mcp (PID ${process.pid})`)
+    console.error(`[tokenmem] Health: http://${HOST}:${PORT}/health`)
+  })
+
+  process.on('SIGINT', () => gracefulExit('SIGINT'))
+  process.on('SIGTERM', () => gracefulExit('SIGTERM'))
+  process.on('SIGHUP', () => gracefulExit('SIGHUP'))
+} else {
+  // ── stdio transport (legacy fallback) ────────────────────────
+  const stdioServer = createServer()
+  const transport = new StdioServerTransport()
+  await stdioServer.connect(transport)
+
+  // Guard: cc session exits typically just close stdio without sending signals,
+  // so we must listen for stdin end/close to actively exit. Otherwise mcp-server
+  // processes pile up as zombies (2026-04-27 实证 13 并发 → engram.db 锁竞争 →
+  // MCP disconnected). HTTP mode avoids this entirely (single daemon-managed instance).
+  process.on('SIGINT', () => gracefulExit('SIGINT'))
+  process.on('SIGTERM', () => gracefulExit('SIGTERM'))
+  process.on('SIGHUP', () => gracefulExit('SIGHUP'))
+  process.stdin.on('end', () => gracefulExit('stdin-end'))
+  process.stdin.on('close', () => gracefulExit('stdin-close'))
+  process.stdout.on('error', (err) => {
+    if (err.code === 'EPIPE') gracefulExit('stdout-EPIPE')
+  })
+}
