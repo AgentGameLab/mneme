@@ -175,6 +175,11 @@ const gracefulExit = (reason) => {
   process.exit(0)
 }
 
+// Session idle cleanup (2026-05-27 加，cover onsessionclosed 不 fire 导致的 leak)
+// 短命 cc/hook 进程退出时不通知 server，依赖 idle timeout 兜底
+const SESSION_IDLE_MS = 10 * 60 * 1000   // 10 min 没请求视为 client 已退出
+const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000  // 每分钟扫一次
+
 if (useHttp) {
   // ── HTTP transport (stateful, per-session transport map) ───────
   // Multi-client: each cc client gets its own transport instance keyed by sessionId
@@ -182,7 +187,7 @@ if (useHttp) {
   //   - Subsequent requests carry Mcp-Session-Id header → look up transport in map
   //   - SDK note: stateless mode requires fresh transport per request (high overhead),
   //     so we go stateful here.
-  const sessions = new Map() // sessionId → { transport, server }
+  const sessions = new Map() // sessionId → { transport, server, lastUsed }
 
   httpServer = http.createServer(async (req, res) => {
     // Origin check: only localhost allowed (MCP spec hard requirement)
@@ -194,10 +199,17 @@ if (useHttp) {
     }
     // Health check endpoint (independent of MCP protocol)
     if (req.url === '/health' && req.method === 'GET') {
+      const now = Date.now()
+      let idleCount = 0
+      for (const entry of sessions.values()) {
+        if (now - entry.lastUsed > SESSION_IDLE_MS) idleCount++
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({
         ok: true, server: SERVER_NAME, version: SERVER_VERSION, transport: 'http',
         active_sessions: sessions.size,
+        idle_pending_cleanup: idleCount,
+        idle_timeout_ms: SESSION_IDLE_MS,
       }))
       return
     }
@@ -206,6 +218,7 @@ if (useHttp) {
       try {
         const sessionId = req.headers['mcp-session-id']
         let entry = sessionId ? sessions.get(sessionId) : null
+        if (entry) entry.lastUsed = Date.now()  // 复用 session：刷新活跃时间
 
         if (!entry) {
           // New session: open transport + connect a fresh server instance
@@ -216,7 +229,7 @@ if (useHttp) {
           const newTransport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
             onsessioninitialized: (newSessionId) => {
-              sessions.set(newSessionId, { transport: newTransport, server: newServer })
+              sessions.set(newSessionId, { transport: newTransport, server: newServer, lastUsed: Date.now() })
               console.error(`[tokenmem] session opened: ${newSessionId.slice(0, 8)} (total=${sessions.size})`)
             },
             onsessionclosed: (closedSessionId) => {
@@ -225,7 +238,7 @@ if (useHttp) {
             },
           })
           await newServer.connect(newTransport)
-          entry = { transport: newTransport, server: newServer }
+          entry = { transport: newTransport, server: newServer, lastUsed: Date.now() }
         }
         await entry.transport.handleRequest(req, res)
       } catch (e) {
@@ -244,11 +257,33 @@ if (useHttp) {
   httpServer.listen(PORT, HOST, () => {
     console.error(`[tokenmem] HTTP MCP server listening on http://${HOST}:${PORT}/mcp (PID ${process.pid})`)
     console.error(`[tokenmem] Health: http://${HOST}:${PORT}/health`)
+    console.error(`[tokenmem] Session idle cleanup: ${SESSION_IDLE_MS / 60000}min timeout, scan every ${SESSION_CLEANUP_INTERVAL_MS / 1000}s`)
   })
 
-  process.on('SIGINT', () => gracefulExit('SIGINT'))
-  process.on('SIGTERM', () => gracefulExit('SIGTERM'))
-  process.on('SIGHUP', () => gracefulExit('SIGHUP'))
+  // Idle session cleanup interval — kicks dead transports out of sessions Map
+  const cleanupTimer = setInterval(() => {
+    const now = Date.now()
+    let cleaned = 0
+    for (const [id, entry] of sessions) {
+      if (now - entry.lastUsed > SESSION_IDLE_MS) {
+        try { entry.transport?.close?.() } catch {}
+        sessions.delete(id)
+        cleaned++
+      }
+    }
+    if (cleaned > 0) {
+      console.error(`[tokenmem] idle cleanup: -${cleaned} sessions, ${sessions.size} remaining`)
+    }
+  }, SESSION_CLEANUP_INTERVAL_MS)
+  cleanupTimer.unref?.()  // 不阻止 process exit
+
+  const httpGracefulExit = (reason) => {
+    try { clearInterval(cleanupTimer) } catch {}
+    gracefulExit(reason)
+  }
+  process.on('SIGINT', () => httpGracefulExit('SIGINT'))
+  process.on('SIGTERM', () => httpGracefulExit('SIGTERM'))
+  process.on('SIGHUP', () => httpGracefulExit('SIGHUP'))
 } else {
   // ── stdio transport (legacy fallback) ────────────────────────
   const stdioServer = createServer()
