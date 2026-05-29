@@ -130,15 +130,39 @@ Schema changes are now versioned in `migrations/`:
 
 ```
 migrations/
-├── 001-add-superseded-by.sql       # supersede pointer column (paper trail prerequisite)
-└── 003-add-decay-and-priors.sql    # decay_score + prior_versions + cold-pool index
+├── 001-add-superseded-by.sql        # supersede pointer column (paper trail prerequisite)
+├── 003-add-decay-and-priors.sql     # decay_score + prior_versions + cold-pool index
+└── 004-add-dedup-and-event-time.sql # content_hash dedup + event_time (v2.2)
 ```
 
-Apply in order against your existing `tokenmem.db` (SQLite `ALTER TABLE`). The schema is forward-compatible — pre-migration records get default values (`decay_score = 1.0`, `prior_versions = '[]'`) so existing recall calls keep working.
+Apply in order against an existing `tokenmem.db` for auditing. **Fresh installs don't need to run these by hand** — `initMemory()` applies the column additions inline (idempotent `ALTER TABLE` in try/catch). The schema is forward-compatible — pre-migration records get default values (`decay_score = 1.0`, `prior_versions = '[]'`) so existing recall calls keep working.
 
 ### Stronger Database Backup Protection
 
 `.gitignore` now covers `*.db.bak` / `*.db.bak-*` / `*.db.bak.*` patterns — previous versions only blocked `*.db.backup-*` which let date-suffixed backups slip through accidentally.
+
+---
+
+## What's New in v2.2
+
+### HTTP Streamable Transport (single shared daemon)
+
+In addition to the default stdio transport (one server process per client), tokenmem can now run as a **single long-lived HTTP server** shared by all clients:
+
+```bash
+node mcp-server.mjs --transport=http --port=18792
+```
+
+Why: when N agent sessions each spawn their own stdio `mcp-server` process, they contend on the same SQLite WAL and can pile up into zombie processes. One daemon-managed HTTP instance with a single SQLite connection roots that out. Exposes `GET /health` (returns `embeddingConfigured` + `vectorCoverage` so a supervisor can detect a silently-degraded vector path).
+
+### Store-Time Dedup + `event_time`
+
+- **`content_hash` dedup**: a 5-minute window stops agents that retry-store the same content from bloating the table — the existing row's `access_count` is bumped instead, preserving the "told you already" signal.
+- **`event_time`**: when the event *actually happened*, distinct from `created_at` (when it was recorded) — lets recall do temporal reasoning ("what did I do last June?") even for memories recorded later.
+
+### `recall_by_id`
+
+Fetch exact memories by rowid (CLI + MCP tool), without bumping `access_count` — for citation / audit / "show me memory #N" without polluting the recall-frequency signal.
 
 ---
 
@@ -170,19 +194,20 @@ Apply in order against your existing `tokenmem.db` (SQLite `ALTER TABLE`). The s
 └────────────────────────────────────────────────┘
 ```
 
-**Three MCP tools exposed:**
+**MCP tools exposed:**
 
 | Tool | Purpose |
 |------|---------|
 | `recall_memory(query, limit?, category?)` | Hybrid search: FTS5 + vector KNN + RRF fusion scoring |
 | `store_memory(content, level?, ...)` | Store with abstraction level (meta_knowledge / semi_abstract / concrete_trace) |
-| `memory_stats()` | Stats including compression pressure, dead knowledge, search miss rate |
+| `recall_by_id(ids)` | Fetch exact memories by rowid (no access_count bump) — citation / audit |
+| `memory_stats()` | Stats including compression pressure, dead knowledge, search miss rate, vector coverage |
 
 ---
 
 ## Why MCP Makes This Universal
 
-tokenmem is a standard **MCP server** using stdio transport. Any AI agent or IDE that supports the [Model Context Protocol](https://modelcontextprotocol.io/) can connect to it — no code changes needed.
+tokenmem is a standard **MCP server**, supporting both **stdio** (default, one process per client) and **HTTP Streamable** transport (`--transport=http`, a single shared daemon). Any AI agent or IDE that supports the [Model Context Protocol](https://modelcontextprotocol.io/) can connect to it — no code changes needed.
 
 **Tested with:**
 
