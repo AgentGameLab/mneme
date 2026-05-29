@@ -712,6 +712,45 @@ export async function storeMemoryAsync(mem) {
   return id
 }
 
+/**
+ * [2026-05-29 千夏] Self-heal sweep：给缺 content_vector 的活跃记忆补向量。
+ * 堵漏——绕过 storeMemoryAsync 的写入路径（同步 storeMemory / CLI / staging 批处理）
+ * 会让新记忆永久缺向量、对语义召回失明。MCP server 启动时 fire-and-forget 跑一遍，
+ * 把"宕机/降级期间漏写的 NULL 向量"扫掉。幂等（只扫 NULL）、有 cap、维度校验拒绝混维。
+ * @param {number} limit 单次最多补多少条（防一次性打爆 embedding API）
+ * @returns {Promise<{scanned:number, embedded:number, failed:number, skipped?:string}>}
+ */
+export async function embedMissingVectors(limit = 200) {
+  if (!_embeddingConfig) return { scanned: 0, embedded: 0, failed: 0, skipped: 'no_embedding_config' }
+  const db = getDb()
+  const rows = db.prepare(`
+    SELECT rowid, content FROM memories
+    WHERE deleted_at IS NULL AND (content_vector IS NULL OR content_vector = '')
+    ORDER BY importance DESC, created_at DESC
+    LIMIT ?
+  `).all(limit)
+  if (rows.length === 0) return { scanned: 0, embedded: 0, failed: 0 }
+  const dim = _embeddingConfig.dimension
+  const updateStmt = db.prepare(`UPDATE memories SET content_vector = ? WHERE rowid = ?`)
+  let embedded = 0, failed = 0
+  for (const row of rows) {
+    try {
+      const vec = await generateEmbedding(row.content)
+      if (!vec || vec.length !== dim) { failed++; continue }  // 维度不符 → 拒绝写脏向量
+      updateStmt.run(JSON.stringify(vec), row.rowid)
+      if (_vecLoaded) {
+        try {
+          db.prepare(`INSERT OR REPLACE INTO memories_vec(memory_rowid, embedding) VALUES (?, ?)`)
+            .run(BigInt(row.rowid), new Float32Array(vec))
+        } catch (e) { log(`embedMissingVectors: memories_vec insert failed (${row.rowid}): ${e.message}`) }
+      }
+      embedded++
+    } catch (e) { failed++; log(`embedMissingVectors: rowid ${row.rowid} failed: ${e.message}`) }
+  }
+  if (embedded || failed) log(`embedMissingVectors: scanned ${rows.length}, embedded ${embedded}, failed ${failed}`)
+  return { scanned: rows.length, embedded, failed }
+}
+
 // ── Memory Retrieval (Core! AIRI-style composite scoring) ───
 
 /**
@@ -1502,6 +1541,17 @@ export function getMemoryStats() {
       FROM memories
     `).get()
     const conv = db.prepare(`SELECT COUNT(*) AS count FROM conversations`).get()
+
+    // [2026-05-29 千夏] 向量覆盖率：active 记忆中有 content_vector 的比例。
+    // 用于 /health 主动告警——掉线/漏写时 coverage 会跌，watchdog 据此报警，
+    // 而不是靠人偶然调 memory_stats 才发现"FTS5 only"。
+    const vecCov = db.prepare(`
+      SELECT
+        SUM(CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END) AS active,
+        SUM(CASE WHEN deleted_at IS NULL AND content_vector IS NOT NULL AND content_vector != '' THEN 1 ELSE 0 END) AS with_vec
+      FROM memories
+    `).get()
+    const vectorCoverage = vecCov?.active ? +((vecCov.with_vec || 0) / vecCov.active).toFixed(4) : null
     const goals = db.prepare(`
       SELECT COUNT(*) AS count FROM goals WHERE deleted_at IS NULL AND status IN ('planned', 'in_progress')
     `).get()
@@ -1540,6 +1590,7 @@ export function getMemoryStats() {
       deadKnowledge: deadKnowledge?.count || 0,
       recentSearchMisses: recentMisses,
       embeddingConfigured: !!_embeddingConfig,
+      vectorCoverage,
     }
   } catch (e) {
     return { error: e.message }

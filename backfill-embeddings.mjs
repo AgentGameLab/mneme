@@ -28,12 +28,21 @@ const require = createRequire(import.meta.url)
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
 // ── Load .env.local if present ─────────────────────────────
-const envPath = resolve(__dirname, '.env.local')
-if (existsSync(envPath)) {
-  readFileSync(envPath, 'utf-8').split('\n').filter(l => l && !l.startsWith('#')).forEach(l => {
-    const i = l.indexOf('=')
-    if (i > 0) process.env[l.slice(0, i).trim()] = l.slice(i + 1).trim()
-  })
+// [2026-05-29 千夏 fix] .env.local 在 chinatsu-workspace/（memory/ 上一级），
+// 不在 memory/。原代码 resolve(__dirname,'.env.local') 指向 memory/.env.local（不存在）→
+// 除非 shell 已 export env 否则 EMBEDDING_API_KEY 取不到直接 exit 1。两个路径都试。
+for (const p of [resolve(__dirname, '..', '.env.local'), resolve(__dirname, '.env.local')]) {
+  if (existsSync(p)) {
+    readFileSync(p, 'utf-8').split('\n').filter(l => l && !l.startsWith('#')).forEach(l => {
+      const i = l.indexOf('=')
+      // \r? 兼容 Windows CRLF；已存在的 env 不覆盖
+      if (i > 0) {
+        const k = l.slice(0, i).trim(), v = l.slice(i + 1).replace(/\r$/, '').trim()
+        if (process.env[k] === undefined) process.env[k] = v
+      }
+    })
+    break
+  }
 }
 
 const args = process.argv.slice(2)
@@ -44,7 +53,12 @@ const CONCURRENCY = parseInt(getFlag('--concurrency') || '3', 10)
 const DRY_RUN = hasFlag('--dry-run')
 
 // ── Configuration ───────────────────────────────────────────
-const DB_PATH = process.env.TOKENMEM_DB_PATH || resolve(__dirname, 'tokenmem.db')
+// [2026-05-29 千夏 fix] 与 index.mjs:35-38 同一套解析：优先 engram.db（真实库），
+// 原默认 tokenmem.db 是 fresh-install 占位库（仅 10 行）→ 回填空转。
+const DB_PATH = process.env.TOKENMEM_DB_PATH
+  || (existsSync(resolve(__dirname, 'engram.db'))
+        ? resolve(__dirname, 'engram.db')
+        : resolve(__dirname, 'tokenmem.db'))
 const VEC_EXT = resolve(__dirname, 'lib/sqlite-vec-windows-x64/vec0')
 const EMBED_URL = (process.env.EMBEDDING_API_BASE_URL || '') + '/embeddings'
 const EMBED_KEY = process.env.EMBEDDING_API_KEY

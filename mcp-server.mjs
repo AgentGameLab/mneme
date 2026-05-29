@@ -20,6 +20,9 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { z } from 'zod'
 import http from 'node:http'
 import { randomUUID } from 'node:crypto'
+import { readFileSync, existsSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import {
   initMemory,
@@ -29,12 +32,38 @@ import {
   storeMemoryAsync,
   buildMemoryContext,
   getMemoryStats,
+  embedMissingVectors,
   indexSessionTranscripts,
   closeMemory,
 } from './index.mjs'
 
+// ── Load .env.local BEFORE initMemory() ────────────────────────────────
+// [2026-05-29 千夏] 根因修复：常驻 HTTP MCP server 由 watchdog spawn，
+// 子进程 env 不含 .env.local，导致 initMemory() 读不到 EMBEDDING_API_*，
+// _embeddingConfig=null → 语义召回静默降级回 FTS5（实测掉线 6 周）。
+// daemon.mjs 本来就 load .env.local，但 MCP server 进程是独立的，必须自己 load。
+// 不依赖谁来 spawn / 是否注入 env，进程自给自足最鲁棒。
+// 写法照搬 daemon.mjs:155-164（含 CRLF \r? 兼容）。
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const envPath = resolve(__dirname, '..', '.env.local')  // memory/ 的上一级 = chinatsu-workspace/
+if (existsSync(envPath)) {
+  readFileSync(envPath, 'utf-8').split('\n').forEach(line => {
+    const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*?)\r?$/)
+    // 已存在的 env 优先（允许 launcher 显式覆盖），只补缺失项
+    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2].trim()
+  })
+}
+
 // Initialize memory system once at startup
 initMemory()
+
+// [2026-05-29 千夏] 启动自愈 sweep：补宕机/降级期间漏写的 NULL 向量。
+// fire-and-forget，不阻塞 server 启动；无 embedding 配置时内部直接 no-op。
+// 配合 .env.local 加载（上方）+ store_memory 走 storeMemoryAsync，
+// 让"绕过 async 写入路径导致永久缺向量"这条漏在每次重启时被兜住。
+embedMissingVectors(500).then(r => {
+  if (r.embedded || r.failed) console.error(`[tokenmem] startup self-heal: embedded ${r.embedded}, failed ${r.failed}, scanned ${r.scanned}`)
+}).catch(e => console.error(`[tokenmem] startup self-heal failed: ${e.message}`))
 
 const SERVER_NAME = 'tokenmem'
 const SERVER_VERSION = '2.2.0'
@@ -204,12 +233,18 @@ if (useHttp) {
       for (const entry of sessions.values()) {
         if (now - entry.lastUsed > SESSION_IDLE_MS) idleCount++
       }
+      // [2026-05-29 千夏] 暴露 embedding 配置 + 向量覆盖率，供 watchdog 主动告警
+      // （静默降级元修复：不靠人偶然调 memory_stats 才发现 'FTS5 only'）。
+      let embeddingConfigured = null, vectorCoverage = null
+      try { const st = getMemoryStats(); embeddingConfigured = st.embeddingConfigured; vectorCoverage = st.vectorCoverage } catch {}
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({
         ok: true, server: SERVER_NAME, version: SERVER_VERSION, transport: 'http',
         active_sessions: sessions.size,
         idle_pending_cleanup: idleCount,
         idle_timeout_ms: SESSION_IDLE_MS,
+        embeddingConfigured,
+        vectorCoverage,
       }))
       return
     }
