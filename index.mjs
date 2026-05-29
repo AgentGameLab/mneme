@@ -224,6 +224,20 @@ export function initMemory() {
   try {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_level ON memories(memory_level) WHERE deleted_at IS NULL`)
   } catch {}
+  // Store-time dedup + event_time (migration 004). Inline so fresh installs get them
+  // without manually applying migrations/004 — storeMemory's dedup path needs content_hash.
+  try {
+    db.exec(`ALTER TABLE memories ADD COLUMN content_hash TEXT`)
+    log('Migration: added content_hash column')
+  } catch {}  // already exists
+  try {
+    db.exec(`ALTER TABLE memories ADD COLUMN event_time INTEGER`)
+    log('Migration: added event_time column')
+  } catch {}
+  try {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_content_hash ON memories(content_hash, created_at DESC) WHERE content_hash IS NOT NULL AND deleted_at IS NULL`)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_event_time ON memories(event_time DESC) WHERE event_time IS NOT NULL AND deleted_at IS NULL`)
+  } catch {}
 
   // Vector search virtual table (sqlite-vec)
   // Dimension determined by _embeddingConfig; skip if not available
