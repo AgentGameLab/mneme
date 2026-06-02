@@ -2034,7 +2034,34 @@ if (_isMain) {
   try {
     initMemory()
 
-    if (hasFlag('--stats')) {
+    if (hasFlag('--record-conversation')) {
+      // [2026-06-02 千夏] 桌面 cc 对话入库（chinatsu-record-conversation.mjs hook 调用）。
+      // content 走 stdin。**此 CLI 分支在 2026-05-13 memory 重构时丢失 → 桌面对话入库停摆 17 天**，本次补回。
+      const content = await new Promise((res) => {
+        let buf = ''
+        process.stdin.setEncoding('utf-8')
+        process.stdin.on('data', d => buf += d)
+        process.stdin.on('end', () => res(buf))
+        setTimeout(() => res(buf), 2500)  // stdin 不 end 兜底
+      })
+      const c = (content || '').trim()
+      if (!c) {
+        process.stdout.write('(empty content, skipped)\n')
+      } else {
+        const id = recordConversation({
+          platform: getFlag('--platform') || 'unknown',
+          chatId: getFlag('--chat-id') || 'unknown',
+          messageId: getFlag('--message-id') || null,
+          fromId: getFlag('--from-id') || 'unknown',
+          fromName: getFlag('--from-name') || '',
+          role: getFlag('--role') || 'user',
+          content: c,
+        })
+        process.stdout.write(`recorded conversation: ${id}\n`)
+        if (!id) process.exit(1)  // 让 hook 的 engram_failed 能真实反映失败
+      }
+
+    } else if (hasFlag('--stats')) {
       const stats = getMemoryStats()
       process.stdout.write(JSON.stringify(stats, null, 2) + '\n')
 
