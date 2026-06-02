@@ -117,8 +117,9 @@ function createServer() {
       tags: z.array(z.string()).optional().describe('Tag list'),
       supersedes: z.array(z.string()).optional().describe('Old memory rowids this entry replaces (string array, e.g. ["325","348"]). Old rows soft-deleted by next expireMemories run; their content/summary chained into this row\'s prior_versions[] for paper trail. Preferred over the deprecated string convention in summary text.'),
       event_time: z.union([z.number(), z.string()]).optional().describe('When the event ACTUALLY happened (ISO 8601 string or ms timestamp). Distinct from created_at (when it was recorded). Lets temporal recall match "what did I do last June?" by event_time, not record time. Optional — defaults to NULL (recall falls back to created_at).'),
+      source_conversation_id: z.number().optional().describe('rowid of the source conversation this memory was formed from (links L1 memory back to its L0 conversation for drill-down/citation). Optional.'),
     },
-    async ({ content, summary, importance = 6, memory_type = 'long_term', memory_level = 'semi_abstract', category = 'general', tags = [], supersedes, event_time }) => {
+    async ({ content, summary, importance = 6, memory_type = 'long_term', memory_level = 'semi_abstract', category = 'general', tags = [], supersedes, event_time, source_conversation_id }) => {
       const id = await storeMemoryAsync({
         content,
         summary,
@@ -130,6 +131,7 @@ function createServer() {
         tags,
         supersedes,
         eventTime: event_time,
+        sourceConversationId: source_conversation_id,
       })
 
       if (!id) {

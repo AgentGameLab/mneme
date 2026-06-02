@@ -238,6 +238,15 @@ export function initMemory() {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_content_hash ON memories(content_hash, created_at DESC) WHERE content_hash IS NOT NULL AND deleted_at IS NULL`)
     db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_event_time ON memories(event_time DESC) WHERE event_time IS NOT NULL AND deleted_at IS NULL`)
   } catch {}
+  // migration 006: source_conversation_id — 把一条 L1 记忆链回它形成时的 L0 对话（conversations.rowid）。
+  // 借鉴 Tencent Agent Memory 的「full traceability drill-down」：召回一条记忆能回查原始对话佐证。
+  try {
+    db.exec(`ALTER TABLE memories ADD COLUMN source_conversation_id INTEGER`)
+    log('Migration: added source_conversation_id column')
+  } catch {}  // already exists
+  try {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_source_conv ON memories(source_conversation_id) WHERE source_conversation_id IS NOT NULL`)
+  } catch {}
 
   // Vector search virtual table (sqlite-vec)
   // Dimension determined by _embeddingConfig; skip if not available
@@ -619,8 +628,9 @@ export function storeMemory(mem) {
       INSERT INTO memories
         (content, summary, memory_type, category, importance, emotional_impact,
          source, source_id, source_platform, tags, metadata, expires_at,
-         compressed_from, is_compressed, memory_level, content_hash, event_time)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         compressed_from, is_compressed, memory_level, content_hash, event_time,
+         source_conversation_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
     const supersedeStmt = db.prepare(
       `UPDATE memories SET superseded_by = ? WHERE rowid = ? AND deleted_at IS NULL AND superseded_by IS NULL`
@@ -654,6 +664,8 @@ export function storeMemory(mem) {
         memoryLevel,
         contentHash,    // migration 004 (v2.2)
         eventTime,      // migration 004 (v2.2)
+        // migration 006: 链回来源 L0 对话的 conversations.rowid（Tencent Agent Memory drill-down 借鉴）
+        (mem.sourceConversationId ?? null),
       )
       newId = info.lastInsertRowid ? String(info.lastInsertRowid) : null
 
@@ -1542,6 +1554,54 @@ export function upsertGoal(goal) {
 
 // ── Statistics ───────────────────────────────────────────────
 
+/**
+ * [2026-06-02 千夏] Drill-down：从一条记忆回查它来源的 L0 对话（借鉴 Tencent Agent Memory
+ * 的 full traceability drill-down）。优先用显式 source_conversation_id 链回（取 anchor 所在
+ * chat 的前后时间窗）；没有显式链则按记忆 created_at 做时间窗回退（跨平台近似）。
+ * 桌面 cc 对话入库若停摆则回退可能为空——属实，不假装有来源。
+ * @param {string|number} memoryRowid
+ * @param {object} [opts] { windowMin?: number=10, limit?: number=40 }
+ * @returns {{memory, linked, fallback?, anchor_rowid?, conversations:[]}}
+ */
+export function getSourceConversation(memoryRowid, opts = {}) {
+  const db = getDb()
+  const windowMin = opts.windowMin ?? 10
+  const limit = opts.limit ?? 40
+  const winMs = windowMin * 60_000
+  const mem = db.prepare(
+    `SELECT rowid, summary, source_conversation_id, created_at FROM memories WHERE rowid = ?`
+  ).get(memoryRowid)
+  if (!mem) return { memory: null, linked: false, conversations: [] }
+  const project = (r) => ({
+    rowid: r.rowid, platform: r.platform, chat_id: r.chat_id,
+    from_name: r.from_name, role: r.role,
+    content: (r.content || '').slice(0, 200), created_at: r.created_at,
+  })
+  // 1. 显式链：取 anchor 所在 chat 的前后时间窗
+  if (mem.source_conversation_id) {
+    const anchor = db.prepare(
+      `SELECT rowid, chat_id, created_at FROM conversations WHERE rowid = ?`
+    ).get(mem.source_conversation_id)
+    if (anchor) {
+      const rows = db.prepare(`
+        SELECT rowid, platform, chat_id, from_name, role, content, created_at
+        FROM conversations
+        WHERE chat_id = ? AND created_at BETWEEN ? AND ?
+        ORDER BY created_at ASC, rowid ASC LIMIT ?
+      `).all(anchor.chat_id, anchor.created_at - winMs, anchor.created_at + winMs, limit)
+      return { memory: mem, linked: true, anchor_rowid: anchor.rowid, conversations: rows.map(project) }
+    }
+  }
+  // 2. 时间窗回退（无显式链 / anchor 已丢）
+  const rows = db.prepare(`
+    SELECT rowid, platform, chat_id, from_name, role, content, created_at
+    FROM conversations
+    WHERE created_at BETWEEN ? AND ?
+    ORDER BY created_at ASC, rowid ASC LIMIT ?
+  `).all(mem.created_at - winMs, mem.created_at + winMs, limit)
+  return { memory: mem, linked: false, fallback: 'time-window', conversations: rows.map(project) }
+}
+
 export function getMemoryStats() {
   const db = getDb()
   try {
@@ -2037,6 +2097,26 @@ if (_isMain) {
             const date = new Date(m.created_at).toLocaleDateString()
             process.stdout.write(`[${m.importance}* ${m.memory_type} ${date}] ${m.content.slice(0, 120)}\n`)
           }
+        }
+      }
+
+    } else if (getFlag('--source-conv') !== null) {
+      // drill-down：从记忆回查来源 L0 对话。用法：--source-conv <memory_rowid> [--window 10] [--format json]
+      const rowid = getFlag('--source-conv')
+      const windowMin = parseInt(getFlag('--window') || '10', 10)
+      const format = getFlag('--format') || 'text'
+      const out = getSourceConversation(rowid, { windowMin })
+      if (format === 'json') {
+        process.stdout.write(JSON.stringify(out, null, 2) + '\n')
+      } else if (!out.memory) {
+        process.stdout.write(`(no memory rowid=${rowid})\n`)
+      } else {
+        const tag = out.linked ? `linked (anchor #${out.anchor_rowid})` : `time-window fallback (±${windowMin}min)`
+        process.stdout.write(`记忆 #${out.memory.rowid} 来源对话 [${tag}]: ${out.memory.summary || ''}\n`)
+        if (!out.conversations.length) process.stdout.write(`  (无对应对话——可能桌面对话入库停摆或时间窗内无记录)\n`)
+        for (const c of out.conversations) {
+          const t = new Date(Number(c.created_at)).toISOString().slice(0, 16)
+          process.stdout.write(`  [${t}] (${c.platform}) ${c.from_name || c.role}: ${c.content}\n`)
         }
       }
 
