@@ -99,16 +99,20 @@ CREATE INDEX IF NOT EXISTS idx_mem_surface_pool
   WHERE deleted_at IS NULL AND superseded_by IS NULL AND importance >= 8;
 
 -- FTS5 virtual table (full-text search)
--- tokenize='simple 0': wangfenjin/simple extension for Chinese word-level segmentation
--- Requires loadExtension('libsimple-windows-x64/simple') + jieba_dict(dictPath)
--- Falls back to default FTS5 tokenizer if simple extension is not available
+-- Default tokenize='unicode61' (built-in, zero-dependency — boots on any SQLite,
+-- no extension required; honours design principle #2).
+-- When the wangfenjin/simple extension IS present, index.mjs initMemory() detects
+-- the non-simple tokenizer here and rebuilds this table with tokenize='simple 0'
+-- for Chinese word-level segmentation (jieba). See the "FTS migration" block in
+-- index.mjs. Hardcoding 'simple 0' here breaks fresh installs without the .dll
+-- (CREATE fails -> schema.exec aborts -> every table after this one is never created).
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
   content,
   summary,
   tags,
   content='memories',
   content_rowid='rowid',
-  tokenize='simple 0'
+  tokenize='unicode61'
 );
 
 -- Sync triggers: memories INSERT/DELETE/UPDATE -> FTS index auto-update
@@ -155,12 +159,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_conv_dedup
   WHERE message_id IS NOT NULL;
 
 -- FTS5 conversation search
+-- Default unicode61 (built-in); index.mjs upgrades to 'simple 0' when the
+-- libsimple extension is available. See memories_fts note above.
 CREATE VIRTUAL TABLE IF NOT EXISTS conversations_fts USING fts5(
   content,
   from_name,
   content='conversations',
   content_rowid='rowid',
-  tokenize='simple 0'
+  tokenize='unicode61'
 );
 
 CREATE TRIGGER IF NOT EXISTS trg_conv_fts_insert AFTER INSERT ON conversations BEGIN
