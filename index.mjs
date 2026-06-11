@@ -996,6 +996,12 @@ export async function recallMemoriesHybrid(opts = {}) {
       if (existing) {
         existing.rrf += contribution
         existing.sources.push(source)
+        // First-seen row object wins the merge (usually the FTS row), which lacks
+        // vec_distance — graft it from the vec-list duplicate so downstream
+        // consumers (semantic-inject gating) can threshold on it.
+        if (row.vec_distance != null && existing.row.vec_distance == null) {
+          existing.row.vec_distance = row.vec_distance
+        }
       } else {
         rrfScores.set(rowid, { row, rrf: contribution, sources: [source] })
       }
@@ -1012,9 +1018,15 @@ export async function recallMemoriesHybrid(opts = {}) {
     const effectiveTime = row.event_time != null ? row.event_time : row.created_at
     const age = now - effectiveTime
     const timeScore = Math.max(0, 1 - age / THIRTY_DAYS_MS)
+    // v2.3: HMO-style hit-frequency term (arXiv 2604.01670 Eq.5 ln(1+C) dampening).
+    // Weight 0.05 is deliberately small: RRF's own dynamic range across a candidate
+    // set is only ~0.015 (1/(k+rank) with k=60), so any structural term larger than
+    // ~0.05 would drown relevance entirely. ln + cap also brakes the
+    // recalled -> access_count++ -> ranked-higher feedback loop.
+    const freqScore = Math.min(1, Math.log1p(row.access_count || 0) / Math.log1p(20))
     // migration 003: decay_score multiplier (defaults to 1.0 backward-compatible)
     const decay = (row.decay_score != null) ? row.decay_score : 1.0
-    const score = (rrf * 0.7 + (importanceScore * 0.2 + timeScore * 0.1)) * levelWeight * decay
+    const score = (rrf * 0.7 + (importanceScore * 0.2 + timeScore * 0.1 + freqScore * 0.05)) * levelWeight * decay
     return { ...row, score, rrf, recall_sources: sources }
   })
 
@@ -1870,6 +1882,21 @@ if (_isMain) {
   }
   const hasFlag = (flag) => args.includes(flag)
 
+  // v2.3: CLI self-loads ../.env.local (EMBEDDING_API_* etc.), same as mcp-server.
+  // Hooks spawn this CLI from Claude Code's env, which does NOT carry the embedding
+  // config — without this, recallMemoriesHybrid silently falls back to FTS-only and
+  // every CLI caller loses the vector path (found 2026-06-11: the prompt-recall hook
+  // had never actually run hybrid). Only fills vars that are not already set.
+  try {
+    const envFile = resolve(__dirname, '..', '.env.local')
+    if (existsSync(envFile)) {
+      for (const line of readFileSync(envFile, 'utf-8').split('\n')) {
+        const m = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/)
+        if (m && process.env[m[1]] == null) process.env[m[1]] = m[2].trim()
+      }
+    }
+  } catch { /* env self-load is best-effort; FTS-only fallback still works */ }
+
   try {
     initMemory()
 
@@ -1903,6 +1930,11 @@ if (_isMain) {
 
       if (minImportance > 0) memories = memories.filter(m => (m.importance || 0) >= minImportance)
       if (levelFilter.length > 0) memories = memories.filter(m => levelFilter.includes(m.memory_level))
+      // --require-vec (v2.3): keep only rows with vector evidence, BEFORE the slice.
+      // Chinese char-level FTS OR-matches flood the RRF pool and evict semantic hits
+      // (rank-flatten); semantic-inject callers need the vec rows to survive. With
+      // embedding down this yields 0 rows — fail-closed is correct for inject paths.
+      if (hasFlag('--require-vec')) memories = memories.filter(m => typeof m.vec_distance === 'number')
       memories = memories.slice(0, limit)
 
       if (format === 'json') {
@@ -1916,6 +1948,9 @@ if (_isMain) {
           tags: Array.isArray(m.tags) ? m.tags : [],
           score: typeof m.score === 'number' ? m.score : null,
           created_at: m.created_at,
+          // semantic-inject gating signals (v2.3): which paths hit + raw vec distance
+          recall_sources: Array.isArray(m.recall_sources) ? m.recall_sources : [],
+          vec_distance: typeof m.vec_distance === 'number' ? m.vec_distance : null,
         }))
         process.stdout.write(JSON.stringify({ hits, count: hits.length }) + '\n')
       } else {
