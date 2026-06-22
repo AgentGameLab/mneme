@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ============================================================
-// mneme MCP Server v2.2.0
+// mneme MCP Server v2.4.0
 // Exposes recall_memory / store_memory / recall_by_id / memory_stats tools
 // On-demand recall for any MCP-compatible AI agent — saves 80-90% memory token costs
 //
@@ -66,7 +66,7 @@ embedMissingVectors(500).then(r => {
 }).catch(e => console.error(`[mneme] startup self-heal failed: ${e.message}`))
 
 const SERVER_NAME = 'mneme'
-const SERVER_VERSION = '2.2.0'
+const SERVER_VERSION = '2.4.0'
 
 // ── Factory: each call returns a fresh McpServer with all 4 tools registered ──
 // Why factory: HTTP stateful multi-client mode requires per-session McpServer
@@ -106,7 +106,7 @@ function createServer() {
   // ── Tool: store_memory ──────────────────────────────────────
   s.tool(
     'store_memory',
-    'Store important information in the agent\'s long-term memory. New preferences, decisions, key facts, and user feedback should be stored promptly. Prefer meta_knowledge level (distilled patterns over concrete steps — higher cross-context reuse value).',
+    'Store important information in the agent\'s long-term memory. New preferences, decisions, key facts, and user feedback should be stored promptly. Default to semi_abstract; reserve meta_knowledge for genuinely cross-context heuristics (test: would it help in a completely unrelated project?). Importance is a weak prior, not a ranking lever — true salience emerges from recall frequency. The store surfaces a near-duplicate warning when content closely matches an existing memory; supersede that one instead of duplicating.',
     {
       content: z.string().describe('Content to remember'),
       summary: z.string().optional().describe('One-line summary (optional)'),
@@ -120,6 +120,7 @@ function createServer() {
       source_conversation_id: z.number().optional().describe('rowid of the source conversation this memory was formed from (links L1 memory back to its L0 conversation for drill-down/citation). Optional.'),
     },
     async ({ content, summary, importance = 6, memory_type = 'long_term', memory_level = 'semi_abstract', category = 'general', tags = [], supersedes, event_time, source_conversation_id }) => {
+      const out = {}
       const id = await storeMemoryAsync({
         content,
         summary,
@@ -132,13 +133,20 @@ function createServer() {
         supersedes,
         eventTime: event_time,
         sourceConversationId: source_conversation_id,
-      })
+      }, { out })
 
       if (!id) {
         return { content: [{ type: 'text', text: 'Storage failed' }] }
       }
 
-      return { content: [{ type: 'text', text: `Stored memory (id: ${id}, importance: ${importance}, type: ${memory_type}, level: ${memory_level})` }] }
+      let text = `Stored memory (id: ${id}, importance: ${importance}, type: ${memory_type}, level: ${memory_level})`
+      if (out.nearDuplicates?.length) {
+        const top = out.nearDuplicates.slice(0, 3)
+        text += `\n⚠️ near-duplicate(s) detected — consider superseding instead of a new entry:\n`
+          + top.map(d => `  #${d.id} (cos ${d.cosine}) ${d.summary}`).join('\n')
+          + `\n(if this updates one of them, re-store with supersedes:["${top[0].id}"])`
+      }
+      return { content: [{ type: 'text', text }] }
     }
   )
 

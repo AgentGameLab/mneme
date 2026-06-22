@@ -18,7 +18,7 @@
 // Data file: tokenmem.db (configurable via TOKENMEM_DB_PATH env var)
 // ============================================================
 
-import { readFileSync, existsSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
@@ -732,10 +732,45 @@ export function storeMemory(mem) {
   }
 }
 
+// v2.4 (2026-06-22): store-time near-duplicate write-gate (R3 from the store-time research).
+// DETECTION ONLY — never auto-blocks or auto-supersedes. engram has no LLM in the store
+// path (local-first), and silently dropping a store risks losing a nuanced update, so the
+// mechanical layer just surfaces the nearest existing memory; the caller (the agent, already
+// in the loop) decides APPEND / UPDATE (re-store with supersedes) / ABORT. The CLAUDE.md
+// "will this be recalled in another session?" gate is the prompt half of the same R3.
+// Cosine is computed exactly on content_vector (metric-explicit) over the vec-KNN shortlist.
+function cosineSim(a, b) {
+  let dot = 0, na = 0, nb = 0
+  const n = Math.min(a.length, b.length)
+  for (let i = 0; i < n; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i] }
+  return (na && nb) ? dot / (Math.sqrt(na) * Math.sqrt(nb)) : 0
+}
+function findNearDuplicates(db, embedding, excludeId, { topK = 5, threshold = 0.92 } = {}) {
+  if (!_vecLoaded || !embedding) return []
+  let cands
+  try {
+    cands = db.prepare(`
+      SELECT m.rowid AS id, m.summary, m.content, m.content_vector
+      FROM (SELECT memory_rowid, distance FROM memories_vec WHERE embedding MATCH ? ORDER BY distance LIMIT ?) v
+      JOIN memories m ON m.rowid = v.memory_rowid
+      WHERE m.rowid != ? AND m.deleted_at IS NULL AND m.content_vector IS NOT NULL AND m.content_vector != ''
+    `).all(new Float32Array(embedding), topK + 1, excludeId)
+  } catch { return [] }
+  const out = []
+  for (const c of cands) {
+    let v; try { v = JSON.parse(c.content_vector) } catch { continue }
+    const cos = cosineSim(embedding, v)
+    if (cos >= threshold) out.push({ id: c.id, cosine: +cos.toFixed(4), summary: c.summary || (c.content || '').slice(0, 60) })
+  }
+  return out.sort((a, b) => b.cosine - a.cosine)
+}
+
 /**
- * Async version: store memory + generate embedding vector
+ * Async version: store memory + generate embedding vector.
+ * opts.out (object): if provided, near-duplicate write-gate writes opts.out.nearDuplicates = [{id,cosine,summary}].
+ * opts.dupThreshold (number): cosine floor for surfacing near-dups (default 0.92).
  */
-export async function storeMemoryAsync(mem) {
+export async function storeMemoryAsync(mem, opts = {}) {
   const id = storeMemory(mem)
   if (!id) return null
 
@@ -756,6 +791,14 @@ export async function storeMemoryAsync(mem) {
       } catch (e) {
         log(`memories_vec insert failed (id=${id}): ${e.message}`)
       }
+    }
+
+    // Write-gate: surface near-duplicates (detection only) so caller can supersede vs bloat.
+    if (opts.out) {
+      try {
+        const dups = findNearDuplicates(db, embedding, id, { threshold: opts.dupThreshold ?? 0.92 })
+        if (dups.length) opts.out.nearDuplicates = dups
+      } catch (e) { log(`near-dup check failed (id=${id}): ${e.message}`) }
     }
   }
   return id
@@ -933,10 +976,13 @@ export function recallMemories(opts = {}) {
     const effectiveTime = row.event_time != null ? row.event_time : row.created_at
     const age = now - effectiveTime
     const timeScore = Math.max(0, 1 - age / THIRTY_DAYS_MS)
-    const accessScore = Math.min(1, row.access_count / 20)
+    // v2.4 (2026-06-22): align with hybrid path. ftsScore (already 0-1 ranged, unlike RRF)
+    // leads at 0.55; importance demoted to weak prior 0.1; frequency log-damped (same form
+    // as hybrid freqScore) at 0.2. R1: don't let saturated self-rated importance drive order.
+    const accessScore = Math.min(1, Math.log1p(row.access_count || 0) / Math.log1p(20))
     const levelWeight = LEVEL_WEIGHT[row.memory_level] || 1.0
 
-    const baseScore = (ftsScore * 0.4) + (importanceScore * 0.3) + (timeScore * 0.2) + (accessScore * 0.1)
+    const baseScore = (ftsScore * 0.55) + (accessScore * 0.2) + (timeScore * 0.15) + (importanceScore * 0.1)
     // migration 003: decay_score as multiplier (periodically updated by runDecayCycle)
     // Defaults to 1.0 for records that haven't been through a decay cycle — backward compatible
     const decay = (row.decay_score != null) ? row.decay_score : 1.0
@@ -1128,15 +1174,18 @@ export async function recallMemoriesHybrid(opts = {}) {
     const effectiveTime = row.event_time != null ? row.event_time : row.created_at
     const age = now - effectiveTime
     const timeScore = Math.max(0, 1 - age / THIRTY_DAYS_MS)
-    // v2.3: HMO-style hit-frequency term (arXiv 2604.01670 Eq.5 ln(1+C) dampening).
-    // Weight 0.05 is deliberately small: RRF's own dynamic range across a candidate
-    // set is only ~0.015 (1/(k+rank) with k=60), so any structural term larger than
-    // ~0.05 would drown relevance entirely. ln + cap also brakes the
-    // recalled -> access_count++ -> ranked-higher feedback loop.
+    // v2.4 (2026-06-22): relevance-leads rescale. The old `rrf * 0.7` drowned relevance:
+    // RRF magnitude is ~0.016 (1/(60+rank)) so its spread across a candidate list is
+    // ~0.0016, while importance*0.2 spread is ~0.06 — importance out-weighed relevance
+    // ~37x. A/B (7 queries on a live-DB copy): under old weights the single most-relevant
+    // item landed at avg rank 16/30. Rescaling rrf to x10 puts it at rank 2.1 and drops
+    // importance to a weak prior (R1 from the 2026-06-22 store-time research: don't let
+    // self-rated importance drive ranking — it's 92.5% saturated >=7, i.e. pure noise).
+    // freqScore: HMO hit-frequency (arXiv 2604.01670, ln+cap dampens the
+    // recalled->access++->ranked-higher loop), now the primary structural tiebreak.
     const freqScore = Math.min(1, Math.log1p(row.access_count || 0) / Math.log1p(20))
-    // migration 003: decay_score multiplier (defaults to 1.0 backward-compatible)
     const decay = (row.decay_score != null) ? row.decay_score : 1.0
-    const score = (rrf * 0.7 + (importanceScore * 0.2 + timeScore * 0.1 + freqScore * 0.05)) * levelWeight * decay
+    const score = (rrf * 10 + freqScore * 0.10 + timeScore * 0.06 + importanceScore * 0.05) * levelWeight * decay
     return { ...row, score, rrf, recall_sources: sources }
   })
 
@@ -1534,6 +1583,80 @@ export function runDecayCycle(opts = {}) {
   } catch (e) {
     log(`runDecayCycle failed: ${e.message}`)
     return { processed, distribution, error: e.message }
+  }
+}
+
+// v2.4 (2026-06-22): frequency-driven memory_level hysteresis migration.
+// Store-time level self-assessment caused 84% meta inflation — the writing agent
+// over-rates its own output. This re-levels by OBSERVED recall frequency (access_count)
+// + age, not by what the caller declared. Deliberately demote-biased (that's what
+// fights inflation). Promotion to meta stays a deliberate human/curation act — frequency
+// alone does not make something a cross-context heuristic, and auto-promoting to meta
+// would just re-inflate it; only concrete->semi auto-migrates upward. No symmetric
+// auto-transition crosses the same boundary, so levels can't flap (implicit hysteresis).
+// Skips memory_type='permanent' (isStatic-style invariants), superseded, deleted.
+//
+// Rules:
+//   meta -> semi     : access_count=0 AND age>30d, OR access_count<=2 AND age>90d   (stale, never/barely recalled)
+//   concrete -> semi : access_count>=6                                               (heavily recalled, mis-leveled)
+//   concrete imp>5   : clamp importance to 5                                          (concrete-importance invariant)
+//
+// Options: { limit = Infinity, dryRun = false, anchorPath = null }
+//   limit      — bound nightly autosleep (e.g. 30); omit for the one-time backfill.
+//   anchorPath — write a JSONL rollback anchor {rowid, old_level, old_importance} BEFORE mutating.
+//                Roll back with: UPDATE memories SET memory_level=?, importance=? WHERE rowid=? per line.
+// Returns { scanned, candidates, demoted, promoted, clamped, anchor }
+export function runLevelMigration(opts = {}) {
+  const { limit = Infinity, dryRun = false, anchorPath = null } = opts
+  const db = getDb()
+  const now = Date.now()
+  const D30 = 30 * 86400_000, D90 = 90 * 86400_000
+  const out = { scanned: 0, candidates: 0, demoted: 0, promoted: 0, clamped: 0, anchor: anchorPath || null }
+  try {
+    const rows = db.prepare(`
+      SELECT rowid, memory_level, importance, access_count, created_at
+      FROM memories
+      WHERE deleted_at IS NULL AND superseded_by IS NULL AND memory_type != 'permanent'
+    `).all()
+    out.scanned = rows.length
+    const changes = []
+    for (const r of rows) {
+      const age = now - r.created_at
+      const ac = r.access_count || 0
+      let newLevel = r.memory_level, newImp = r.importance
+      if (r.memory_level === 'meta_knowledge') {
+        if ((ac === 0 && age > D30) || (ac <= 2 && age > D90)) newLevel = 'semi_abstract'
+      } else if (r.memory_level === 'concrete_trace') {
+        if (ac >= 6) newLevel = 'semi_abstract'
+        if (newImp > 5) newImp = 5
+      }
+      if (newLevel !== r.memory_level || newImp !== r.importance) {
+        changes.push({ rowid: r.rowid, old_level: r.memory_level, new_level: newLevel, old_importance: r.importance, new_importance: newImp })
+      }
+    }
+    const bounded = Number.isFinite(limit) ? changes.slice(0, limit) : changes
+    out.candidates = bounded.length
+    const tally = (c) => {
+      if (c.new_level !== c.old_level) { if (c.old_level === 'meta_knowledge') out.demoted++; else out.promoted++ }
+      if (c.new_importance !== c.old_importance) out.clamped++
+    }
+    if (dryRun) {
+      for (const c of bounded) tally(c)
+      return { ...out, dryRun: true, sample: bounded.slice(0, 8) }
+    }
+    // Persist rollback anchor BEFORE mutating (crash-safe: anchor on disk first).
+    if (anchorPath && bounded.length) {
+      writeFileSync(anchorPath, bounded.map(c =>
+        JSON.stringify({ rowid: c.rowid, old_level: c.old_level, old_importance: c.old_importance })).join('\n') + '\n')
+    }
+    const stmt = db.prepare(`UPDATE memories SET memory_level = ?, importance = ?, updated_at = ? WHERE rowid = ?`)
+    const tx = db.transaction((batch) => { for (const c of batch) { stmt.run(c.new_level, c.new_importance, now, c.rowid); tally(c) } })
+    tx(bounded)
+    log(`runLevelMigration: scanned=${out.scanned} demoted=${out.demoted} promoted=${out.promoted} clamped=${out.clamped}${anchorPath ? ' anchor=' + anchorPath : ''}`)
+    return out
+  } catch (e) {
+    log(`runLevelMigration failed: ${e.message}`)
+    return { ...out, error: e.message }
   }
 }
 
