@@ -335,36 +335,29 @@ claude mcp add --scope user mneme -- node /absolute/path/to/mcp-server.mjs
 
 ### Add Agent Instructions
 
-Add to your agent's system instructions (e.g., `CLAUDE.md`, `.cursorrules`, etc.):
+mneme stores and recalls, but *when* and *how* your agent stores is driven by its
+instruction file — not by mneme. A few well-chosen lines keep the memory sharp instead of
+bloated. See **[docs/configuring-your-agent.md](docs/configuring-your-agent.md)** for the
+full guide: the instruction block plus where each agent (Claude Code, Codex, Cursor, Cline,
+Gemini CLI, Windsurf, Amp) reads it.
+
+The short version — paste into `CLAUDE.md` / `AGENTS.md` / `.cursor/rules` / `GEMINI.md` / etc.:
 
 ```markdown
-## Memory System (mneme MCP)
+## Memory (mneme MCP)
 
-You have access to a persistent memory database via the `mneme` MCP server:
-- `recall_memory(query, limit?, category?)` — retrieve relevant memories
-- `store_memory(content, summary?, importance?, memory_type?, memory_level?, category?, tags?)` — store important info
-- `memory_stats()` — view statistics
+You have persistent memory via `mneme`: `recall_memory`, `store_memory`, `memory_stats`.
 
-### When to call recall_memory
-**Check context first. Only query when context doesn't contain a confident answer.**
-
-Must call:
-- User asks about personal preferences, habits, past work
-- User references people, relationships, project history
-- Context doesn't have a confident answer
-
-Skip:
-- Current context already has the answer
-- Pure technical question unrelated to stored knowledge
-- Already queried the same topic in this session
-
-### Memory Level Guidelines
-When storing memories, prefer higher abstraction levels:
-- `meta_knowledge` (preferred): Patterns, principles, heuristics — "When X happens, do Y"
-- `semi_abstract` (default): Description with some context — "Project uses X because Y"
-- `concrete_trace` (last resort): Specific operation logs — "Ran script X on date Y"
-
-Distill experiences into reusable patterns whenever possible.
+- **Recall** only when context lacks a confident answer (past work, decisions, people,
+  preferences, project history). Skip if context already answers, the question is generic,
+  or you already asked this session.
+- **Store is a write gate, not a reflex**: store only what will change future behavior or be
+  useful in a different session — not passing chatter or one-off confirmations.
+- **Default `semi_abstract`.** `meta_knowledge` is *earned* — reserve it for heuristics that
+  would help even in a completely unrelated project. Importance is a weak prior (anchor it:
+  9-10 identity/rules · 7-8 active decisions · 5-6 context · ≤4 traces), not a ranking lever —
+  salience emerges from recall frequency, not the number you assign at write time.
+- On a **near-duplicate** warning, `supersedes: ["<id>"]` the existing entry instead of duplicating.
 ```
 
 ---
