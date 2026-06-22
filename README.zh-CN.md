@@ -264,7 +264,7 @@ v2.1 的 `× decay_score` 乘数让长时间未碰的记忆自然排到后面，
 ### 安装
 
 ```bash
-git clone https://github.com/MXAntian/mneme.git
+git clone https://github.com/AgentGameLab/mneme.git
 cd mneme
 npm install
 ```

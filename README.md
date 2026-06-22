@@ -289,7 +289,7 @@ Both are optional — mneme works fully with just FTS5 out of the box.
 ### Install
 
 ```bash
-git clone https://github.com/MXAntian/mneme.git
+git clone https://github.com/AgentGameLab/mneme.git
 cd mneme
 npm install
 ```
