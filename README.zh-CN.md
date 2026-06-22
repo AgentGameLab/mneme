@@ -310,36 +310,25 @@ claude mcp add --scope user mneme -- node /absolute/path/to/mcp-server.mjs
 
 ### 加 Agent 指令
 
-加到你的 Agent 系统指令（比如 `CLAUDE.md`、`.cursorrules` 等）：
+mneme 负责存和召回，但**何时**存、**怎么**存的纪律是你 Agent 的指令文件决定的，不是 mneme。
+几行配置就决定了记忆是越用越准还是膨胀成垃圾抽屉。完整指南见
+**[docs/configuring-your-agent.zh-CN.md](docs/configuring-your-agent.zh-CN.md)**：指令块 +
+每个 Agent（Claude Code / Codex / Cursor / Cline / Gemini CLI / Windsurf / Amp）配在哪个文件。
+
+精简版——粘进 `CLAUDE.md` / `AGENTS.md` / `.cursor/rules` / `GEMINI.md` 等：
 
 ```markdown
-## 记忆系统（mneme MCP）
+## 记忆（mneme MCP）
 
-你能通过 `mneme` MCP server 访问一个持久化记忆数据库：
-- `recall_memory(query, limit?, category?)` — 检索相关记忆
-- `store_memory(content, summary?, importance?, memory_type?, memory_level?, category?, tags?)` — 存重要信息
-- `memory_stats()` — 看统计
+你能通过 `mneme` 用持久记忆：`recall_memory`、`store_memory`、`memory_stats`。
 
-### 何时调用 recall_memory
-**先看上下文。只有上下文不含可靠答案时才查询。**
-
-必须调用的场景：
-- 用户问个人偏好、习惯、过往工作
-- 用户提到人物、关系、项目历史
-- 上下文里没有可靠答案
-
-可跳过的场景：
-- 当前上下文已有答案
-- 跟存储知识无关的纯技术问题
-- 本次 session 已查过同主题
-
-### Memory Level 准则
-存记忆时优先用更高抽象层级：
-- `meta_knowledge`（首选）：模式、原则、启发式——"遇到 X 时做 Y"
-- `semi_abstract`（默认）：含一定上下文的描述——"项目用 X 因为 Y"
-- `concrete_trace`（最后选）：具体操作日志——"X 日跑了 Y 脚本"
-
-尽可能把经验提炼成可复用的模式。
+- **召回**只在上下文没有可靠答案时（过往工作、决策、人物、偏好、项目历史）。上下文已答 /
+  问题很通用 / 本 session 已查过 → 跳过。
+- **存是写入闸不是反射**：只存会改变未来行为、或在别的 session 有用的——闲聊和一次性确认不是记忆。
+- **默认 `semi_abstract`。** `meta_knowledge` 是要"挣"的——只给那种放到一个完全无关的项目里
+  还有用的启发式。importance 是弱 prior（按锚点：9-10 身份/铁律 · 7-8 活跃决策 · 5-6 上下文 ·
+  ≤4 痕迹），不是排序杠杆——真正的权重靠召回频次涌现，不是写入时拍的数。
+- 遇到**近邻重复**警告，用 `supersedes: ["<id>"]` 覆盖旧条目，别新建。
 ```
 
 ---
