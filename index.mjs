@@ -2027,6 +2027,16 @@ if (_isMain) {
       const stats = getMemoryStats()
       process.stdout.write(JSON.stringify(stats, null, 2) + '\n')
 
+    } else if (hasFlag('--level-migrate')) {
+      // v2.4: frequency-driven memory_level hysteresis migration.
+      //   --limit N   (default 30; nightly autosleep bound — omit/large for one-time backfill)
+      //   --anchor P  (write reversible JSONL rollback anchor before mutating)
+      //   --dry-run   (preview counts, no mutation)
+      const limit = getFlag('--limit') ? parseInt(getFlag('--limit'), 10) : 30
+      const anchorPath = getFlag('--anchor') || null
+      const res = runLevelMigration({ limit, anchorPath, dryRun: hasFlag('--dry-run') })
+      process.stdout.write(JSON.stringify(res, null, 2) + '\n')
+
     } else if (getFlag('--context') !== null) {
       const query = getFlag('--context') || ''
       const ctx = await buildMemoryContext({ query, memoryLimit: 10 })
