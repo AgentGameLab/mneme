@@ -27,26 +27,35 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 const require = createRequire(import.meta.url)
 
 // -- Configure scan directories -------------------------------------------
-// Update these paths to match your Claude Code project locations
 const CLAUDE_PROJECTS = resolve(process.env.HOME || process.env.USERPROFILE || '', '.claude/projects')
-const MEMORY_DIRS = [
-  resolve(CLAUDE_PROJECTS, 'memory'),
-  // Add more project memory directories as needed, e.g.:
-  // resolve(CLAUDE_PROJECTS, 'my-project/memory'),
-]
 
-// Scan all subdirectories under CLAUDE_PROJECTS for memory/ folders
-try {
-  const { readdirSync: rd, statSync: st } = require('node:fs')
-  for (const entry of rd(CLAUDE_PROJECTS)) {
-    const memDir = resolve(CLAUDE_PROJECTS, entry, 'memory')
-    try {
-      if (st(memDir).isDirectory() && !MEMORY_DIRS.includes(memDir)) {
-        MEMORY_DIRS.push(memDir)
-      }
-    } catch {}
-  }
-} catch {}
+// Resolve which memory/ dirs to scan (first match wins):
+//   1. MNEME_MEMORY_DIRS env — comma-separated project names (under ~/.claude/projects) or absolute paths
+//   2. ./mneme.migrate.local.json — local override { "projects": [...] }, gitignored
+//   3. fallback — auto-scan every memory/ folder under ~/.claude/projects
+function resolveMemoryDirs() {
+  const { readdirSync, statSync, readFileSync } = require('node:fs')
+  const toDir = (p) =>
+    /[\\/]/.test(p) || /^[A-Za-z]:/.test(p) ? resolve(p) : resolve(CLAUDE_PROJECTS, p, 'memory')
+
+  const env = (process.env.MNEME_MEMORY_DIRS || '').split(',').map((s) => s.trim()).filter(Boolean)
+  if (env.length) return env.map(toDir)
+
+  try {
+    const cfg = JSON.parse(readFileSync(resolve(process.cwd(), 'mneme.migrate.local.json'), 'utf-8'))
+    if (Array.isArray(cfg.projects) && cfg.projects.length) return cfg.projects.map(toDir)
+  } catch {}
+
+  const dirs = []
+  try {
+    for (const entry of readdirSync(CLAUDE_PROJECTS)) {
+      const memDir = resolve(CLAUDE_PROJECTS, entry, 'memory')
+      try { if (statSync(memDir).isDirectory()) dirs.push(memDir) } catch {}
+    }
+  } catch {}
+  return dirs
+}
+const MEMORY_DIRS = resolveMemoryDirs()
 
 // -- type -> category mapping ---------------------------------------------
 const TYPE_TO_CATEGORY = {

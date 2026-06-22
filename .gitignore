@@ -19,3 +19,9 @@ node_modules/
 
 # Misc
 *.zip
+
+# Lockfile (library — consumers resolve their own deps)
+package-lock.json
+
+# Local migrate overrides (machine-specific project list)
+mneme.migrate.local.json
