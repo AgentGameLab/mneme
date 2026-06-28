@@ -23,10 +23,22 @@ import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import { createHash } from 'node:crypto'
-import { verifyAndRecord } from '../lib/team-registry-verify.mjs'
 
 const require = createRequire(import.meta.url)
 const __dirname = dirname(fileURLToPath(import.meta.url))
+
+// Optional team-registry sender_id verify hook (千夏-private workspace only).
+// Public mneme checkout has no ../lib/ sibling — make import fail-soft so
+// MCP startup never crashes when the hook isn't bundled.
+let verifyAndRecord = null
+try {
+  const hookPath = resolve(__dirname, '..', 'lib', 'team-registry-verify.mjs')
+  if (existsSync(hookPath)) {
+    ;({ verifyAndRecord } = await import(hookPath))
+  }
+} catch (_) {
+  // Optional dependency — startup must not fail when absent
+}
 // Path resolution order (v2.1.2):
 //   1. $TOKENMEM_DB_PATH if set (explicit override)
 //   2. Existing engram.db beside this module (back-compat for users coming from
@@ -655,11 +667,15 @@ function cosineSimilarity(a, b) {
  */
 export function recordConversation(msg) {
   // G7 family · 千夏 segment: sender_id verify against team-registry
-  // Fail-soft: log + metric, never blocks main flow
-  try {
-    verifyAndRecord(msg)
-  } catch (_) {
-    // Defensive: verify-hook errors must never affect recording
+  // Fail-soft: log + metric, never blocks main flow. Hook is optional —
+  // public mneme checkout has no ../lib/ sibling so the import resolves to
+  // null and we silently skip the verify call.
+  if (verifyAndRecord) {
+    try {
+      verifyAndRecord(msg)
+    } catch (_) {
+      // Defensive: verify-hook errors must never affect recording
+    }
   }
 
   const db = getDb()
