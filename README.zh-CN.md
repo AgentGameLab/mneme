@@ -429,6 +429,9 @@ Reciprocal Rank Fusion 只用排名位置，不用原始分数。这样 FTS5 BM2
 | `EMBEDDING_API_KEY` | — | embedding 服务 API key |
 | `EMBEDDING_MODEL` | `text-embedding-3-small` | embedding 模型名 |
 | `EMBEDDING_DIMENSION` | `1536` | 向量维度 |
+| `ENTITY_LLM_API_BASE_URL` | — | 可选实体层的 OpenAI-compat chat base URL（v2.5；不设则休眠） |
+| `ENTITY_LLM_API_KEY` | — | 实体抽取的 API key |
+| `ENTITY_LLM_MODEL` | `gpt-4o-mini` | 实体抽取用的 chat 模型 |
 | `CLAUDE_BIN` | `claude` | Claude CLI 路径（压缩管线用） |
 | `TOKENMEM_COMPACT_SUMMARY` | — | compact 摘要文本（SessionStart hook 用） |
 | `TOKENMEM_COMPACT_SESSION` | — | compact 摘要的 session ID |

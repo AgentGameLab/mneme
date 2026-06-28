@@ -112,6 +112,39 @@ you want one shared instance across several agents instead of a stdio process pe
 
 ---
 
+## 4. Optional: entity-aware recall (v2.5)
+
+mneme can add a **third recall signal** on top of keyword (FTS5) and vector search: named
+entities (projects, people, tools…) mentioned across your memories. A query that names an
+entity then also surfaces memories about it, fused via RRF.
+
+**Off by default, fully optional.** Recall works the same (keyword + vector) without it. The
+schema upgrades **automatically** — pulling a newer mneme and restarting creates the
+`entities` / `mentions` tables (no manual migration; nothing breaks if you never enable it).
+
+To turn it on:
+
+1. Point it at any OpenAI-compatible chat model — used only for **async extraction**, never on
+   the recall path. Leave unset and the entity layer stays dormant.
+   ```bash
+   ENTITY_LLM_API_BASE_URL=https://api.your-provider.com/v1
+   ENTITY_LLM_API_KEY=sk-...
+   ENTITY_LLM_MODEL=your-chat-model
+   ```
+2. Backfill entities for existing memories (one-time):
+   ```bash
+   node index.mjs --extract-entities --limit 100000
+   ```
+3. Keep new memories covered by scheduling the same command periodically — it only processes
+   memories not yet extracted:
+   ```bash
+   node index.mjs --extract-entities --limit 200   # e.g. nightly cron
+   ```
+
+Extraction is async + batched; recall stays pure SQL (zero LLM on the hot path).
+
+---
+
 ## TL;DR
 
 1. Connect mneme via MCP (§3).
