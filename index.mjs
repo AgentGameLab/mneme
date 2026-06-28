@@ -61,6 +61,8 @@ const log = (msg) => process.stderr.write(`[${new Date().toISOString()}] [Memory
 let _db = null
 let _embeddingConfig = null
 let _entityLlmConfig = null  // v2.5: optional OpenAI-compatible chat LLM for async entity extraction
+let _entityCache = null       // v2.5.1: cached entity list for the recall path (parsed aliases)
+let _entityCacheSig = ''       // cheap change signature (count:maxId) — refreshes cross-process
 let _simpleLoaded = false  // whether the simple extension loaded successfully
 let _vecLoaded = false     // whether the sqlite-vec extension loaded successfully
 
@@ -1296,17 +1298,31 @@ const RRF_K = 60
 // mention them, filtered to LIVE rows (deleted_at IS NULL AND superseded_by IS NULL — keeps
 // soft-deleted/superseded memories from resurfacing via a stale mention edge). Returned as a
 // ranked list; the caller feeds it into RRF as a 4th source (never an additive boost).
+// Cached entity list (aliases pre-parsed) for the recall path. Loading all entities every
+// recall was ~5ms at 6k entities — over the latency budget. A cheap count:maxId signature
+// detects changes (incl. from the separate backfill/extraction process) and reloads only then.
+function getEntityList(db) {
+  let sig
+  try {
+    const r = db.prepare(`SELECT COUNT(*) c, COALESCE(MAX(id), 0) m FROM entities WHERE deleted_at IS NULL`).get()
+    sig = `${r.c}:${r.m}`
+  } catch { return [] }  // entities table absent (pre-migration-007 db) → no entity path, graceful
+  if (_entityCache && _entityCacheSig === sig) return _entityCache
+  _entityCache = db.prepare(`SELECT id, normalized, aliases FROM entities WHERE deleted_at IS NULL`)
+    .all().map(e => ({ id: e.id, normalized: e.normalized, aliases: safeJsonParse(e.aliases, []).map(normalizeEntityName) }))
+  _entityCacheSig = sig
+  return _entityCache
+}
+
 function findEntityMatchedMemories(db, queryText, limit) {
   const qNorm = normalizeEntityName(queryText)
   if (qNorm.length < 2) return []
-  let ents
-  try { ents = db.prepare(`SELECT id, normalized, aliases FROM entities WHERE deleted_at IS NULL`).all() }
-  catch { return [] }  // entities table absent (pre-migration-007 db) → no entity path, graceful
+  const ents = getEntityList(db)
+  if (!ents.length) return []
   const matchedIds = []
   for (const e of ents) {
     if (e.normalized && e.normalized.length >= 2 && qNorm.includes(e.normalized)) { matchedIds.push(e.id); continue }
-    const al = safeJsonParse(e.aliases, [])
-    if (al.some(a => { const n = normalizeEntityName(a); return n.length >= 2 && qNorm.includes(n) })) matchedIds.push(e.id)
+    if (e.aliases.some(n => n.length >= 2 && qNorm.includes(n))) matchedIds.push(e.id)
   }
   if (!matchedIds.length) return []
   const ph = matchedIds.map(() => '?').join(',')
