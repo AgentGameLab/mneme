@@ -97,6 +97,35 @@ mneme 也能跑 HTTP（`node mcp-server.mjs --transport=http --port=18790`），
 
 ---
 
+## 4. 可选：实体感知召回（v2.5）
+
+mneme 可以在关键词（FTS5）+ 向量之外加**第三路召回信号**：你记忆里出现的命名实体（项目/人/工具…）。
+查询里点到某个实体名，就会顺带召回关于它的记忆，用 RRF 融合。
+
+**默认关、纯可选。** 不开它召回照常（关键词 + 向量）。schema **自动升级**——pull 新版 mneme 重启，
+就会跑迁移建出 `entities` / `mentions` 表（无需手动迁移；不开也不会坏）。
+
+要开：
+
+1. 指向任意 OpenAI-compat chat 模型——只用于**异步抽取**，绝不在召回路上。不设就一直休眠。
+   ```bash
+   ENTITY_LLM_API_BASE_URL=https://api.your-provider.com/v1
+   ENTITY_LLM_API_KEY=sk-...
+   ENTITY_LLM_MODEL=your-chat-model
+   ```
+2. 给存量记忆 backfill 实体（一次性）：
+   ```bash
+   node index.mjs --extract-entities --limit 100000
+   ```
+3. 定期跑同一条命令给新记忆补实体——它只处理还没抽过的：
+   ```bash
+   node index.mjs --extract-entities --limit 200   # 比如每晚 cron
+   ```
+
+抽取异步 + 批量；召回保持纯 SQL（热路零 LLM）。
+
+---
+
 ## TL;DR
 
 1. 用 MCP 接上 mneme（§3）。

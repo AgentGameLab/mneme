@@ -433,6 +433,9 @@ Reciprocal Rank Fusion uses only rank positions, not raw scores. This means FTS5
 | `EMBEDDING_API_KEY` | — | API key for embedding service |
 | `EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model name |
 | `EMBEDDING_DIMENSION` | `1536` | Vector dimension |
+| `ENTITY_LLM_API_BASE_URL` | — | OpenAI-compatible chat base URL for the optional entity layer (v2.5; dormant if unset) |
+| `ENTITY_LLM_API_KEY` | — | API key for entity extraction |
+| `ENTITY_LLM_MODEL` | `gpt-4o-mini` | Chat model for entity extraction |
 | `CLAUDE_BIN` | `claude` | Path to Claude CLI (for compression pipeline) |
 | `TOKENMEM_COMPACT_SUMMARY` | — | Compact summary text (for SessionStart hook) |
 | `TOKENMEM_COMPACT_SESSION` | — | Session ID for compact summary |
