@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ============================================================
-// mneme MCP Server v2.4.0
+// mneme MCP Server v2.5.0
 // Exposes recall_memory / store_memory / recall_by_id / memory_stats tools
 // On-demand recall for any MCP-compatible AI agent — saves 80-90% memory token costs
 //
@@ -66,7 +66,7 @@ embedMissingVectors(500).then(r => {
 }).catch(e => console.error(`[mneme] startup self-heal failed: ${e.message}`))
 
 const SERVER_NAME = 'mneme'
-const SERVER_VERSION = '2.4.0'
+const SERVER_VERSION = '2.5.0'
 
 // ── Factory: each call returns a fresh McpServer with all 4 tools registered ──
 // Why factory: HTTP stateful multi-client mode requires per-session McpServer

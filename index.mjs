@@ -23,6 +23,7 @@ import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import { createHash } from 'node:crypto'
+import { verifyAndRecord } from '../lib/team-registry-verify.mjs'
 
 const require = createRequire(import.meta.url)
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -59,6 +60,7 @@ const log = (msg) => process.stderr.write(`[${new Date().toISOString()}] [Memory
 // ── DB Instance ─────────────────────────────────────────────
 let _db = null
 let _embeddingConfig = null
+let _entityLlmConfig = null  // v2.5: optional OpenAI-compatible chat LLM for async entity extraction
 let _simpleLoaded = false  // whether the simple extension loaded successfully
 let _vecLoaded = false     // whether the sqlite-vec extension loaded successfully
 
@@ -214,6 +216,18 @@ export function initMemory() {
     log('No embedding API — using FTS5 full-text search only')
   }
 
+  // Detect entity-extraction LLM (v2.5, optional, OpenAI-compatible chat completions).
+  // Dormant if unset — the entity layer just stays empty and recall falls back to
+  // FTS5 + vector RRF (current behaviour). Extraction never runs on the recall hot path.
+  if (process.env.ENTITY_LLM_API_BASE_URL && process.env.ENTITY_LLM_API_KEY) {
+    _entityLlmConfig = {
+      baseUrl: process.env.ENTITY_LLM_API_BASE_URL,
+      apiKey: process.env.ENTITY_LLM_API_KEY,
+      model: process.env.ENTITY_LLM_MODEL || 'gpt-4o-mini',
+    }
+    log(`Entity LLM: ${_entityLlmConfig.model}`)
+  }
+
   // ── Incremental schema migrations ───────────────────────────
   // New columns: compressed_from, is_compressed (compression pipeline)
   try {
@@ -255,6 +269,45 @@ export function initMemory() {
   try {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_source_conv ON memories(source_conversation_id) WHERE source_conversation_id IS NOT NULL`)
   } catch {}
+  // migration 007 (v2.5): entity layer — `entities` + `mentions` (memory<->entity), plus a
+  // memories.entities_extracted_at marker (NULL = not yet processed, mirrors content_vector IS NULL).
+  // A 3rd retrieval signal beside FTS5 + vector. Extraction is async / store-time, NEVER on the
+  // recall hot path; recall joins `mentions` and feeds an RRF 4th ranked list (NOT an additive
+  // boost — additive would re-drown relevance, see the v2.4 rrf*10 note). Same SQLite file, no
+  // graph DB. Soft-delete only (no tombstone), consistent with the rest of the store.
+  try {
+    db.exec(`ALTER TABLE memories ADD COLUMN entities_extracted_at INTEGER`)
+    log('Migration 007: added entities_extracted_at column')
+  } catch {}  // already exists
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS entities (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        normalized TEXT NOT NULL,
+        type TEXT NOT NULL DEFAULT 'other',
+        aliases TEXT NOT NULL DEFAULT '[]',
+        mention_count INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+        updated_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+        deleted_at INTEGER
+      )
+    `)
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_norm ON entities(normalized, type) WHERE deleted_at IS NULL`)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name) WHERE deleted_at IS NULL`)
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS mentions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        memory_rowid INTEGER NOT NULL,
+        entity_id INTEGER NOT NULL REFERENCES entities(id),
+        created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
+      )
+    `)
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_mentions_pair ON mentions(memory_rowid, entity_id)`)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_mentions_entity ON mentions(entity_id)`)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_mentions_memory ON mentions(memory_rowid)`)
+    log('Migration 007: entity layer (entities + mentions) ready')
+  } catch (e) { log(`Migration 007 (entities) failed: ${e.message}`) }
   // migration 003: decay_score + prior_versions (power-law decay + supersede paper trail).
   // Inline so upgrading an OLD db gets them without manually applying migrations/003 —
   // otherwise recall's `AND decay_score >= ?` (strict/cold-pool path) throws "no such column".
@@ -469,6 +522,142 @@ async function generateEmbedding(text) {
   }
 }
 
+// ── Entity extraction (v2.5, async / store-time — NEVER on the recall hot path) ──
+// Optional: dormant unless ENTITY_LLM_* is configured. Extraction is an OpenAI-compatible
+// chat call; the resulting entities feed an RRF 4th retrieval path (see recall), not an
+// additive boost. Recall itself does zero LLM — query→entity matching is pure SQL.
+
+async function callEntityLlm(prompt) {
+  if (!_entityLlmConfig) return null
+  try {
+    const res = await fetch(`${_entityLlmConfig.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${_entityLlmConfig.apiKey}` },
+      body: JSON.stringify({
+        model: _entityLlmConfig.model,
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0,
+        max_tokens: 600,
+      }),
+    })
+    const data = await res.json()
+    return data?.choices?.[0]?.message?.content || null
+  } catch (e) {
+    log(`Entity LLM call failed: ${e.message}`)
+    return null
+  }
+}
+
+const ENTITY_PROMPT = `你是命名实体抽取器。从下面这条记忆里**只抽具体的命名实体**(专有名词),用作检索锚点。
+只抽这五类(必须是特定的、可复用指代某个东西的专名):
+- person: 具体人名
+- project: 具体项目/产品/代号名(如 TANDEM / Fire-Seed / engram / mneme / KOS / GClaw)
+- org: 具体组织/公司/团队名
+- tech: 具体工具/库/服务/协议名(如 codex / DeepSeek / sqlite-vec / MCP / jieba)
+- place: 具体地名
+**绝不抽**:通用技术词(timeout / metric / cache / dedup / supersede / fail-soft / CLI 等)、动词、形容词、泛泛概念、角色词(owner / 负责人 / 用户)。
+判据:这个词是不是一个**特定的、能反复指代同一个东西的专名**?不是就丢。宁缺毋滥,最多 6 个,中英文都抽。
+每个给 name(规范名)、type(上面五类之一)、aliases(同义/简称,没有则 [])。
+严格只输出 JSON 数组,无其他文字:[{"name":"","type":"","aliases":[]}]
+记忆内容:
+`
+
+function parseEntityJson(text) {
+  if (!text) return []
+  const m = text.match(/\[[\s\S]*\]/)  // tolerate ```json fences / surrounding prose
+  if (!m) return []
+  let arr
+  try { arr = JSON.parse(m[0]) } catch { return [] }
+  if (!Array.isArray(arr)) return []
+  // strict whitelist of types — drop (not remap) anything else, since the generic-concept
+  // junk the LLM occasionally emits ("metric", "timeout"...) makes useless broad-match anchors.
+  const TYPES = new Set(['person', 'project', 'org', 'tech', 'place'])
+  return arr
+    .filter(e => e && typeof e.name === 'string' && e.name.trim() && TYPES.has(e.type))
+    .map(e => ({
+      name: e.name.trim().slice(0, 120),
+      type: e.type,
+      aliases: Array.isArray(e.aliases)
+        ? e.aliases.filter(a => typeof a === 'string' && a.trim()).map(a => a.trim().slice(0, 80)).slice(0, 6)
+        : [],
+    }))
+    .slice(0, 6)
+}
+
+async function extractEntitiesFromContent(content) {
+  return parseEntityJson(await callEntityLlm(ENTITY_PROMPT + String(content).slice(0, 4000)))
+}
+
+function normalizeEntityName(name) {
+  return String(name).toLowerCase().replace(/\s+/g, ' ').trim()
+}
+
+// Upsert by (normalized, type); merge aliases; bump mention_count. Returns entity id (or null).
+function upsertEntity(db, { name, type, aliases }) {
+  const normalized = normalizeEntityName(name)
+  if (!normalized) return null
+  const now = Date.now()
+  const existing = db.prepare(`SELECT id, aliases FROM entities WHERE normalized = ? AND type = ? AND deleted_at IS NULL`).get(normalized, type)
+  if (existing) {
+    if (aliases?.length) {
+      const cur = safeJsonParse(existing.aliases, [])
+      const merged = Array.from(new Set([...cur, ...aliases]))
+      if (merged.length !== cur.length) {
+        db.prepare(`UPDATE entities SET aliases = ?, updated_at = ? WHERE id = ?`).run(JSON.stringify(merged), now, existing.id)
+      }
+    }
+    db.prepare(`UPDATE entities SET mention_count = mention_count + 1, updated_at = ? WHERE id = ?`).run(now, existing.id)
+    return existing.id
+  }
+  return db.prepare(`INSERT INTO entities (name, normalized, type, aliases, mention_count, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?)`)
+    .run(name.slice(0, 120), normalized, type, JSON.stringify(aliases || []), now, now).lastInsertRowid
+}
+
+/**
+ * Async batch: extract entities for memories not yet processed (entities_extracted_at IS NULL).
+ * Off the store + recall hot paths. No-op if no entity LLM configured.
+ * @param {number} limit  max memories per run (bounds LLM cost)
+ */
+export async function extractMissingEntities(limit = 100, concurrency = 8) {
+  if (!_entityLlmConfig) return { scanned: 0, processed: 0, entities: 0, mentions: 0, failed: 0, skipped: 'no_entity_llm' }
+  const db = getDb()
+  const rows = db.prepare(`
+    SELECT rowid, content FROM memories
+    WHERE entities_extracted_at IS NULL AND deleted_at IS NULL
+    ORDER BY rowid DESC LIMIT ?
+  `).all(limit)
+  if (rows.length === 0) return { scanned: 0, processed: 0, entities: 0, mentions: 0, failed: 0 }
+  let processed = 0, entCount = 0, mentCount = 0, failed = 0
+  const markStmt = db.prepare(`UPDATE memories SET entities_extracted_at = ? WHERE rowid = ?`)
+  const linkStmt = db.prepare(`INSERT OR IGNORE INTO mentions (memory_rowid, entity_id, created_at) VALUES (?, ?, ?)`)
+  // The slow part is the per-memory LLM call (network). Run them CONCURRENTLY in batches,
+  // then commit each memory's entities SEQUENTIALLY (better-sqlite3 is synchronous — DB writes
+  // can't and shouldn't overlap). Brings a full backfill from hours to ~minutes.
+  for (let i = 0; i < rows.length; i += concurrency) {
+    const batch = rows.slice(i, i + concurrency)
+    const extracted = await Promise.all(batch.map(row =>
+      extractEntitiesFromContent(row.content).then(ents => ({ row, ents })).catch(() => ({ row, ents: null }))
+    ))
+    for (const { row, ents } of extracted) {
+      if (ents === null) { failed++; continue }
+      // dedup per memory (LLM may repeat) so mention_count isn't double-bumped
+      const seen = new Set()
+      const uniq = ents.filter(e => { const k = normalizeEntityName(e.name) + '|' + e.type; if (!k || seen.has(k)) return false; seen.add(k); return true })
+      const now = Date.now()
+      const tx = db.transaction(() => {
+        for (const e of uniq) {
+          const eid = upsertEntity(db, e)
+          if (eid != null) { const r = linkStmt.run(row.rowid, Number(eid), now); if (r.changes > 0) mentCount++ }
+        }
+        markStmt.run(now, row.rowid)
+      })
+      try { tx(); processed++; entCount += uniq.length } catch { failed++ }
+    }
+  }
+  log(`extractMissingEntities: processed=${processed}/${rows.length} entities=${entCount} mentions=${mentCount} failed=${failed}`)
+  return { scanned: rows.length, processed, entities: entCount, mentions: mentCount, failed }
+}
+
 /**
  * Cosine similarity (application-layer computation)
  */
@@ -502,6 +691,14 @@ function cosineSimilarity(a, b) {
  * @returns {string|null} conversation id
  */
 export function recordConversation(msg) {
+  // G7 family · 千夏 segment: sender_id verify against team-registry
+  // Fail-soft: log + metric, never blocks main flow
+  try {
+    verifyAndRecord(msg)
+  } catch (_) {
+    // Defensive: verify-hook errors must never affect recording
+  }
+
   const db = getDb()
   try {
     const stmt = db.prepare(`
@@ -1095,6 +1292,35 @@ const RRF_K = 60
  * @param {Object} opts  same as recallMemories
  * @returns {Promise<Array>}
  */
+// Entity retrieval path (v2.5): query → matched entities (pure SQL, ZERO LLM) → memories that
+// mention them, filtered to LIVE rows (deleted_at IS NULL AND superseded_by IS NULL — keeps
+// soft-deleted/superseded memories from resurfacing via a stale mention edge). Returned as a
+// ranked list; the caller feeds it into RRF as a 4th source (never an additive boost).
+function findEntityMatchedMemories(db, queryText, limit) {
+  const qNorm = normalizeEntityName(queryText)
+  if (qNorm.length < 2) return []
+  let ents
+  try { ents = db.prepare(`SELECT id, normalized, aliases FROM entities WHERE deleted_at IS NULL`).all() }
+  catch { return [] }  // entities table absent (pre-migration-007 db) → no entity path, graceful
+  const matchedIds = []
+  for (const e of ents) {
+    if (e.normalized && e.normalized.length >= 2 && qNorm.includes(e.normalized)) { matchedIds.push(e.id); continue }
+    const al = safeJsonParse(e.aliases, [])
+    if (al.some(a => { const n = normalizeEntityName(a); return n.length >= 2 && qNorm.includes(n) })) matchedIds.push(e.id)
+  }
+  if (!matchedIds.length) return []
+  const ph = matchedIds.map(() => '?').join(',')
+  const rows = db.prepare(`
+    SELECT m.rowid AS rowid, m.*, COUNT(DISTINCT me.entity_id) AS ent_hits
+    FROM mentions me JOIN memories m ON m.rowid = me.memory_rowid
+    WHERE me.entity_id IN (${ph}) AND m.deleted_at IS NULL AND m.superseded_by IS NULL
+    GROUP BY m.rowid
+    ORDER BY ent_hits DESC, m.last_accessed DESC
+    LIMIT ?
+  `).all(...matchedIds, limit)
+  return rows.map(r => ({ ...r, tags: safeJsonParse(r.tags, []), metadata: safeJsonParse(r.metadata, {}) }))
+}
+
 export async function recallMemoriesHybrid(opts = {}) {
   const { query: queryText, limit = 10 } = opts
 
@@ -1165,6 +1391,10 @@ export async function recallMemoriesHybrid(opts = {}) {
   }
   addRanks(ftsRows, 'fts')
   addRanks(vecRows, 'vec')
+  // v2.5: entity path as RRF 4th source (ranked list, NOT an additive boost — additive at any
+  // weight > the rrf*10 spread (~0.16) would re-drown relevance, the exact v2.4 fix). Pure SQL.
+  // opts._noEntity skips it (A/B harness baseline only).
+  if (!opts._noEntity) addRanks(findEntityMatchedMemories(db, queryText, limit * 3), 'entity')
 
   // Apply Memory Transfer Learning level weighting + importance + time decay + decay_score (migration 003)
   const merged = Array.from(rrfScores.values()).map(({ row, rrf, sources }) => {
@@ -2246,6 +2476,13 @@ if (_isMain) {
       const limit = getFlag('--limit') ? parseInt(getFlag('--limit'), 10) : 30
       const anchorPath = getFlag('--anchor') || null
       const res = runLevelMigration({ limit, anchorPath, dryRun: hasFlag('--dry-run') })
+      process.stdout.write(JSON.stringify(res, null, 2) + '\n')
+
+    } else if (hasFlag('--extract-entities')) {
+      // v2.5: async entity backfill (extract entities for unprocessed memories).
+      //   --limit N  (default 100). No-op if ENTITY_LLM_* is not configured.
+      const limit = getFlag('--limit') ? parseInt(getFlag('--limit'), 10) : 100
+      const res = await extractMissingEntities(limit)
       process.stdout.write(JSON.stringify(res, null, 2) + '\n')
 
     } else if (getFlag('--context') !== null) {
