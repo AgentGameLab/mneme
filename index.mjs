@@ -23,6 +23,7 @@ import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import { createHash } from 'node:crypto'
+import { applyMetaGate } from './meta-gate.mjs'
 
 const require = createRequire(import.meta.url)
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -328,6 +329,24 @@ export function initMemory() {
   } catch {}
   try {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_surface_pool ON memories(importance, last_accessed, decay_score) WHERE deleted_at IS NULL AND superseded_by IS NULL AND importance >= 8`)
+  } catch {}
+  // migration 008 (v2.6): is_anchor / is_pinned scarcity-as-structure layer.
+  // Ombre-Brain inspired: importance 1-10 is a weak prior that gets inflated
+  // (real snapshot: 61% of memories >= 8). Add two boolean columns with hard
+  // quotas (anchor <= 40 / pinned <= 30) so callers must trade off. Anchor is
+  // the stronger tier (identity / rule level); pinned is a recall floor.
+  // Quota check lives in storeMemory (application layer).
+  try {
+    db.exec(`ALTER TABLE memories ADD COLUMN is_anchor INTEGER NOT NULL DEFAULT 0`)
+    log('Migration 008: added is_anchor column')
+  } catch {}
+  try {
+    db.exec(`ALTER TABLE memories ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0`)
+    log('Migration 008: added is_pinned column')
+  } catch {}
+  try {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_anchor ON memories(is_anchor) WHERE is_anchor = 1 AND deleted_at IS NULL`)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_pinned ON memories(is_pinned) WHERE is_pinned = 1 AND deleted_at IS NULL`)
   } catch {}
 
   // Vector search virtual table (sqlite-vec)
@@ -746,7 +765,7 @@ function _parseEventTime(v) {
  * @param {Object} mem
  * @returns {string|null} memory id
  */
-export function storeMemory(mem) {
+export function storeMemory(mem, opts = {}) {
   const db = getDb()
   const now = Date.now()
 
@@ -779,7 +798,29 @@ export function storeMemory(mem) {
   // - semi_abstract:  "did X because Y" -> default
   // - meta_knowledge: "when encountering X, do Y" -> high recall weight
   const validLevels = ['concrete_trace', 'semi_abstract', 'meta_knowledge']
-  const memoryLevel = validLevels.includes(mem.memoryLevel) ? mem.memoryLevel : 'semi_abstract'
+  const requestedLevel = validLevels.includes(mem.memoryLevel) ? mem.memoryLevel : 'semi_abstract'
+
+  // v2.6: meta_knowledge write-gate. A real snapshot of an active mneme DB
+  // measured 71% of stored memories at level=meta after the "default semi"
+  // knob shipped — self-discipline on wording didn't hold. This gate checks
+  // content for concrete bindings (ISO date, mem-rowid ref, commit hash,
+  // abs path, version, project/multi-person names) and auto-downgrades to
+  // semi_abstract when caller asked for meta. Signal words like
+  // "cross-project" or "heuristic" exempt soft bindings but never hard ones.
+  // DETECTION ONLY — same philosophy as the near-dup gate: never reject the
+  // write, just annotate. Downgrade info flows out via opts.out.metaDowngrade.
+  const gate = applyMetaGate(mem.content || '', requestedLevel)
+  const memoryLevel = gate.finalLevel
+  if (gate.downgraded) {
+    log(`storeMemory: meta_knowledge downgraded to semi_abstract | reasons: ${gate.reasons.join(' | ')}`)
+    if (opts.out) {
+      opts.out.metaDowngrade = {
+        fromLevel: 'meta_knowledge',
+        toLevel: 'semi_abstract',
+        reasons: gate.reasons,
+      }
+    }
+  }
 
   // Structured supersede (migration 001): when caller passes mem.supersedes (array of
   // rowid strings), the new record's id will be UPDATEd into old records' superseded_by
@@ -791,6 +832,36 @@ export function storeMemory(mem) {
   // migration 004 (v2.2): content hash + event_time
   const contentHash = createHash('sha256').update(String(mem.content || '')).digest('hex').slice(0, 16)
   const eventTime = _parseEventTime(mem.eventTime)
+
+  // migration 008 (v2.6): is_anchor / is_pinned scarcity quota check.
+  // Hard caps enforce trade-off instead of inflating importance to 9-10 for
+  // everything. DETECTION ONLY — over-quota resets the flag to 0 and pushes
+  // opts.out.quotaRejected up for the MCP layer to surface. Same philosophy
+  // as the near-dup gate and the meta gate: never reject the store.
+  const ANCHOR_LIMIT = 40
+  const PIN_LIMIT = 30
+  let isAnchor = mem.isAnchor ? 1 : 0
+  let isPinned = mem.isPinned ? 1 : 0
+  const quotaRejected = []
+  if (isAnchor) {
+    const cnt = db.prepare(`SELECT COUNT(*) as c FROM memories WHERE is_anchor = 1 AND deleted_at IS NULL`).get().c
+    if (cnt >= ANCHOR_LIMIT) {
+      isAnchor = 0
+      quotaRejected.push({ flag: 'is_anchor', current: cnt, limit: ANCHOR_LIMIT })
+      log(`storeMemory: is_anchor quota exhausted (${cnt}/${ANCHOR_LIMIT}) — flag reset to 0`)
+    }
+  }
+  if (isPinned) {
+    const cnt = db.prepare(`SELECT COUNT(*) as c FROM memories WHERE is_pinned = 1 AND deleted_at IS NULL`).get().c
+    if (cnt >= PIN_LIMIT) {
+      isPinned = 0
+      quotaRejected.push({ flag: 'is_pinned', current: cnt, limit: PIN_LIMIT })
+      log(`storeMemory: is_pinned quota exhausted (${cnt}/${PIN_LIMIT}) — flag reset to 0`)
+    }
+  }
+  if (quotaRejected.length && opts.out) {
+    opts.out.quotaRejected = quotaRejected
+  }
 
   // migration 004 (v2.2): 5-min window dedup
   // If the same content was stored within the last DEDUP_WINDOW_MS,
@@ -827,8 +898,9 @@ export function storeMemory(mem) {
       INSERT INTO memories
         (content, summary, memory_type, category, importance, emotional_impact,
          source, source_id, source_platform, tags, metadata, expires_at,
-         compressed_from, is_compressed, memory_level, content_hash, event_time)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         compressed_from, is_compressed, memory_level, content_hash, event_time,
+         is_anchor, is_pinned)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
     const supersedeStmt = db.prepare(
       `UPDATE memories SET superseded_by = ? WHERE rowid = ? AND deleted_at IS NULL AND superseded_by IS NULL`
@@ -862,6 +934,8 @@ export function storeMemory(mem) {
         memoryLevel,
         contentHash,    // migration 004 (v2.2)
         eventTime,      // migration 004 (v2.2)
+        isAnchor,       // migration 008 (v2.6)
+        isPinned,       // migration 008 (v2.6)
       )
       newId = info.lastInsertRowid ? String(info.lastInsertRowid) : null
 
@@ -944,7 +1018,7 @@ function findNearDuplicates(db, embedding, excludeId, { topK = 5, threshold = 0.
  * opts.dupThreshold (number): cosine floor for surfacing near-dups (default 0.92).
  */
 export async function storeMemoryAsync(mem, opts = {}) {
-  const id = storeMemory(mem)
+  const id = storeMemory(mem, opts)
   if (!id) return null
 
   const embedding = await generateEmbedding(mem.content)
