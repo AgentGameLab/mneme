@@ -47,7 +47,7 @@ let pass = 0, fail = 0
 {
   const r = runHook(PROMPT_HOOK, {
     session_id: 'test-mneme-hooks-' + Math.random().toString(36).slice(2, 8),
-    prompt: '怎么启动千夏的 daemon？端口配在哪里？',
+    prompt: 'how do I start the daemon and where is the port config?',
   })
   const v = isValidHookOutput(r.stdout, 'UserPromptSubmit')
   const ok = r.status === 0 && v.ok
@@ -131,17 +131,30 @@ let pass = 0, fail = 0
   console.log(`${ok?'✓':'✗'} tool-recall Read: status=${r.status} silent=${v.silent}`)
 }
 
-// case 8: Glob with pure `**/*.ext` — must skip
+// case 8: Glob with too-short stem — must skip. `*.js` stem "js" (len=2).
 {
   const r = runHook(TOOL_HOOK, {
     session_id: 'test-mneme-tool-glob-empty',
     tool_name: 'Glob',
-    tool_input: { pattern: '**/*.mjs' },
+    tool_input: { pattern: '*.js' },
   })
   const v = isValidHookOutput(r.stdout, 'PreToolUse')
   const ok = r.status === 0 && v.silent
   if (ok) pass++; else fail++
-  console.log(`${ok?'✓':'✗'} tool-recall Glob pure-pattern: status=${r.status} silent=${v.silent}`)
+  console.log(`${ok?'✓':'✗'} tool-recall Glob short-stem: status=${r.status} silent=${v.silent}`)
+}
+
+// case 8b: Glob with short-but-meaningful dir stem — must fire recall.
+{
+  const r = runHook(TOOL_HOOK, {
+    session_id: 'test-mneme-tool-glob-dir',
+    tool_name: 'Glob',
+    tool_input: { pattern: 'src/**/*.mjs' },
+  })
+  const v = isValidHookOutput(r.stdout, 'PreToolUse')
+  const ok = r.status === 0 && v.ok
+  if (ok) pass++; else fail++
+  console.log(`${ok?'✓':'✗'} tool-recall Glob dir-stem: status=${r.status} silent=${v.silent}`)
 }
 
 // case 9: unknown tool_name — must skip

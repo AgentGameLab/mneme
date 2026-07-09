@@ -145,6 +145,28 @@ Extraction is async + batched; recall stays pure SQL (zero LLM on the hot path).
 
 ---
 
+## 4b. Optional: meta-gate soft vocabularies (v2.6)
+
+The write-gate in `meta-gate.mjs` auto-downgrades `meta_knowledge` stores to
+`semi_abstract` when the content has concrete bindings. Two of the bindings —
+project names and person names — are *soft*: they only fire if you provide the
+vocabulary. The public repo ships **empty** defaults so it carries no team
+roster.
+
+Set these env vars anywhere your agent runs mneme to turn on soft matching:
+
+| var | example | meaning |
+|-----|---------|---------|
+| `MNEME_META_GATE_PROJECT_NAMES` | `MyApp,billing-service,mobile-app` | Comma-separated project/product identifiers |
+| `MNEME_META_GATE_PERSON_NAMES` | `alice,bob,carol` | Comma-separated person names (needs ≥ 2 hits to trigger a downgrade) |
+| `MNEME_META_GATE_SIGNAL_WORDS` | `cross-project,heuristic` | Overrides the built-in EN+ZH signal-word list that exempts soft matches |
+
+Hard bindings (ISO date, mem-rowid ref, commit hash, absolute path, version
+string) always fire without any configuration. Signal words in the first 200
+characters of the content can exempt a *soft* binding — never a hard one.
+
+---
+
 ## 5. Optional: auto-recall hooks (Claude Code)
 
 The MCP tools are pull-based — the agent decides when to `recall_memory`. Some agents (Claude

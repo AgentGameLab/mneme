@@ -33,21 +33,31 @@
 //   - Session-scoped dedup shared with prompt-recall via a separate file.
 
 import { spawnSync } from 'node:child_process'
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs'
 import { resolve, dirname, basename } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const HOME = process.env.USERPROFILE || process.env.HOME || __dirname
 
+// Parse a positive integer env var, silently falling back on bad input.
+// See the identical helper in prompt-recall.mjs — kept duplicated because
+// these two hooks are meant to be individually copyable.
+function intEnv(name, fallback) {
+  const raw = process.env[name]
+  if (raw === undefined || raw === '') return fallback
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback
+}
+
 const CFG = {
   indexPath: process.env.MNEME_INDEX_PATH || resolve(__dirname, '..', 'index.mjs'),
-  minImportance: parseInt(process.env.MNEME_TOOL_MIN_IMPORTANCE || '6', 10),
+  minImportance: intEnv('MNEME_TOOL_MIN_IMPORTANCE', 6),
   level: process.env.MNEME_TOOL_LEVEL || 'meta_knowledge,semi_abstract',
-  limit: parseInt(process.env.MNEME_TOOL_LIMIT || '4', 10),
-  queryLen: parseInt(process.env.MNEME_TOOL_QUERY_LEN || '120', 10),
+  limit: intEnv('MNEME_TOOL_LIMIT', 4),
+  queryLen: intEnv('MNEME_TOOL_QUERY_LEN', 120),
   stateDir: process.env.MNEME_STATE_DIR || resolve(HOME, '.claude', 'hooks'),
-  timeoutMs: parseInt(process.env.MNEME_TIMEOUT_MS || '2800', 10),
+  timeoutMs: intEnv('MNEME_TIMEOUT_MS', 2800),
 }
 
 // Extract a short recall query from tool arguments.
@@ -72,16 +82,21 @@ function extractQuery(toolName, toolInput) {
     case 'Read': {
       const path = String(toolInput.file_path || '').trim()
       if (!path) return ''
-      return basename(path).replace(/\.[a-z0-9]+$/i, '').slice(0, CFG.queryLen)
+      // Strip ALL trailing extensions, not just the last one — `foo.test.mjs`
+      // and `user.service.spec.ts` should both reduce to the actual concept.
+      const bare = basename(path).replace(/(\.[A-Za-z0-9]+)+$/, '')
+      return bare.slice(0, CFG.queryLen)
     }
     case 'Glob': {
       const pattern = String(toolInput.pattern || '').trim()
       if (!pattern) return ''
-      // Drop glob metachars, path separators, and dots — what's left is the
-      // meaningful stem. `**/*.mjs` / `src/**/*.ts` etc. collapse to too-short
-      // strings, which we then skip.
+      // Strip glob metachars / separators / dots and see what stem is left.
+      // We accept stems ≥ 2 chars as long as they contain at least one letter,
+      // so `src/*` and `lib/*` survive while `**/*.mjs` (stem "mjs" — all
+      // letters but ext-shaped) still passes; `**/*.js` (stem "js" — 2 chars)
+      // will pass too, that's fine — the recall itself is cheap.
       const stem = pattern.replace(/[*?/\\.]+/g, ' ').replace(/\s+/g, ' ').trim()
-      if (stem.length < 5) return ''
+      if (stem.length < 3 || !/[A-Za-z一-鿿]/.test(stem)) return ''
       return stem.slice(0, CFG.queryLen)
     }
     default:
@@ -107,8 +122,13 @@ function saveInjected(sessionId, idSet) {
   try {
     if (!existsSync(CFG.stateDir)) mkdirSync(CFG.stateDir, { recursive: true })
     const p = stateFilePath(sessionId)
+    const tmp = p + '.tmp-' + process.pid
     const ids = Array.from(idSet).slice(-200)
-    writeFileSync(p, JSON.stringify({ ids, ts: Date.now() }))
+    // Atomic write: write to temp then rename. A kill between write and
+    // rename leaves the previous state file intact instead of a truncated
+    // JSON that would evaporate session dedup on the next load.
+    writeFileSync(tmp, JSON.stringify({ ids, ts: Date.now() }))
+    renameSync(tmp, p)
   } catch { /* best-effort */ }
 }
 

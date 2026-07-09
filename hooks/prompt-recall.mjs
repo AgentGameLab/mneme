@@ -40,21 +40,32 @@
 //   - Session-scoped dedup: same rowid never re-injected within a session.
 
 import { spawnSync } from 'node:child_process'
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const HOME = process.env.USERPROFILE || process.env.HOME || __dirname
 
+// Parse a positive integer env var. Silently falls back to `fallback` on
+// missing, non-numeric, negative, or NaN values — hook is fail-soft, we
+// don't want a bad env like MNEME_TIMEOUT_MS=abc leaking a TimeoutNaNWarning
+// to stderr and violating the "silent" contract.
+function intEnv(name, fallback) {
+  const raw = process.env[name]
+  if (raw === undefined || raw === '') return fallback
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback
+}
+
 const CFG = {
   indexPath: process.env.MNEME_INDEX_PATH || resolve(__dirname, '..', 'index.mjs'),
-  minImportance: parseInt(process.env.MNEME_MIN_IMPORTANCE || '6', 10),
+  minImportance: intEnv('MNEME_MIN_IMPORTANCE', 6),
   level: process.env.MNEME_LEVEL || 'meta_knowledge',
-  limit: parseInt(process.env.MNEME_LIMIT || '5', 10),
-  minConsensus: parseInt(process.env.MNEME_MIN_CONSENSUS || '2', 10),
+  limit: intEnv('MNEME_LIMIT', 5),
+  minConsensus: intEnv('MNEME_MIN_CONSENSUS', 2),
   stateDir: process.env.MNEME_STATE_DIR || resolve(HOME, '.claude', 'hooks'),
-  timeoutMs: parseInt(process.env.MNEME_TIMEOUT_MS || '2800', 10),
+  timeoutMs: intEnv('MNEME_TIMEOUT_MS', 2800),
 }
 
 // Generic trigger set. Covers "how do I / where is / what's the path" style
@@ -100,8 +111,14 @@ function saveInjected(sessionId, idSet) {
   try {
     if (!existsSync(CFG.stateDir)) mkdirSync(CFG.stateDir, { recursive: true })
     const p = stateFilePath(sessionId)
+    const tmp = p + '.tmp-' + process.pid
     const ids = Array.from(idSet).slice(-200)  // cap file size
-    writeFileSync(p, JSON.stringify({ ids, ts: Date.now() }))
+    // Atomic write: full-content write to a per-pid temp, then rename. A
+    // kill between write and rename leaves the previous state file intact
+    // (no truncated JSON, no lost dedup). Orphaned .tmp files from a
+    // crashed process will be overwritten by the next same-pid save.
+    writeFileSync(tmp, JSON.stringify({ ids, ts: Date.now() }))
+    renameSync(tmp, p)
   } catch { /* best-effort */ }
 }
 

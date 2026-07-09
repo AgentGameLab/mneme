@@ -12,7 +12,8 @@ const cases = [
   { content: 'AbyssDatabase v0.2.0 released', expect: true, label: 'project+version' },
   { content: '2026-05-05 ship notes for the mesh refactor', expect: true, label: 'iso_date' },
   { content: 'continues from mem 6008 personality rules', expect: true, label: 'mem_ref' },
-  { content: 'edit E:/Project/example/store.mjs to add the guard', expect: true, label: 'abs_path' },
+  { content: 'edit E:/Project/example/store.mjs to add the guard', expect: true, label: 'abs_path_windows' },
+  { content: 'the daemon config lives at /etc/mneme/config.json', expect: true, label: 'abs_path_posix' },
   { content: 'after commit 41171eb we must verify the committer', expect: true, label: 'commit_hash' },
 
   // Downgrade (soft bindings — require env-configured vocabularies)

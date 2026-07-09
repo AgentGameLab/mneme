@@ -28,9 +28,10 @@ import { applyMetaGate } from './meta-gate.mjs'
 const require = createRequire(import.meta.url)
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
-// Optional team-registry sender_id verify hook (千夏-private workspace only).
-// Public mneme checkout has no ../lib/ sibling — make import fail-soft so
-// MCP startup never crashes when the hook isn't bundled.
+// Optional sender_id verify hook — downstream forks can drop a
+// `../lib/team-registry-verify.mjs` sibling to gate stores by sender.
+// Public checkouts have no such file; the fail-soft import below keeps
+// startup working either way.
 let verifyAndRecord = null
 try {
   const hookPath = resolve(__dirname, '..', 'lib', 'team-registry-verify.mjs')
@@ -688,7 +689,7 @@ function cosineSimilarity(a, b) {
  * @returns {string|null} conversation id
  */
 export function recordConversation(msg) {
-  // G7 family · 千夏 segment: sender_id verify against team-registry
+  // Optional sender_id verify against a team-registry hook.
   // Fail-soft: log + metric, never blocks main flow. Hook is optional —
   // public mneme checkout has no ../lib/ sibling so the import resolves to
   // null and we silently skip the verify call.
@@ -1066,8 +1067,8 @@ export async function storeMemoryAsync(mem, opts = {}) {
 }
 
 /**
- * [2026-05-29 千夏] Self-heal sweep：给缺 content_vector 的活跃记忆补向量。
- * 堵漏——绕过 storeMemoryAsync 的写入路径（同步 storeMemory / CLI / staging 批处理）
+ * Self-heal sweep: fill missing content_vector on active memories.
+ * Covers writes that bypassed storeMemoryAsync (sync storeMemory / CLI / batch)
  * 会让新记忆永久缺向量、对语义召回失明。MCP server 启动时 fire-and-forget 跑一遍，
  * 把"宕机/降级期间漏写的 NULL 向量"扫掉。幂等（只扫 NULL）、有 cap、维度校验拒绝混维。
  * @param {number} limit 单次最多补多少条（防一次性打爆 embedding API）
@@ -1964,8 +1965,8 @@ export function getMemoryStats() {
     `).get()
     const conv = db.prepare(`SELECT COUNT(*) AS count FROM conversations`).get()
 
-    // [2026-05-29 千夏] 向量覆盖率：active 记忆中有 content_vector 的比例。
-    // 用于 /health 主动告警——掉线/漏写时 coverage 会跌，watchdog 据此报警，
+    // Vector coverage: fraction of active memories with a content_vector.
+    // Surfaced on /health so callers can alert when it drops (indicates a
     // 而不是靠人偶然调 memory_stats 才发现"FTS5 only"。
     const vecCov = db.prepare(`
       SELECT

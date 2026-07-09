@@ -52,7 +52,9 @@ const HARD_BINDINGS = [
   // Commit hashes have to include at least one letter [a-f] — pure-digit
   // strings like "8080000" or "port 1234567" would otherwise match.
   { name: 'commit_hash', re: /\b(?=[a-f0-9]*[a-f])[a-f0-9]{7,40}\b/, hint: 'specific commit hash' },
-  { name: 'abs_path', re: /(?:^|[\s`'"(])[A-Za-z]:[\/\\][A-Za-z0-9_\-\.\/\\]{3,}/, hint: 'specific absolute path' },
+  // Absolute paths — Windows drive-letter form OR POSIX-style `/`-rooted paths
+  // with at least two segments (avoids matching a lone `/` sentence separator).
+  { name: 'abs_path', re: /(?:(?:^|[\s`'"(])[A-Za-z]:[\/\\][A-Za-z0-9_\-\.\/\\]{3,}|(?:^|[\s`'"(])\/(?:[A-Za-z0-9_\-\.]+\/){1,}[A-Za-z0-9_\-\.]+)/, hint: 'specific absolute path' },
   { name: 'port_host', re: /:\d{2,5}\/|https?:\/\/[a-z0-9\.\-]+\.[a-z]{2,}/i, hint: 'specific port or host' },
 ]
 

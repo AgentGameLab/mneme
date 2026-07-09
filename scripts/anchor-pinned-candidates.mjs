@@ -19,16 +19,27 @@
 // ============================================================
 
 import Database from 'better-sqlite3'
-import { writeFileSync } from 'node:fs'
+import { writeFileSync, existsSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const DB_PATH = resolve(__dirname, '..', 'engram.db')
+
+// Mirror index.mjs's DB resolution so `TOKENMEM_DB_PATH=/prod/mneme.db node ...`
+// works and doesn't silently mutate the wrong DB. Order: explicit env → legacy
+// engram.db beside the module → fresh-install tokenmem.db default.
+const args = process.argv.slice(2)
+const dbFlag = args.find(a => a.startsWith('--db='))
+const DB_PATH = (
+  (dbFlag && dbFlag.slice(5))
+  || process.env.TOKENMEM_DB_PATH
+  || (existsSync(resolve(__dirname, '..', 'engram.db'))
+        ? resolve(__dirname, '..', 'engram.db')
+        : resolve(__dirname, '..', 'tokenmem.db'))
+)
 const ANCHOR_LIMIT = 40
 const PIN_LIMIT = 30
 
-const args = process.argv.slice(2)
 const WRITE = args.includes('--write')
 const jsonArg = args.find(a => a.startsWith('--json='))
 const jsonPath = jsonArg ? jsonArg.split('=')[1] : null
