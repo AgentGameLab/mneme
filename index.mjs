@@ -336,18 +336,21 @@ export function initMemory() {
   // quotas (anchor <= 40 / pinned <= 30) so callers must trade off. Anchor is
   // the stronger tier (identity / rule level); pinned is a recall floor.
   // Quota check lives in storeMemory (application layer).
+  //
+  // Catch narrowly: only swallow the "column already exists" case that ADD
+  // COLUMN throws on a second run. Anything else (disk full, permission,
+  // WAL lock) should surface loudly so the operator can act.
+  const isDupColumn = (e) => /duplicate column name/i.test(String(e?.message || ''))
   try {
     db.exec(`ALTER TABLE memories ADD COLUMN is_anchor INTEGER NOT NULL DEFAULT 0`)
     log('Migration 008: added is_anchor column')
-  } catch {}
+  } catch (e) { if (!isDupColumn(e)) throw e }
   try {
     db.exec(`ALTER TABLE memories ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0`)
     log('Migration 008: added is_pinned column')
-  } catch {}
-  try {
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_anchor ON memories(is_anchor) WHERE is_anchor = 1 AND deleted_at IS NULL`)
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_pinned ON memories(is_pinned) WHERE is_pinned = 1 AND deleted_at IS NULL`)
-  } catch {}
+  } catch (e) { if (!isDupColumn(e)) throw e }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_anchor ON memories(is_anchor) WHERE is_anchor = 1 AND deleted_at IS NULL`)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_pinned ON memories(is_pinned) WHERE is_pinned = 1 AND deleted_at IS NULL`)
 
   // Vector search virtual table (sqlite-vec)
   // Dimension determined by _embeddingConfig; skip if not available
@@ -833,35 +836,21 @@ export function storeMemory(mem, opts = {}) {
   const contentHash = createHash('sha256').update(String(mem.content || '')).digest('hex').slice(0, 16)
   const eventTime = _parseEventTime(mem.eventTime)
 
-  // migration 008 (v2.6): is_anchor / is_pinned scarcity quota check.
-  // Hard caps enforce trade-off instead of inflating importance to 9-10 for
-  // everything. DETECTION ONLY — over-quota resets the flag to 0 and pushes
-  // opts.out.quotaRejected up for the MCP layer to surface. Same philosophy
-  // as the near-dup gate and the meta gate: never reject the store.
+  // migration 008 (v2.6): is_anchor / is_pinned scarcity quota.
+  // Hard caps force callers to trade off instead of inflating importance to
+  // 9-10 for everything. DETECTION ONLY — over-quota resets the flag to 0
+  // and pushes opts.out.quotaRejected up for the MCP layer to surface. Same
+  // philosophy as the near-dup gate and the meta gate: never reject the store.
+  //
+  // The actual COUNT re-check happens INSIDE the INSERT transaction below so
+  // two concurrent writers can't both slip past a full cap. We resolve the
+  // requested flags here (mem.isAnchor/isPinned → 1|0) and pre-declare
+  // quotaRejected so the tx callback can populate it.
   const ANCHOR_LIMIT = 40
   const PIN_LIMIT = 30
   let isAnchor = mem.isAnchor ? 1 : 0
   let isPinned = mem.isPinned ? 1 : 0
   const quotaRejected = []
-  if (isAnchor) {
-    const cnt = db.prepare(`SELECT COUNT(*) as c FROM memories WHERE is_anchor = 1 AND deleted_at IS NULL`).get().c
-    if (cnt >= ANCHOR_LIMIT) {
-      isAnchor = 0
-      quotaRejected.push({ flag: 'is_anchor', current: cnt, limit: ANCHOR_LIMIT })
-      log(`storeMemory: is_anchor quota exhausted (${cnt}/${ANCHOR_LIMIT}) — flag reset to 0`)
-    }
-  }
-  if (isPinned) {
-    const cnt = db.prepare(`SELECT COUNT(*) as c FROM memories WHERE is_pinned = 1 AND deleted_at IS NULL`).get().c
-    if (cnt >= PIN_LIMIT) {
-      isPinned = 0
-      quotaRejected.push({ flag: 'is_pinned', current: cnt, limit: PIN_LIMIT })
-      log(`storeMemory: is_pinned quota exhausted (${cnt}/${PIN_LIMIT}) — flag reset to 0`)
-    }
-  }
-  if (quotaRejected.length && opts.out) {
-    opts.out.quotaRejected = quotaRejected
-  }
 
   // migration 004 (v2.2): 5-min window dedup
   // If the same content was stored within the last DEDUP_WINDOW_MS,
@@ -916,6 +905,26 @@ export function storeMemory(mem, opts = {}) {
 
     let newId = null
     const tx = db.transaction(() => {
+      // migration 008 (v2.6): re-check anchor/pinned quotas INSIDE the tx so
+      // concurrent writers can't both slip past a full cap. Downgrade the
+      // flag to 0 on overflow — the write itself still succeeds.
+      if (isAnchor) {
+        const cnt = db.prepare(`SELECT COUNT(*) as c FROM memories WHERE is_anchor = 1 AND deleted_at IS NULL`).get().c
+        if (cnt >= ANCHOR_LIMIT) {
+          isAnchor = 0
+          quotaRejected.push({ flag: 'is_anchor', current: cnt, limit: ANCHOR_LIMIT })
+          log(`storeMemory: is_anchor quota exhausted (${cnt}/${ANCHOR_LIMIT}) — flag reset to 0`)
+        }
+      }
+      if (isPinned) {
+        const cnt = db.prepare(`SELECT COUNT(*) as c FROM memories WHERE is_pinned = 1 AND deleted_at IS NULL`).get().c
+        if (cnt >= PIN_LIMIT) {
+          isPinned = 0
+          quotaRejected.push({ flag: 'is_pinned', current: cnt, limit: PIN_LIMIT })
+          log(`storeMemory: is_pinned quota exhausted (${cnt}/${PIN_LIMIT}) — flag reset to 0`)
+        }
+      }
+
       const info = insertStmt.run(
         mem.content,
         mem.summary || null,
@@ -972,6 +981,11 @@ export function storeMemory(mem, opts = {}) {
       }
     })
     tx()
+    // Surface anchor/pinned quota rejections up to the caller AFTER the tx
+    // commits — the tx populated `quotaRejected` if any flag was reset.
+    if (quotaRejected.length && opts.out) {
+      opts.out.quotaRejected = quotaRejected
+    }
     return newId
   } catch (e) {
     log(`storeMemory failed: ${e.message}`)

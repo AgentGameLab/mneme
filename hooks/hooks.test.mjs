@@ -96,7 +96,7 @@ let pass = 0, fail = 0
   const r = runHook(TOOL_HOOK, {
     session_id: 'test-mneme-tool-' + Math.random().toString(36).slice(2, 8),
     tool_name: 'Bash',
-    tool_input: { command: 'node E:/Project/chinatsu-workspace/scripts/schedule-self-wakeup.mjs --delay 60' },
+    tool_input: { command: 'node scripts/schedule-self-wakeup.mjs --delay 60' },
   })
   const v = isValidHookOutput(r.stdout, 'PreToolUse')
   const ok = r.status === 0 && v.ok
@@ -123,7 +123,7 @@ let pass = 0, fail = 0
   const r = runHook(TOOL_HOOK, {
     session_id: 'test-mneme-tool-read',
     tool_name: 'Read',
-    tool_input: { file_path: 'E:/Project/chinatsu-workspace/memory/mcp-server.mjs' },
+    tool_input: { file_path: 'mcp-server.mjs' },
   })
   const v = isValidHookOutput(r.stdout, 'PreToolUse')
   const ok = r.status === 0 && v.ok

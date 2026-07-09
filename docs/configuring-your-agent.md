@@ -204,6 +204,7 @@ be re-injected within one Claude Code session.
 | `MNEME_TOOL_MIN_IMPORTANCE` | `6` | Floor for tool-recall hits |
 | `MNEME_TOOL_LEVEL` | `meta_knowledge,semi_abstract` | Tool-recall level filter |
 | `MNEME_TOOL_LIMIT` | `4` | Tool-recall candidate cap |
+| `MNEME_TOOL_QUERY_LEN` | `120` | Max chars of tool arg used as recall query |
 | `MNEME_STATE_DIR` | `~/.claude/hooks` | Where session dedup files live |
 | `MNEME_TIMEOUT_MS` | `2800` | Spawn timeout for the recall CLI |
 

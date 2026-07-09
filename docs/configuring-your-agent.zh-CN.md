@@ -183,6 +183,7 @@ MCP tool 是 pull 模式——Agent 自己决定何时 `recall_memory`。有些 
 | `MNEME_TOOL_MIN_IMPORTANCE` | `6` | tool-recall 命中门槛 |
 | `MNEME_TOOL_LEVEL` | `meta_knowledge,semi_abstract` | tool-recall level 过滤 |
 | `MNEME_TOOL_LIMIT` | `4` | tool-recall 候选上限 |
+| `MNEME_TOOL_QUERY_LEN` | `120` | 从 tool 参数抽 query 的最大字符数 |
 | `MNEME_STATE_DIR` | `~/.claude/hooks` | session 去重文件放哪 |
 | `MNEME_TIMEOUT_MS` | `2800` | recall CLI 的 spawn 超时 |
 
