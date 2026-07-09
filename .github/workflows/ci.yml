@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: node ${{ matrix.node }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        node: ['20', '22']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # No lockfile in-repo (package-lock.json is gitignored so consumers
+      # resolve their own deps). `npm install` is intentional.
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Syntax check
+        run: |
+          find . -type f -name '*.mjs' -not -path './node_modules/*' -print0 \
+            | xargs -0 -n1 node --check
+
+      - name: Unit tests (meta-gate)
+        run: node meta-gate.test.mjs
+
+      - name: Integration test (meta-gate write-gate)
+        env:
+          TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-meta-gate.db
+        run: node meta-gate.integration.test.mjs
+
+      - name: Integration test (anchor/pinned quota)
+        env:
+          TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-anchor-pinned.db
+        run: node anchor-pinned.integration.test.mjs
+
+      - name: End-to-end test (hooks)
+        env:
+          TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-hooks.db
+          MNEME_DB_PATH: ${{ runner.temp }}/mneme-ci-hooks.db
+          MNEME_STATE_DIR: ${{ runner.temp }}/mneme-hook-state
+        run: node hooks/hooks.test.mjs

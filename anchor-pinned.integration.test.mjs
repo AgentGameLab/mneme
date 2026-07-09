@@ -15,8 +15,33 @@ function verifyRow(id) {
 }
 
 import Database from 'better-sqlite3'
-// Read-only connection to check is_anchor / is_pinned values — no writes, no FTS trigger, tokenizer irrelevant
-const dbRead = new Database('./engram.db', { readonly: true })
+import { resolve, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { existsSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+
+// Resolve the DB the same way index.mjs does so CI / user overrides work.
+const __dirname_at = dirname(fileURLToPath(import.meta.url))
+const DB_PATH = process.env.TOKENMEM_DB_PATH
+  || (existsSync(resolve(__dirname_at, 'engram.db'))
+        ? resolve(__dirname_at, 'engram.db')
+        : resolve(__dirname_at, 'tokenmem.db'))
+
+// If the simple tokenizer extension is available (like on the primary dev
+// machine), initMemory() will have migrated memories_fts to tokenize='simple 0'.
+// Downstream write connections in this test also need to load the extension
+// or INSERT will trip an FTS trigger with "no such tokenizer: simple".
+// On CI (no ext binary) this is a no-op and the FTS table stays unicode61.
+const SIMPLE_EXT_PATH = resolve(__dirname_at, 'lib', 'libsimple-windows-x64', 'simple')
+function tryLoadSimple(db) {
+  try {
+    if (existsSync(SIMPLE_EXT_PATH + '.dll') || existsSync(SIMPLE_EXT_PATH)) {
+      db.loadExtension(SIMPLE_EXT_PATH)
+    }
+  } catch { /* extension unavailable — FTS stays on unicode61 */ }
+}
+
+const dbRead = new Database(DB_PATH, { readonly: true })
 
 const baseAnchor = dbRead.prepare('SELECT COUNT(*) as c FROM memories WHERE is_anchor = 1 AND deleted_at IS NULL').get().c
 const basePinned = dbRead.prepare('SELECT COUNT(*) as c FROM memories WHERE is_pinned = 1 AND deleted_at IS NULL').get().c
@@ -77,10 +102,34 @@ console.log(`baseline: anchor=${baseAnchor} pinned=${basePinned}`)
 // We open a write connection WITHOUT extension load — UPDATE on existing rows does NOT
 // trigger the FTS insert/update trigger (those fire on INSERT/UPDATE of content/summary/tags),
 // so UPDATE is_anchor is safe with unicode61 tokenizer default.
-const dbWrite = new Database('./engram.db')
+const dbWrite = new Database(DB_PATH)
+tryLoadSimple(dbWrite)
+const paddedIds = []
 try {
-  // Get 40 existing rows (real anchors + top importance) and temp-flag them
-  const rowsToFlag = dbRead.prepare('SELECT rowid FROM memories WHERE deleted_at IS NULL AND is_anchor = 0 ORDER BY importance DESC, rowid LIMIT ?').all(40 - baseAnchor)
+  // Ensure at least (40 - baseAnchor) rows with is_anchor=0 exist to flip.
+  // On a fresh DB the earlier cases only added 3, so we pad with cheap
+  // raw-INSERT rows (bypasses FTS triggers by not touching content columns
+  // that already exist — INSERT does trigger, but tokenizer=unicode61 is
+  // the fallback and accepts any content).
+  const needed = 40 - baseAnchor
+  const havePool = dbRead.prepare('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NULL AND is_anchor = 0').get().c
+  if (havePool < needed) {
+    const padInsert = dbWrite.prepare(
+      `INSERT INTO memories (content, content_hash, memory_type, category, importance)
+       VALUES (?, ?, 'short_term', 'general', 5)`
+    )
+    const now = Date.now()
+    for (let i = 0; i < needed - havePool; i++) {
+      const c = `quota-pad-${now}-${i}-${Math.random().toString(36).slice(2, 8)} [test-marker-quota-pad]`
+      const h = createHash('sha256').update(c).digest('hex').slice(0, 16)
+      const r = padInsert.run(c, h)
+      paddedIds.push(r.lastInsertRowid)
+    }
+    console.log(`  padded ${paddedIds.length} extra rows so we can flip 40 to anchor=1`)
+  }
+
+  // Get 40 existing rows and temp-flag them.
+  const rowsToFlag = dbRead.prepare('SELECT rowid FROM memories WHERE deleted_at IS NULL AND is_anchor = 0 ORDER BY importance DESC, rowid LIMIT ?').all(needed)
   const flagStmt = dbWrite.prepare('UPDATE memories SET is_anchor = 1 WHERE rowid = ?')
   const unflagStmt = dbWrite.prepare('UPDATE memories SET is_anchor = 0 WHERE rowid = ?')
   for (const r of rowsToFlag) flagStmt.run(r.rowid)
@@ -114,7 +163,7 @@ try {
 }
 
 // Cleanup: soft-delete test-marker rows (UPDATE deleted_at does not trigger FTS reindex trigger)
-const dbClean = new Database('./engram.db')
+const dbClean = new Database(DB_PATH)
 try {
   const now = Date.now()
   const cleanup = dbClean.prepare(`UPDATE memories SET deleted_at = ? WHERE content LIKE '%[test-marker-%' AND deleted_at IS NULL`).run(now)
