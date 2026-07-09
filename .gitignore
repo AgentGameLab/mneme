@@ -19,3 +19,10 @@ node_modules/
 
 # Misc
 *.zip
+
+# Private staging scripts / one-shot batch stores (never in public repo)
+staging/
+
+# Tool outputs / dry-run reports (not source, contains data snapshots)
+*.tmp.json
+*-candidates.json

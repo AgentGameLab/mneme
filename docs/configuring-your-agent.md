@@ -145,6 +145,138 @@ Extraction is async + batched; recall stays pure SQL (zero LLM on the hot path).
 
 ---
 
+## 5. Optional: auto-recall hooks (Claude Code)
+
+The MCP tools are pull-based — the agent decides when to `recall_memory`. Some agents (Claude
+Code specifically) also support *hooks* that run before every user prompt and every tool call.
+mneme ships two optional hook scripts that push relevant memories back into the conversation
+automatically, so the agent sees them without having to remember to ask.
+
+**These are opt-in.** Skip this section if pull-based recall is enough.
+
+Wire them in `~/.claude/settings.json` (or your project's `.claude/settings.json`):
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [{
+      "hooks": [{
+        "type": "command",
+        "command": "node /abs/path/to/mneme/hooks/prompt-recall.mjs",
+        "timeout": 5
+      }]
+    }],
+    "PreToolUse": [{
+      "matcher": "Bash|Grep|Read|Glob",
+      "hooks": [{
+        "type": "command",
+        "command": "node /abs/path/to/mneme/hooks/tool-recall-pre.mjs",
+        "timeout": 5
+      }]
+    }]
+  }
+}
+```
+
+What they do:
+
+- `prompt-recall.mjs` fires on every user prompt. If the prompt matches an "infrastructure /
+  how-to / where-is" trigger and there are ≥ 2 stored hits at `importance ≥ 6`, the top hits
+  are injected as `additionalContext` so the agent sees them before answering.
+- `tool-recall-pre.mjs` fires before Bash / Grep / Read / Glob calls. It extracts a short
+  query from the tool arguments (command head / grep pattern / file basename / glob stem) and
+  surfaces any related memories — often letting the agent skip the tool call entirely.
+
+Both hooks are **detection-only**: any error (missing DB, spawn crash, timeout) exits silently
+and the prompt/tool call proceeds normally. Session-scoped dedup means the same memory won't
+be re-injected within one Claude Code session.
+
+### Environment variables (all optional)
+
+| var | default | meaning |
+|-----|---------|---------|
+| `MNEME_DB_PATH` | mneme's own `engram.db` | Alias for `TOKENMEM_DB_PATH`; picks the DB file |
+| `MNEME_INDEX_PATH` | `<mneme>/index.mjs` | Override the engine entry point |
+| `MNEME_MIN_IMPORTANCE` | `6` | Floor for prompt-recall hits |
+| `MNEME_LEVEL` | `meta_knowledge` | Prompt-recall level filter |
+| `MNEME_LIMIT` | `5` | Prompt-recall candidate cap |
+| `MNEME_MIN_CONSENSUS` | `2` | Prompt-recall skip if fewer hits |
+| `MNEME_TOOL_MIN_IMPORTANCE` | `6` | Floor for tool-recall hits |
+| `MNEME_TOOL_LEVEL` | `meta_knowledge,semi_abstract` | Tool-recall level filter |
+| `MNEME_TOOL_LIMIT` | `4` | Tool-recall candidate cap |
+| `MNEME_STATE_DIR` | `~/.claude/hooks` | Where session dedup files live |
+| `MNEME_TIMEOUT_MS` | `2800` | Spawn timeout for the recall CLI |
+
+### PreToolUse matcher reference
+
+The `matcher` field is a Claude Code hook feature — it decides which tool calls trigger the
+hook. A few useful shapes:
+
+```jsonc
+// Only Bash — cheapest, catches the most common "I'm about to run a command" moment
+{ "matcher": "Bash", "hooks": [ /* ... */ ] }
+
+// Bash + Grep + Read + Glob — the default we recommend; covers file/code exploration too
+{ "matcher": "Bash|Grep|Read|Glob", "hooks": [ /* ... */ ] }
+
+// Fire on every tool call, no matter what (rare — usually too noisy)
+{ "matcher": ".*", "hooks": [ /* ... */ ] }
+
+// MCP tools — e.g. only fire before your custom MCP server's tools
+{ "matcher": "mcp__myserver__.*", "hooks": [ /* ... */ ] }
+```
+
+Order in the array matters: hooks with the same matcher run top-to-bottom. If you have
+multiple `PreToolUse` hooks (linters, blockers, etc.), put mneme's tool-recall near the top
+so its context arrives before anything else adds noise.
+
+### Debugging — optional but recommended
+
+The bundled hooks are silent by design so they don't clutter your terminal. That also makes
+them hard to debug when they don't fire. Two lightweight options:
+
+**Option A — quick trace via stderr.** Wrap the hook with a shell one-liner that logs whether
+it ran and how long it took:
+
+```jsonc
+{
+  "type": "command",
+  "command": "node /abs/path/to/mneme/hooks/prompt-recall.mjs; echo prompt-recall:$? >&2",
+  "timeout": 5
+}
+```
+
+Claude Code surfaces hook stderr in its own log. `$?` = 0 always (the hooks exit 0 by design),
+but seeing the line prove the hook was invoked at all.
+
+**Option B — append a jsonl trace.** Fork `prompt-recall.mjs` and add before every `process.exit(0)`:
+
+```js
+import { appendFileSync } from 'node:fs'
+try {
+  appendFileSync(resolve(HOME, '.claude/hooks/mneme-trace.jsonl'),
+    JSON.stringify({ ts: new Date().toISOString(), event: 'injected|silent|triggered', sessionId, hits: top?.length ?? 0 }) + '\n')
+} catch {}
+```
+
+Then `grep '"event":"injected"' ~/.claude/hooks/mneme-trace.jsonl | wc -l` tells you how often
+memory actually got surfaced vs how often the hook fired but bailed (dedup / no hits /
+below-threshold). No log = no visibility; upstream mneme intentionally leaves this to you so
+you can shape the format to whatever downstream analytics you want.
+
+### Troubleshooting
+
+- Hook never injects → check `~/.claude/settings.json` is well-formed and `command` is the
+  absolute path. Run the hook manually: `echo '{"prompt":"how do I start the daemon"}' | node hooks/prompt-recall.mjs`
+- Silent even when the prompt looks matching → your trigger patterns are English/Chinese
+  generic. If your prompts use domain-specific jargon, fork `TRIGGERS` in `prompt-recall.mjs`.
+- Wrong DB → set `MNEME_DB_PATH` (or `TOKENMEM_DB_PATH`) to the file you actually want. mneme
+  falls back to the `engram.db` beside `index.mjs` if neither is set.
+- Injects too often / not enough → tune `MNEME_MIN_IMPORTANCE` and `MNEME_MIN_CONSENSUS`.
+  Injecting once but repeatedly across sessions is expected (session dedup is per-session).
+
+---
+
 ## TL;DR
 
 1. Connect mneme via MCP (§3).
@@ -152,3 +284,5 @@ Extraction is async + batched; recall stays pure SQL (zero LLM on the hot path).
 3. The rules that matter most: **store is a gate, `semi_abstract` is the default,
    `meta` is earned, importance is a weak prior, supersede instead of rewrite.**
    That's what keeps the memory sharp instead of bloated.
+4. Optional: enable the auto-recall hooks (§5) if you're on Claude Code and want memory
+   surfaced without asking.

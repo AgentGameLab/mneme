@@ -23,6 +23,7 @@ import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import { createHash } from 'node:crypto'
+import { applyMetaGate } from './meta-gate.mjs'
 
 const require = createRequire(import.meta.url)
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -336,6 +337,22 @@ export function initMemory() {
   } catch {}
   try {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_surface_pool ON memories(importance, last_accessed, decay_score) WHERE deleted_at IS NULL AND superseded_by IS NULL AND importance >= 8`)
+  } catch {}
+  // migration 008 (v2.5): is_anchor / is_pinned scarcity-as-structure layer.
+  // Ombre-Brain 借鉴：importance 1-10 弱先验被通胀（imp>=8 占 61%），加两个 boolean
+  // + 硬配额（anchor <= 40 / pinned <= 30）。语义: anchor 是超集（身份/铁律级），
+  // pinned 是强 recall 保底。配额校验在 storeMemory 里做。
+  try {
+    db.exec(`ALTER TABLE memories ADD COLUMN is_anchor INTEGER NOT NULL DEFAULT 0`)
+    log('Migration 008: added is_anchor column')
+  } catch {}
+  try {
+    db.exec(`ALTER TABLE memories ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0`)
+    log('Migration 008: added is_pinned column')
+  } catch {}
+  try {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_anchor ON memories(is_anchor) WHERE is_anchor = 1 AND deleted_at IS NULL`)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_pinned ON memories(is_pinned) WHERE is_pinned = 1 AND deleted_at IS NULL`)
   } catch {}
 
   // Vector search virtual table (sqlite-vec)
@@ -785,7 +802,7 @@ function _parseEventTime(v) {
  * @param {Object} mem
  * @returns {string|null} memory id
  */
-export function storeMemory(mem) {
+export function storeMemory(mem, opts = {}) {
   const db = getDb()
   const now = Date.now()
 
@@ -818,7 +835,25 @@ export function storeMemory(mem) {
   // - semi_abstract:  "did X because Y" -> default
   // - meta_knowledge: "when encountering X, do Y" -> high recall weight
   const validLevels = ['concrete_trace', 'semi_abstract', 'meta_knowledge']
-  const memoryLevel = validLevels.includes(mem.memoryLevel) ? mem.memoryLevel : 'semi_abstract'
+  const requestedLevel = validLevels.includes(mem.memoryLevel) ? mem.memoryLevel : 'semi_abstract'
+
+  // v2.5 (2026-07-08): meta_knowledge write-gate — 库里 71% 是 meta 说明"默认 semi"
+  // 的 write-gate 靠调用方自律没压住。这里加机器化校验：content 里含具体项目名 /
+  // ISO 日期 / memory 引用 / commit hash / 绝对路径等强绑定信号 → auto-降级 semi。
+  // Signal words（跨项目/普适/铁律等）可以豁免软绑定（项目名/多人名），但硬绑定
+  // 一律以降级为准。DETECTION ONLY，跟 near-dup gate 同哲学，不 reject 只降级。
+  const gate = applyMetaGate(mem.content || '', requestedLevel)
+  const memoryLevel = gate.finalLevel
+  if (gate.downgraded) {
+    log(`storeMemory: meta_knowledge downgraded to semi_abstract | reasons: ${gate.reasons.join(' | ')}`)
+    if (opts.out) {
+      opts.out.metaDowngrade = {
+        fromLevel: 'meta_knowledge',
+        toLevel: 'semi_abstract',
+        reasons: gate.reasons,
+      }
+    }
+  }
 
   // Structured supersede (migration 001): when caller passes mem.supersedes (array of
   // rowid strings), the new record's id will be UPDATEd into old records' superseded_by
@@ -830,6 +865,35 @@ export function storeMemory(mem) {
   // migration 004 (v2.2): content hash + event_time
   const contentHash = createHash('sha256').update(String(mem.content || '')).digest('hex').slice(0, 16)
   const eventTime = _parseEventTime(mem.eventTime)
+
+  // migration 008 (v2.5): is_anchor / is_pinned scarcity quota check.
+  // Ombre-Brain 借鉴：硬配额强制 tradeoff。DETECTION ONLY 一致哲学 — 超配额
+  // 不 reject 整条 store，只把 flag 归零 + 通过 opts.out.quotaRejected 通知调用方
+  // "想 pin 就先 unpin 别的"。跟 near-dup / meta-gate 同 pattern。
+  const ANCHOR_LIMIT = 40
+  const PIN_LIMIT = 30
+  let isAnchor = mem.isAnchor ? 1 : 0
+  let isPinned = mem.isPinned ? 1 : 0
+  const quotaRejected = []
+  if (isAnchor) {
+    const cnt = db.prepare(`SELECT COUNT(*) as c FROM memories WHERE is_anchor = 1 AND deleted_at IS NULL`).get().c
+    if (cnt >= ANCHOR_LIMIT) {
+      isAnchor = 0
+      quotaRejected.push({ flag: 'is_anchor', current: cnt, limit: ANCHOR_LIMIT })
+      log(`storeMemory: is_anchor quota exhausted (${cnt}/${ANCHOR_LIMIT}) — flag reset to 0`)
+    }
+  }
+  if (isPinned) {
+    const cnt = db.prepare(`SELECT COUNT(*) as c FROM memories WHERE is_pinned = 1 AND deleted_at IS NULL`).get().c
+    if (cnt >= PIN_LIMIT) {
+      isPinned = 0
+      quotaRejected.push({ flag: 'is_pinned', current: cnt, limit: PIN_LIMIT })
+      log(`storeMemory: is_pinned quota exhausted (${cnt}/${PIN_LIMIT}) — flag reset to 0`)
+    }
+  }
+  if (quotaRejected.length && opts.out) {
+    opts.out.quotaRejected = quotaRejected
+  }
 
   // migration 004 (v2.2): 5-min window dedup
   // If the same content was stored within the last DEDUP_WINDOW_MS,
@@ -867,8 +931,8 @@ export function storeMemory(mem) {
         (content, summary, memory_type, category, importance, emotional_impact,
          source, source_id, source_platform, tags, metadata, expires_at,
          compressed_from, is_compressed, memory_level, content_hash, event_time,
-         source_conversation_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         source_conversation_id, is_anchor, is_pinned)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
     const supersedeStmt = db.prepare(
       `UPDATE memories SET superseded_by = ? WHERE rowid = ? AND deleted_at IS NULL AND superseded_by IS NULL`
@@ -904,6 +968,8 @@ export function storeMemory(mem) {
         eventTime,      // migration 004 (v2.2)
         // migration 006: 链回来源 L0 对话的 conversations.rowid（Tencent Agent Memory drill-down 借鉴）
         (mem.sourceConversationId ?? null),
+        isAnchor,       // migration 008 (v2.5)
+        isPinned,       // migration 008 (v2.5)
       )
       newId = info.lastInsertRowid ? String(info.lastInsertRowid) : null
 
@@ -986,7 +1052,7 @@ function findNearDuplicates(db, embedding, excludeId, { topK = 5, threshold = 0.
  * opts.dupThreshold (number): cosine floor for surfacing near-dups (default 0.92).
  */
 export async function storeMemoryAsync(mem, opts = {}) {
-  const id = storeMemory(mem)
+  const id = storeMemory(mem, opts)
   if (!id) return null
 
   const embedding = await generateEmbedding(mem.content)
