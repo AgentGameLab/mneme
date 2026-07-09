@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ============================================================
-// mneme MCP Server v2.5.1
+// mneme MCP Server v2.6.0
 // Exposes recall_memory / store_memory / recall_by_id / memory_stats tools
 // On-demand recall for any MCP-compatible AI agent — saves 80-90% memory token costs
 //
@@ -38,18 +38,16 @@ import {
 } from './index.mjs'
 
 // ── Load .env.local BEFORE initMemory() ────────────────────────────────
-// [2026-05-29 千夏] 根因修复：常驻 HTTP MCP server 由 watchdog spawn，
-// 子进程 env 不含 .env.local，导致 initMemory() 读不到 EMBEDDING_API_*，
-// _embeddingConfig=null → 语义召回静默降级回 FTS5（实测掉线 6 周）。
-// daemon.mjs 本来就 load .env.local，但 MCP server 进程是独立的，必须自己 load。
-// 不依赖谁来 spawn / 是否注入 env，进程自给自足最鲁棒。
-// 写法照搬 daemon.mjs:155-164（含 CRLF \r? 兼容）。
+// The MCP server is often spawned by a supervisor (watchdog / launcher) that
+// doesn't inherit the user's shell env. Load `../.env.local` here so that
+// EMBEDDING_API_* and any other config-file secrets reach initMemory() —
+// without this, embeddings silently fall back to FTS5-only.
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const envPath = resolve(__dirname, '..', '.env.local')  // memory/ 的上一级 = chinatsu-workspace/
+const envPath = resolve(__dirname, '..', '.env.local')
 if (existsSync(envPath)) {
   readFileSync(envPath, 'utf-8').split('\n').forEach(line => {
     const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*?)\r?$/)
-    // 已存在的 env 优先（允许 launcher 显式覆盖），只补缺失项
+    // Existing env wins — launcher-set values still override the file.
     if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2].trim()
   })
 }
@@ -57,16 +55,16 @@ if (existsSync(envPath)) {
 // Initialize memory system once at startup
 initMemory()
 
-// [2026-05-29 千夏] 启动自愈 sweep：补宕机/降级期间漏写的 NULL 向量。
-// fire-and-forget，不阻塞 server 启动；无 embedding 配置时内部直接 no-op。
-// 配合 .env.local 加载（上方）+ store_memory 走 storeMemoryAsync，
-// 让"绕过 async 写入路径导致永久缺向量"这条漏在每次重启时被兜住。
+// Startup self-heal sweep: backfill missing content_vector on active memories.
+// Fire-and-forget, doesn't block server startup; no-op when embedding is
+// unconfigured. Complements the .env.local load above so restarts patch the
+// windows during which writes went through paths that skipped embedding.
 embedMissingVectors(500).then(r => {
   if (r.embedded || r.failed) console.error(`[mneme] startup self-heal: embedded ${r.embedded}, failed ${r.failed}, scanned ${r.scanned}`)
 }).catch(e => console.error(`[mneme] startup self-heal failed: ${e.message}`))
 
 const SERVER_NAME = 'mneme'
-const SERVER_VERSION = '2.5.1'
+const SERVER_VERSION = '2.6.0'
 
 // ── Factory: each call returns a fresh McpServer with all 4 tools registered ──
 // Why factory: HTTP stateful multi-client mode requires per-session McpServer
@@ -102,7 +100,7 @@ function createServer() {
   // ── Tool: store_memory ──────────────────────────────────────
   s.tool(
     'store_memory',
-    'Store important information in the agent\'s long-term memory. New preferences, decisions, key facts, and user feedback should be stored promptly. Default to semi_abstract; reserve meta_knowledge for genuinely cross-context heuristics (test: would it help in a completely unrelated project?). Importance is a weak prior, not a ranking lever — true salience emerges from recall frequency. The store surfaces a near-duplicate warning when content closely matches an existing memory; supersede that one instead of duplicating.',
+    'Store important information in the agent\'s long-term memory. New preferences, decisions, key facts, and user feedback should be stored promptly. Default to semi_abstract; reserve meta_knowledge for genuinely cross-context heuristics (test: would it help in a completely unrelated project?). meta_knowledge with concrete bindings (project name / ISO date / memory rowid ref / commit hash / absolute path) is auto-downgraded to semi_abstract — the response shows the reasons so you can adjust wording next time. Importance is a weak prior for recall display ranking, NOT an input to decay / auto-forget — retention emerges from access_count / recency. The store also surfaces a near-duplicate warning when content closely matches an existing memory; supersede that one instead of duplicating.',
     {
       content: z.string().describe('Content to remember'),
       summary: z.string().optional().describe('One-line summary (optional)'),
@@ -113,8 +111,10 @@ function createServer() {
       tags: z.array(z.string()).optional().describe('Tag list'),
       supersedes: z.array(z.string()).optional().describe('Old memory rowids this entry replaces (string array, e.g. ["325","348"]). Old rows soft-deleted by next expireMemories run; their content/summary chained into this row\'s prior_versions[] for paper trail. Preferred over the deprecated string convention in summary text.'),
       event_time: z.union([z.number(), z.string()]).optional().describe('When the event ACTUALLY happened (ISO 8601 string or ms timestamp). Distinct from created_at (when it was recorded). Lets temporal recall match "what did I do last June?" by event_time, not record time. Optional — defaults to NULL (recall falls back to created_at).'),
+      is_anchor: z.boolean().optional().describe('Mark as anchor: identity/permanent-rule level. Hard-capped at 40 memories globally. If quota exhausted, the flag is silently dropped (memory still stored) and the response notes it — unpin another anchor first if you really need this one.'),
+      is_pinned: z.boolean().optional().describe('Mark as pinned: recall floor / high-signal reference. Hard-capped at 30 memories globally. Same quota-drop semantics as is_anchor. Use for the handful of memories you always want surfaced — importance 1-10 alone is a weak prior and inflates.'),
     },
-    async ({ content, summary, importance = 6, memory_type = 'long_term', memory_level = 'semi_abstract', category = 'general', tags = [], supersedes, event_time }) => {
+    async ({ content, summary, importance = 6, memory_type = 'long_term', memory_level = 'semi_abstract', category = 'general', tags = [], supersedes, event_time, is_anchor, is_pinned }) => {
       const out = {}
       const id = await storeMemoryAsync({
         content,
@@ -127,13 +127,31 @@ function createServer() {
         tags,
         supersedes,
         eventTime: event_time,
+        isAnchor: is_anchor,
+        isPinned: is_pinned,
       }, { out })
 
       if (!id) {
         return { content: [{ type: 'text', text: 'Storage failed' }] }
       }
 
-      let text = `Stored memory (id: ${id}, importance: ${importance}, type: ${memory_type}, level: ${memory_level})`
+      const finalLevel = out.metaDowngrade?.toLevel || memory_level
+      const flags = []
+      if (is_anchor && !out.quotaRejected?.find(q => q.flag === 'is_anchor')) flags.push('anchor')
+      if (is_pinned && !out.quotaRejected?.find(q => q.flag === 'is_pinned')) flags.push('pinned')
+      const flagStr = flags.length ? `, flags: [${flags.join(', ')}]` : ''
+      let text = `Stored memory (id: ${id}, importance: ${importance}, type: ${memory_type}, level: ${finalLevel}${flagStr})`
+      if (out.quotaRejected?.length) {
+        for (const q of out.quotaRejected) {
+          text += `\n🚫 ${q.flag} quota exhausted (${q.current}/${q.limit}) — flag dropped, memory still stored`
+        }
+        text += `\n   to make room: recall an existing ${out.quotaRejected[0].flag} row and clear its flag with a direct sql UPDATE`
+      }
+      if (out.metaDowngrade) {
+        text += `\n📉 meta_knowledge → semi_abstract (write-gate: content has concrete bindings)`
+          + `\n   reasons: ${out.metaDowngrade.reasons.join(' | ')}`
+          + `\n   next time: extract the cross-project heuristic without the specific name/date/id, or accept semi_abstract`
+      }
       if (out.nearDuplicates?.length) {
         const top = out.nearDuplicates.slice(0, 3)
         text += `\n⚠️ near-duplicate(s) detected — consider superseding instead of a new entry:\n`
@@ -237,8 +255,8 @@ if (useHttp) {
       for (const entry of sessions.values()) {
         if (now - entry.lastUsed > SESSION_IDLE_MS) idleCount++
       }
-      // [2026-05-29 千夏] 暴露 embedding 配置 + 向量覆盖率，供 watchdog 主动告警
-      // （静默降级元修复：不靠人偶然调 memory_stats 才发现 'FTS5 only'）。
+      // Expose embedding config + vector coverage so watchdogs can alert
+      // proactively instead of waiting for someone to run memory_stats.
       let embeddingConfigured = null, vectorCoverage = null
       try { const st = getMemoryStats(); embeddingConfigured = st.embeddingConfigured; vectorCoverage = st.vectorCoverage } catch {}
       res.writeHead(200, { 'Content-Type': 'application/json' })
