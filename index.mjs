@@ -2395,47 +2395,69 @@ if (_isMain) {
     }
   } catch { /* env self-load is best-effort; FTS-only fallback still works */ }
 
-  try {
-    initMemory()
+  // v2.7: numeric-flag guards. `parseInt("abc",10)` = NaN, and NaN slips past
+  // `??` (which only catches null/undefined) into recall math, cutoff filters,
+  // and decay tau — producing silently wrong output. Wrap every numeric flag
+  // through these helpers and fall back to the caller-supplied default with
+  // a stderr warning.
+  function parsePosIntFlag(name, dflt) {
+    const raw = getFlag(name)
+    if (raw === null || raw === '') return dflt
+    const n = parseInt(raw, 10)
+    if (!Number.isFinite(n) || n <= 0) {
+      process.stderr.write(`warning: invalid ${name}=${JSON.stringify(raw)}, using default ${dflt}\n`)
+      return dflt
+    }
+    return n
+  }
+  function parsePosFloatFlag(name, dflt) {
+    const raw = getFlag(name)
+    if (raw === null || raw === '') return dflt
+    const n = parseFloat(raw)
+    if (!Number.isFinite(n) || n <= 0) {
+      process.stderr.write(`warning: invalid ${name}=${JSON.stringify(raw)}, using default ${dflt}\n`)
+      return dflt
+    }
+    return n
+  }
 
-    if (hasFlag('--stats')) {
-      const stats = getMemoryStats()
-      process.stdout.write(JSON.stringify(stats, null, 2) + '\n')
+  // v2.7: --health and --surface-cold are readonly by contract. Dispatch them
+  // BEFORE initMemory() so we never trigger schema migrations against the
+  // caller's DB (and never touch a `getDb()` mutable handle downstream).
+  if (hasFlag('--health')) {
+    const mh = await import('./memory-health.mjs')
+    const opts = {
+      format: getFlag('--format') || 'text',
+      dbPath: getFlag('--db') || undefined,
+      recallLogDays: parsePosIntFlag('--days', undefined),
+      budgetMs: parsePosIntFlag('--budget-ms', undefined),
+      simDup: parsePosFloatFlag('--sim-dup', undefined),
+      dumpHist: hasFlag('--dump-sim-hist'),
+    }
+    const report = mh.runMemoryHealth(opts)
+    if (opts.format === 'json') {
+      process.stdout.write(JSON.stringify(report, null, 2) + '\n')
+    } else {
+      process.stdout.write(mh.renderTextReport(report, opts))
+    }
+    return
+  }
 
-    } else if (hasFlag('--health')) {
-      // v2.7: readonly health check. Runs the five scans (inflation,
-      // dead-concrete, integrity, blindspot, near-dup) and prints a report.
-      // Delegates to memory-health.mjs so the same code powers both this
-      // CLI subcommand and `node memory-health.mjs`.
-      const mh = await import('./memory-health.mjs')
-      const opts = {
-        format: getFlag('--format') || 'text',
-        dbPath: getFlag('--db') || undefined,
-        recallLogDays: getFlag('--days') ? parseInt(getFlag('--days'), 10) : undefined,
-        budgetMs: getFlag('--budget-ms') ? parseInt(getFlag('--budget-ms'), 10) : undefined,
-        simDup: getFlag('--sim-dup') ? parseFloat(getFlag('--sim-dup')) : undefined,
-        dumpHist: hasFlag('--dump-sim-hist'),
-      }
-      const report = mh.runMemoryHealth(opts)
-      if (opts.format === 'json') {
-        process.stdout.write(JSON.stringify(report, null, 2) + '\n')
-      } else {
-        process.stdout.write(mh.renderTextReport(report, opts))
-      }
-
-    } else if (hasFlag('--surface-cold')) {
-      // v2.7: surface the "cold pool" — high-signal rows the curator should
-      // consider consolidating (supersede / merge / relabel). READ-ONLY;
-      // never mutates. The caller (LLM agent or human) decides what to do.
-      //   --days N         staleness floor (default 30)
-      //   --min-importance importance floor (default 8)
-      //   --limit N        cap (default 20)
-      //   --format json    machine-readable
-      const days = getFlag('--days') ? parseInt(getFlag('--days'), 10) : 30
-      const minImp = getFlag('--min-importance') ? parseInt(getFlag('--min-importance'), 10) : 8
-      const limit = getFlag('--limit') ? parseInt(getFlag('--limit'), 10) : 20
-      const cutoff = Date.now() - days * 86400_000
-      const db = getDb()
+  if (hasFlag('--surface-cold')) {
+    // Open a dedicated readonly connection so the "READ-ONLY" footer is
+    // underwritten by the connection mode, not just the SELECT-only query.
+    // Falls back to the same resolution order the module uses at import time.
+    const dbPath = getFlag('--db') || process.env.TOKENMEM_DB_PATH
+      || (existsSync(resolve(__dirname, 'engram.db'))
+            ? resolve(__dirname, 'engram.db')
+            : resolve(__dirname, 'tokenmem.db'))
+    const days = parsePosIntFlag('--days', 30)
+    const minImp = parsePosIntFlag('--min-importance', 8)
+    const limit = parsePosIntFlag('--limit', 20)
+    const cutoff = Date.now() - days * 86400_000
+    const Database = require('better-sqlite3')
+    const db = new Database(dbPath, { readonly: true })
+    try {
       const rows = db.prepare(`
         SELECT rowid, id, memory_level, importance, category, access_count,
                last_accessed, decay_score, is_anchor, is_pinned,
@@ -2470,6 +2492,18 @@ if (_isMain) {
         }
         process.stdout.write(`\n(READ-ONLY — LLM/human decides supersede/merge; nothing was mutated.)\n`)
       }
+    } finally {
+      db.close()
+    }
+    return
+  }
+
+  try {
+    initMemory()
+
+    if (hasFlag('--stats')) {
+      const stats = getMemoryStats()
+      process.stdout.write(JSON.stringify(stats, null, 2) + '\n')
 
     } else if (hasFlag('--consolidate')) {
       // v2.7: nightly consolidation pipeline — expire + decay + level-migrate.
@@ -2480,22 +2514,41 @@ if (_isMain) {
       //   --level-limit N           cap level migrations per run (default 30)
       //   --level-anchor PATH       write rollback JSONL before level migration
       //   --skip-decay | --skip-expire | --skip-level-migrate
+      //
+      // Non-transactional: the three primitives run in sequence and each has
+      // its own transaction (expireMemories writes soft-deletes,
+      // runDecayCycle+runLevelMigration each use db.transaction). If step 2
+      // or 3 fails after step 1 committed, there is no cross-step rollback —
+      // the recipe (docs/recipes/nightly-consolidation.md) documents the
+      // manual recovery paths.
       const dryRun = hasFlag('--dry-run')
-      const tauHours = getFlag('--decay-tau-hours') ? parseFloat(getFlag('--decay-tau-hours')) : 24
-      const levelLimit = getFlag('--level-limit') ? parseInt(getFlag('--level-limit'), 10) : 30
+      const tauHours = parsePosFloatFlag('--decay-tau-hours', 24)
+      const levelLimit = parsePosIntFlag('--level-limit', 30)
       const levelAnchor = getFlag('--level-anchor') || null
       const result = { dryRun, started_at: new Date().toISOString() }
       // Step 1: expire — soft-delete rows past their TTL. Idempotent.
+      // expireMemories does not accept a dry-run, so we surface an accurate
+      // "would-mutate" preview by counting rows that WOULD expire without
+      // touching anything.
       if (!hasFlag('--skip-expire')) {
-        result.expire = dryRun
-          ? { skipped: 'dry-run', note: 'expireMemories has no dry-run path; would soft-delete TTL-expired rows' }
-          : (() => { const before = getMemoryStats().memories.total_active; expireMemories(); const after = getMemoryStats().memories.total_active; return { removed: before - after } })()
+        if (dryRun) {
+          const now = Date.now()
+          const db = getDb()
+          const wouldExpire = db.prepare(
+            `SELECT COUNT(*) c FROM memories WHERE expires_at IS NOT NULL AND expires_at <= ? AND deleted_at IS NULL`
+          ).get(now).c
+          result.expire = { dryRun: true, would_soft_delete: wouldExpire }
+        } else {
+          const before = getMemoryStats().memories.total_active
+          expireMemories()
+          const after = getMemoryStats().memories.total_active
+          result.expire = { removed: before - after }
+        }
       }
       // Step 2: decay — refresh decay_score based on last_accessed. Idempotent.
+      // runDecayCycle DOES support dry-run (returns { processed, distribution, sample }).
       if (!hasFlag('--skip-decay')) {
-        result.decay = dryRun
-          ? { skipped: 'dry-run', note: 'runDecayCycle has no dry-run path; would refresh decay_score for all active rows' }
-          : runDecayCycle({ tauHours })
+        result.decay = runDecayCycle({ tauHours, dryRun })
       }
       // Step 3: level-migrate — hysteresis-based level demotion / promotion.
       if (!hasFlag('--skip-level-migrate')) {

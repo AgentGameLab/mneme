@@ -159,6 +159,42 @@ function check(label, cond, detail = '') {
     `demoted=${result2?.level_migrate?.demoted}`)
 }
 
+// ── --level-anchor: JSONL rollback file is actually written and parseable ──
+{
+  // Age enough meta rows to have at least one demotion candidate again.
+  const Database = (await import('better-sqlite3')).default
+  const db = new Database(DB_PATH)
+  const D45 = 45 * 86400_000
+  db.prepare('UPDATE memories SET last_accessed = ?, created_at = ?, memory_level = ?, access_count = 0 WHERE rowid = (SELECT MIN(rowid) FROM memories WHERE deleted_at IS NULL)')
+    .run(Date.now() - D45, Date.now() - D45, 'meta_knowledge')
+  db.close()
+
+  const anchorPath = DB_PATH + '.anchor.jsonl'
+  try { if (existsSync(anchorPath)) unlinkSync(anchorPath) } catch {}
+  const r = spawnSync(process.execPath, [
+    resolve(__dirname, 'index.mjs'), '--consolidate',
+    '--skip-expire', '--skip-decay', '--level-anchor', anchorPath,
+  ], { encoding: 'utf-8', env: { ...process.env, TOKENMEM_DB_PATH: DB_PATH } })
+  check('--consolidate --level-anchor exit=0', r.status === 0, r.stderr?.slice(0, 200))
+  check('--level-anchor file exists', existsSync(anchorPath))
+  if (existsSync(anchorPath)) {
+    const raw = (await import('node:fs')).readFileSync(anchorPath, 'utf-8')
+    const lines = raw.split('\n').filter(Boolean)
+    check('--level-anchor at least one line written', lines.length >= 1, `lines=${lines.length}`)
+    let allParseable = true, allHaveShape = true
+    for (const l of lines) {
+      let parsed
+      try { parsed = JSON.parse(l) } catch { allParseable = false; break }
+      if (typeof parsed.rowid !== 'number' || typeof parsed.old_level !== 'string' || typeof parsed.old_importance !== 'number') {
+        allHaveShape = false; break
+      }
+    }
+    check('--level-anchor every line is parseable JSON', allParseable)
+    check('--level-anchor every line has {rowid, old_level, old_importance}', allHaveShape)
+    try { unlinkSync(anchorPath) } catch {}
+  }
+}
+
 // Cleanup temp DB files
 for (const suffix of ['', '-shm', '-wal']) {
   const p = DB_PATH + suffix

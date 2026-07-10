@@ -68,6 +68,26 @@ Keep the split. Mixing surface and mutation in one pass is the same failure
 mode as auto-merging PRs on green CI: sooner or later you'll silently delete
 something you wanted to keep, and you won't notice for weeks.
 
+### On atomicity
+
+`--consolidate` runs its three primitives in sequence — expire, decay,
+level-migrate. Each one has its own transaction internally, but there is
+**no cross-step atomicity**: if step 3 fails after step 2 committed, the
+decay updates are still on disk. Recovery paths for each step:
+
+- **expireMemories** — reversible with `UPDATE memories SET deleted_at = NULL
+  WHERE deleted_at BETWEEN <run-start-ts> AND <run-end-ts>` (soft delete only,
+  the row content is intact).
+- **runDecayCycle** — the next run recomputes every `decay_score` from
+  `access_count` and `last_accessed`, so a bad tau on one night is corrected
+  on the next.
+- **runLevelMigration** — the JSONL rollback anchor above.
+
+If any of the three throws, the previous steps have already committed. In
+practice the primitives are simple SQL and rarely fail mid-flight; treat
+mid-run failure as an operational incident (log, re-run) rather than a
+consistency invariant to defend at the storage layer.
+
 ## Three cadences
 
 Pick one and stick with it — churn on cadence is worse than any specific choice.
@@ -101,8 +121,42 @@ mechanical job that runs the safe mutations tonight.
 15 3 * * *  node /path/to/mneme/index.mjs --consolidate --level-anchor /tmp/mneme-anchor-$(date +\%F).jsonl
 ```
 
-The level-migration rollback anchor lets you revert one bad run:
-`while IFS= read -r line; do rowid=$(jq -r .rowid <<<$line); level=$(jq -r .old_level <<<$line); imp=$(jq -r .old_importance <<<$line); sqlite3 engram.db "UPDATE memories SET memory_level='$level', importance=$imp WHERE rowid=$rowid"; done < /tmp/mneme-anchor-YYYY-MM-DD.jsonl`
+The level-migration rollback anchor lets you revert one bad run. mneme already
+depends on `better-sqlite3`, so the safest replay uses `node` — no extra deps,
+same DB resolution logic mneme itself uses, works on Windows and POSIX:
+
+```js
+// rollback-level-migration.mjs
+// usage: MNEME_DB_PATH=/path/to/engram.db node rollback-level-migration.mjs /tmp/anchor.jsonl
+import Database from 'better-sqlite3'
+import { readFileSync } from 'node:fs'
+const [anchorPath] = process.argv.slice(2)
+const dbPath = process.env.MNEME_DB_PATH || process.env.TOKENMEM_DB_PATH
+if (!anchorPath || !dbPath) throw new Error('anchorPath arg and MNEME_DB_PATH env required')
+const db = new Database(dbPath)
+const stmt = db.prepare(
+  `UPDATE memories SET memory_level = ?, importance = ? WHERE rowid = ?`
+)
+const tx = db.transaction((rows) => { for (const r of rows) stmt.run(r.old_level, r.old_importance, r.rowid) })
+const rows = readFileSync(anchorPath, 'utf-8').split('\n').filter(Boolean).map(JSON.parse)
+tx(rows)
+console.log(`rolled back ${rows.length} rows`)
+db.close()
+```
+
+If you prefer shell and have `sqlite3` + `jq` installed, the equivalent
+one-liner is bash-specific and cwd-sensitive — verify `$DB` resolves to the
+same store mneme uses before running:
+
+```bash
+DB="${MNEME_DB_PATH:?set MNEME_DB_PATH to the mneme engram.db path}"
+while IFS= read -r line; do
+  rowid=$(jq -r .rowid <<<"$line")
+  level=$(jq -r .old_level <<<"$line")
+  imp=$(jq -r .old_importance <<<"$line")
+  [ -n "$rowid" ] && sqlite3 "$DB" "UPDATE memories SET memory_level='$level', importance=$imp WHERE rowid=$rowid;"
+done < /tmp/mneme-anchor-YYYY-MM-DD.jsonl
+```
 
 ### C. LLM agent in the loop
 

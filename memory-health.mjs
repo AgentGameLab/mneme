@@ -122,7 +122,14 @@ function dot(a, b) {
 // ============================================================
 // Scan (a): inflation — memory_level / importance / category distributions
 // ============================================================
-export function detectInflation(db) {
+export function detectInflation(db, opts = {}) {
+  // Match runLevelMigration's demotion rule (index.mjs): a meta_knowledge
+  // row only becomes a downgrade candidate once it has aged past 30 days
+  // with zero recalls. Counting age-agnostically inflates the number every
+  // time a fresh meta gets stored, which makes the week-over-week diff the
+  // recipe recommends noisy. Configurable so callers can widen the window.
+  const metaDowngradeAgeDays = opts.metaDowngradeAgeDays ?? 30
+  const cutoff = Date.now() - metaDowngradeAgeDays * 86400_000
   const total = db.prepare(`SELECT COUNT(*) c FROM memories WHERE ${ACTIVE_CLAUSE}`).get().c
   const byLevel = db.prepare(`SELECT memory_level lvl, COUNT(*) c FROM memories WHERE ${ACTIVE_CLAUSE} GROUP BY memory_level`).all()
   const byImp = db.prepare(`SELECT importance imp, COUNT(*) c FROM memories WHERE ${ACTIVE_CLAUSE} GROUP BY importance ORDER BY importance DESC`).all()
@@ -136,8 +143,8 @@ export function detectInflation(db) {
     `SELECT COUNT(*) c FROM memories WHERE ${ACTIVE_CLAUSE} AND memory_level='concrete_trace' AND importance>5`
   ).get().c
   const metaNoAccess = db.prepare(
-    `SELECT COUNT(*) c FROM memories WHERE ${ACTIVE_CLAUSE} AND memory_level='meta_knowledge' AND access_count=0`
-  ).get().c
+    `SELECT COUNT(*) c FROM memories WHERE ${ACTIVE_CLAUSE} AND memory_level='meta_knowledge' AND access_count=0 AND created_at < ?`
+  ).get(cutoff).c
   return {
     total,
     level: byLevel.map(r => ({ ...r, pct: pct(r.c) })),
@@ -148,6 +155,7 @@ export function detectInflation(db) {
     imp_ge9_pct: pct(impGe9),
     concrete_importance_violations: concreteViol,
     meta_zero_access_downgrade_candidates: metaNoAccess,
+    meta_downgrade_age_days: metaDowngradeAgeDays,
   }
 }
 
@@ -178,8 +186,13 @@ export function detectIntegrity(db, opts = {}) {
   const supRows = db.prepare(`SELECT rowid, superseded_by FROM memories WHERE superseded_by IS NOT NULL`).all()
   let orphan = 0, leakedActive = 0
   for (const r of supRows) {
-    // superseded_by holds the SUCCESSOR ROWID (not id). See migrations/001.
-    const target = db.prepare(`SELECT rowid, deleted_at FROM memories WHERE rowid = ?`).get(r.superseded_by)
+    // superseded_by holds the SUCCESSOR ROWID as a TEXT column (migrations/001).
+    // SQLite coerces "42" -> 42 for INTEGER comparisons; empty string / non-numeric
+    // would silently coerce to 0 and return "orphan". CAST explicitly so a bad
+    // value stays NULL and lands in the orphan bucket where it's visible.
+    const successor = String(r.superseded_by).trim()
+    if (!/^\d+$/.test(successor)) { orphan++; continue }
+    const target = db.prepare(`SELECT rowid, deleted_at FROM memories WHERE rowid = CAST(? AS INTEGER)`).get(successor)
     if (!target) orphan++
     // A row that carries superseded_by should also be soft-deleted.
     const self = db.prepare(`SELECT deleted_at FROM memories WHERE rowid = ?`).get(r.rowid)
