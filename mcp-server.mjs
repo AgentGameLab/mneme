@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ============================================================
-// mneme MCP Server v2.6.0
+// mneme MCP Server v2.7.0
 // Exposes recall_memory / store_memory / recall_by_id / memory_stats tools
 // On-demand recall for any MCP-compatible AI agent — saves 80-90% memory token costs
 //

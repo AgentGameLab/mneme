@@ -25,3 +25,8 @@ package-lock.json
 
 # Local migrate overrides (machine-specific project list)
 mneme.migrate.local.json
+
+# Local scratch — dry-run reports, migration candidate exports, one-off batches
+*.tmp.json
+*-candidates.json
+staging/

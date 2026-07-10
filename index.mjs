@@ -2395,12 +2395,168 @@ if (_isMain) {
     }
   } catch { /* env self-load is best-effort; FTS-only fallback still works */ }
 
+  // v2.7: numeric-flag guards. `parseInt("abc",10)` = NaN, and NaN slips past
+  // `??` (which only catches null/undefined) into recall math, cutoff filters,
+  // and decay tau — producing silently wrong output. Wrap every numeric flag
+  // through these helpers and fall back to the caller-supplied default with
+  // a stderr warning.
+  function parsePosIntFlag(name, dflt) {
+    const raw = getFlag(name)
+    if (raw === null || raw === '') return dflt
+    const n = parseInt(raw, 10)
+    if (!Number.isFinite(n) || n <= 0) {
+      process.stderr.write(`warning: invalid ${name}=${JSON.stringify(raw)}, using default ${dflt}\n`)
+      return dflt
+    }
+    return n
+  }
+  function parsePosFloatFlag(name, dflt) {
+    const raw = getFlag(name)
+    if (raw === null || raw === '') return dflt
+    const n = parseFloat(raw)
+    if (!Number.isFinite(n) || n <= 0) {
+      process.stderr.write(`warning: invalid ${name}=${JSON.stringify(raw)}, using default ${dflt}\n`)
+      return dflt
+    }
+    return n
+  }
+
+  // v2.7: --health and --surface-cold are readonly by contract. Dispatch them
+  // BEFORE initMemory() so we never trigger schema migrations against the
+  // caller's DB (and never touch a `getDb()` mutable handle downstream).
+  if (hasFlag('--health')) {
+    const mh = await import('./memory-health.mjs')
+    const opts = {
+      format: getFlag('--format') || 'text',
+      dbPath: getFlag('--db') || undefined,
+      recallLogDays: parsePosIntFlag('--days', undefined),
+      budgetMs: parsePosIntFlag('--budget-ms', undefined),
+      simDup: parsePosFloatFlag('--sim-dup', undefined),
+      dumpHist: hasFlag('--dump-sim-hist'),
+    }
+    const report = mh.runMemoryHealth(opts)
+    if (opts.format === 'json') {
+      process.stdout.write(JSON.stringify(report, null, 2) + '\n')
+    } else {
+      process.stdout.write(mh.renderTextReport(report, opts))
+    }
+    return
+  }
+
+  if (hasFlag('--surface-cold')) {
+    // Open a dedicated readonly connection so the "READ-ONLY" footer is
+    // underwritten by the connection mode, not just the SELECT-only query.
+    // Falls back to the same resolution order the module uses at import time.
+    const dbPath = getFlag('--db') || process.env.TOKENMEM_DB_PATH
+      || (existsSync(resolve(__dirname, 'engram.db'))
+            ? resolve(__dirname, 'engram.db')
+            : resolve(__dirname, 'tokenmem.db'))
+    const days = parsePosIntFlag('--days', 30)
+    const minImp = parsePosIntFlag('--min-importance', 8)
+    const limit = parsePosIntFlag('--limit', 20)
+    const cutoff = Date.now() - days * 86400_000
+    const Database = require('better-sqlite3')
+    const db = new Database(dbPath, { readonly: true })
+    try {
+      const rows = db.prepare(`
+        SELECT rowid, id, memory_level, importance, category, access_count,
+               last_accessed, decay_score, is_anchor, is_pinned,
+               COALESCE(summary, substr(content, 1, 120)) AS label
+        FROM memories
+        WHERE deleted_at IS NULL AND superseded_by IS NULL
+          AND memory_type != 'permanent'
+          AND is_anchor = 0
+          AND importance >= ?
+          AND last_accessed < ?
+        ORDER BY decay_score ASC, importance DESC, last_accessed ASC
+        LIMIT ?
+      `).all(minImp, cutoff, limit)
+      const payload = {
+        generated_at: new Date().toISOString(),
+        thresholds: { days_stale: days, min_importance: minImp, limit },
+        count: rows.length,
+        rows: rows.map(r => ({
+          ...r,
+          decay_score: +((r.decay_score ?? 0).toFixed(3)),
+          label: (r.label || '').replace(/\s+/g, ' ').slice(0, 120),
+        })),
+      }
+      if ((getFlag('--format') || 'text') === 'json') {
+        process.stdout.write(JSON.stringify(payload, null, 2) + '\n')
+      } else {
+        process.stdout.write(`\n# cold pool — top ${payload.count} candidates (>= ${days}d stale, imp>=${minImp}, non-anchor)\n\n`)
+        for (const r of payload.rows) {
+          const flags = [r.is_anchor ? 'A' : '', r.is_pinned ? 'P' : ''].filter(Boolean).join('')
+          const ageD = Math.floor((Date.now() - r.last_accessed) / 86400_000)
+          process.stdout.write(`  #${r.rowid} imp=${r.importance} ${r.memory_level} acc=${r.access_count} decay=${r.decay_score} age=${ageD}d ${flags ? '['+flags+']' : ''} | ${r.label}\n`)
+        }
+        process.stdout.write(`\n(READ-ONLY — LLM/human decides supersede/merge; nothing was mutated.)\n`)
+      }
+    } finally {
+      db.close()
+    }
+    return
+  }
+
   try {
     initMemory()
 
     if (hasFlag('--stats')) {
       const stats = getMemoryStats()
       process.stdout.write(JSON.stringify(stats, null, 2) + '\n')
+
+    } else if (hasFlag('--consolidate')) {
+      // v2.7: nightly consolidation pipeline — expire + decay + level-migrate.
+      // Mechanical primitives only, no semantic judgment. Safe to schedule
+      // as a cron once per day; --dry-run previews everything.
+      //   --dry-run                 preview counts, no writes
+      //   --decay-tau-hours H       decay half-life (default 24)
+      //   --level-limit N           cap level migrations per run (default 30)
+      //   --level-anchor PATH       write rollback JSONL before level migration
+      //   --skip-decay | --skip-expire | --skip-level-migrate
+      //
+      // Non-transactional: the three primitives run in sequence and each has
+      // its own transaction (expireMemories writes soft-deletes,
+      // runDecayCycle+runLevelMigration each use db.transaction). If step 2
+      // or 3 fails after step 1 committed, there is no cross-step rollback —
+      // the recipe (docs/recipes/nightly-consolidation.md) documents the
+      // manual recovery paths.
+      const dryRun = hasFlag('--dry-run')
+      const tauHours = parsePosFloatFlag('--decay-tau-hours', 24)
+      const levelLimit = parsePosIntFlag('--level-limit', 30)
+      const levelAnchor = getFlag('--level-anchor') || null
+      const result = { dryRun, started_at: new Date().toISOString() }
+      // Step 1: expire — soft-delete rows past their TTL. Idempotent.
+      // expireMemories does not accept a dry-run, so we surface an accurate
+      // "would-mutate" preview by counting rows that WOULD expire without
+      // touching anything.
+      if (!hasFlag('--skip-expire')) {
+        if (dryRun) {
+          const now = Date.now()
+          const db = getDb()
+          const wouldExpire = db.prepare(
+            `SELECT COUNT(*) c FROM memories WHERE expires_at IS NOT NULL AND expires_at <= ? AND deleted_at IS NULL`
+          ).get(now).c
+          result.expire = { dryRun: true, would_soft_delete: wouldExpire }
+        } else {
+          const before = getMemoryStats().memories.total_active
+          expireMemories()
+          const after = getMemoryStats().memories.total_active
+          result.expire = { removed: before - after }
+        }
+      }
+      // Step 2: decay — refresh decay_score based on last_accessed. Idempotent.
+      // runDecayCycle DOES support dry-run (returns { processed, distribution, sample }).
+      if (!hasFlag('--skip-decay')) {
+        result.decay = runDecayCycle({ tauHours, dryRun })
+      }
+      // Step 3: level-migrate — hysteresis-based level demotion / promotion.
+      if (!hasFlag('--skip-level-migrate')) {
+        result.level_migrate = runLevelMigration({ limit: levelLimit, anchorPath: levelAnchor, dryRun })
+      }
+      result.finished_at = new Date().toISOString()
+      result.stats = getMemoryStats()
+      process.stdout.write(JSON.stringify(result, null, 2) + '\n')
 
     } else if (hasFlag('--level-migrate')) {
       // v2.4: frequency-driven memory_level hysteresis migration.
@@ -2566,6 +2722,13 @@ if (_isMain) {
         '',
         'Usage:',
         '  node index.mjs --stats                  Output stats JSON',
+        '  node index.mjs --health                  Readonly health check (5 scans)',
+        '    [--format text|json] [--days 7] [--sim-dup 0.97] [--budget-ms 90000] [--dump-sim-hist]',
+        '  node index.mjs --surface-cold            Surface cold-pool candidates (readonly)',
+        '    [--days 30] [--min-importance 8] [--limit 20] [--format text|json]',
+        '  node index.mjs --consolidate             Nightly pipeline: expire + decay + level-migrate',
+        '    [--dry-run] [--decay-tau-hours 24] [--level-limit 30] [--level-anchor PATH]',
+        '    [--skip-decay | --skip-expire | --skip-level-migrate]',
         '  node index.mjs --context "query"         Build injection context',
         '  node index.mjs --recall "query"          Recall memory list',
         '  node index.mjs --recall "" --limit 20    List recent 20 memories',
