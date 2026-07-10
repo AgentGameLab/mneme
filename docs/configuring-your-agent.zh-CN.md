@@ -267,6 +267,26 @@ try {
 
 ---
 
+## 6. 维护 — 整理（consolidation）
+
+只写不整的 mneme 会漂成垃圾抽屉。每一次 store 都在加噪音，不定期反向清就永远清不干净。
+mneme 自带一套 primitive：
+
+- `node index.mjs --health` — 只读五扫描报告（通胀 / 僵死 concrete / 完整性 / 盲区 /
+  近重复），绝不写库。
+- `node index.mjs --surface-cold [--days 30] [--min-importance 8]` — 列出 N 天没被访问过的
+  高 importance 记忆，只读。是否 supersede / 合并 / 重标由 caller 决定。
+- `node index.mjs --consolidate [--dry-run] [--level-anchor PATH]` — 机械 nightly pipeline：
+  `expireMemories` → `runDecayCycle` → `runLevelMigration`，按此序跑。`--dry-run` 只预览；
+  `--level-anchor` 在 level 迁移前写 JSONL rollback。
+
+两步循环：**surface → apply**。**不要**基于 cosine 阈值自动合并、也不要基于相似度自动
+supersede —— 那会静默删掉信号。
+
+完整 recipe 在 [`docs/recipes/nightly-consolidation.md`](recipes/nightly-consolidation.md)。
+
+---
+
 ## TL;DR
 
 1. 用 MCP 接上 mneme（§3）。
@@ -274,3 +294,4 @@ try {
 3. 最重要的几条规则：**存是一道闸、`semi_abstract` 是默认、`meta` 要挣、importance 是弱 prior、
    覆盖而非重写。** 这就是让记忆保持锋利而不膨胀的关键。
 4. 可选：如果在 Claude Code 上想让记忆自动 surface，装 §5 的 auto-recall hook。
+5. 每周跑一次 §6 的 `--health` review —— 只有反向压回来记忆库才会越用越锋利。

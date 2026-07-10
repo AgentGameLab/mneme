@@ -300,6 +300,29 @@ you can shape the format to whatever downstream analytics you want.
 
 ---
 
+## 6. Maintenance — consolidation
+
+A mneme that only takes writes drifts into a junk drawer. Every store adds noise;
+nothing removes it unless you run a periodic pass. mneme ships primitives for
+this out of the box:
+
+- `node index.mjs --health` — a readonly five-scan report (inflation,
+  dead-concrete, integrity, blindspot, near-dup). Never mutates.
+- `node index.mjs --surface-cold [--days 30] [--min-importance 8]` — the
+  high-importance rows nobody's touched in a while. Readonly; the caller
+  decides supersede/merge/relabel.
+- `node index.mjs --consolidate [--dry-run] [--level-anchor PATH]` — the
+  mechanical nightly pipeline: `expireMemories` + `runDecayCycle` +
+  `runLevelMigration`, in that order. `--dry-run` previews without writing;
+  `--level-anchor` writes a JSONL rollback file before the level migration.
+
+Two-step loop: **surface → apply**. Keep the split. Auto-merging duplicates
+based on cosine, or auto-supersede on similarity, silently deletes signal.
+
+Full recipe in [`docs/recipes/nightly-consolidation.md`](recipes/nightly-consolidation.md).
+
+---
+
 ## TL;DR
 
 1. Connect mneme via MCP (§3).
@@ -307,5 +330,7 @@ you can shape the format to whatever downstream analytics you want.
 3. The rules that matter most: **store is a gate, `semi_abstract` is the default,
    `meta` is earned, importance is a weak prior, supersede instead of rewrite.**
    That's what keeps the memory sharp instead of bloated.
+4. Schedule a weekly `--health` review — the store gets sharper only when you
+   push back on the drift (§6).
 4. Optional: enable the auto-recall hooks (§5) if you're on Claude Code and want memory
    surfaced without asking.

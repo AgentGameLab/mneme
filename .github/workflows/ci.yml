@@ -55,3 +55,8 @@ jobs:
           MNEME_DB_PATH: ${{ runner.temp }}/mneme-ci-hooks.db
           MNEME_STATE_DIR: ${{ runner.temp }}/mneme-hook-state
         run: node hooks/hooks.test.mjs
+
+      - name: End-to-end test (memory-health + consolidation CLIs)
+        env:
+          TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-memhealth.db
+        run: node memory-health.test.mjs
