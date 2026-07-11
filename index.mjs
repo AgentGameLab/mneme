@@ -1283,7 +1283,7 @@ export function recallMemories(opts = {}) {
   }
 
   // Search miss tracking: queried but found nothing = knowledge blind spot signal
-  if (queryText && result.length === 0) {
+  if (queryText && result.length === 0 && !opts.suppressMiss) {
     try {
       db.prepare('INSERT INTO search_misses (query, source, hit_count) VALUES (?, ?, 0)')
         .run(queryText.slice(0, 500), 'recall')
@@ -1471,7 +1471,7 @@ export async function recallMemoriesHybrid(opts = {}) {
   }
 
   // Search miss tracking (both paths empty = miss)
-  if (result.length === 0) {
+  if (result.length === 0 && !opts.suppressMiss) {
     try {
       db.prepare('INSERT INTO search_misses (query, source, hit_count) VALUES (?, ?, 0)')
         .run(queryText.slice(0, 500), 'hybrid')
@@ -1500,6 +1500,39 @@ export function getRecentConversations(chatId, limit = 20) {
     log(`getRecentConversations failed: ${e.message}`)
     return []
   }
+}
+
+function memoryFallbackConversationSegments(queryText, opts = {}) {
+  const { limit = 3, minImportance = 3 } = opts
+  const memories = recallMemories({
+    query: queryText,
+    limit,
+    minImportance,
+    _internal: true,
+    suppressMiss: true,
+  })
+  return memories.map(m => ({
+    score: m.score || 0,
+    source: 'memories_fallback',
+    note: 'conversation_search_fallback: memories',
+    messages: [{
+      id: String(m.rowid),
+      platform: 'mneme',
+      from_id: 'memory',
+      from_name: 'memory',
+      role: 'system',
+      content: m.content,
+      created_at: m.created_at,
+      metadata: {
+        fallback_from: 'memories',
+        memory_rowid: m.rowid,
+        memory_source: m.source,
+        memory_level: m.memory_level,
+        category: m.category,
+        tags: m.tags || [],
+      },
+    }],
+  }))
 }
 
 /**
@@ -1546,6 +1579,8 @@ export function searchConversations(queryText, opts = {}) {
 
     const anchors = db.prepare(anchorSQL).all(...anchorParams)
     if (anchors.length === 0) {
+      const fallback = memoryFallbackConversationSegments(queryText, opts)
+      if (fallback.length > 0) return fallback
       try {
         db.prepare('INSERT INTO search_misses (query, source, hit_count) VALUES (?, ?, 0)')
           .run(queryText.slice(0, 500), 'search_conversations')
@@ -1575,6 +1610,10 @@ export function searchConversations(queryText, opts = {}) {
     }))
   } catch (e) {
     log(`searchConversations failed: ${e.message}`)
+    try {
+      const fallback = memoryFallbackConversationSegments(queryText, opts)
+      if (fallback.length > 0) return fallback
+    } catch {}
     return []
   }
 }
@@ -1620,9 +1659,10 @@ export async function buildMemoryContext(opts = {}) {
     const segments = searchConversations(queryText, { chatId, limit: 2, contextWindow: 3 })
     if (segments.length > 0) {
       const convLines = segments.map(seg => {
+        const sourceMark = seg.source === 'memories_fallback' ? ' [memory-fallback]' : ''
         return seg.messages.map(m => {
           const time = new Date(Number(m.created_at)).toISOString().slice(0, 16)
-          return `  [${time}] ${m.from_name || m.role}: ${m.content.slice(0, 150)}`
+          return `  [${time}]${sourceMark} ${m.from_name || m.role}: ${m.content.slice(0, 150)}`
         }).join('\n')
       })
       sections.push(`<relevant-conversations>\n${convLines.join('\n---\n')}\n</relevant-conversations>`)
