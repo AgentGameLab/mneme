@@ -22,6 +22,7 @@ import { readFileSync, readdirSync, existsSync } from 'node:fs'
 import { resolve, dirname, basename } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
+import { createHash } from 'node:crypto'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const require = createRequire(import.meta.url)
@@ -89,6 +90,10 @@ function parseFrontmatter(content) {
   return { meta, body: m[2].trim() }
 }
 
+function contentHash(content) {
+  return createHash('sha256').update(String(content || '')).digest('hex').slice(0, 16)
+}
+
 // -- Main -----------------------------------------------------------------
 async function main() {
   // Initialize DB (reuses index.mjs initMemory)
@@ -100,9 +105,17 @@ async function main() {
   const DB_PATH = process.env.TOKENMEM_DB_PATH || resolve(__dirname, 'tokenmem.db')
   const db = new Database(DB_PATH)
 
-  const checkDup = db.prepare(
-    `SELECT id FROM memories WHERE summary = ? AND source = 'manual' AND deleted_at IS NULL LIMIT 1`
-  )
+  const checkDup = db.prepare(`
+    SELECT rowid, id FROM memories
+    WHERE deleted_at IS NULL
+      AND (
+        content_hash = ?
+        OR content = ?
+        OR (summary = ? AND source = 'manual')
+      )
+    ORDER BY created_at DESC
+    LIMIT 1
+  `)
 
   let imported = 0
   let skipped = 0
@@ -130,22 +143,22 @@ async function main() {
         const category = TYPE_TO_CATEGORY[type] || 'general'
         const importance = guessImportance(filename, type, name)
 
-        // Summary used for dedup
+        // Summary used for display and a legacy dedup fallback.
         const summary = description || name
+        // Content = file body (with frontmatter description)
+        const content = (body || `${name}${description ? ': ' + description : ''}`).slice(0, 8000)
 
-        // Check dedup
-        const existing = checkDup.get(summary)
+        // Check dedup by content first, independent of source/source_file provenance.
+        // Summary remains only as the legacy manual-import idempotency fallback.
+        const existing = checkDup.get(contentHash(content), content, summary)
         if (existing) {
-          console.log(`  Skip (exists): ${name}`)
+          console.log(`  Skip (exists #${existing.rowid}): ${name}`)
           skipped++
           continue
         }
 
-        // Content = file body (with frontmatter description)
-        const content = body || `${name}${description ? ': ' + description : ''}`
-
         storeMemory({
-          content: content.slice(0, 8000),
+          content,
           summary,
           memoryType: 'permanent',
           category,
