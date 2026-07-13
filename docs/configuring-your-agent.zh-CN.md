@@ -287,6 +287,27 @@ supersede —— 那会静默删掉信号。
 
 ---
 
+## 7. 路径别名（`locations`）
+
+不是每个"XX 在哪"都是记忆问题。`godot → E:/tools/godot`、`download → E:/download`、
+`docs → https://docs.example.com` 都是**精确匹配 KV**，走 FTS + vector + RRF
+既掉精度又慢。v2.8 加一张 `locations` 表（name / path / kind / aliases / notes）
+跟 `memories` 并列：
+
+- **CLI**：`--set-path <name> <path>` / `--get-path <nameOrAlias>` /
+  `--list-paths` / `--delete-path` / `--import-paths <file.json>`。
+- **MCP tools**：`resolve_path` / `set_path` / `list_paths` / `delete_path`。
+  Agent 可以像 `store_memory` 一样注册和查询路径别名。
+- **Hook 前置**：`hooks/tool-recall-pre.mjs` 从 Bash / Read / Grep / Glob 参数里
+  抽 identifier-shaped token，命中就把解析路径挂在 recall 前面（短 TTL 缓存）。
+
+判据：**答案是路径 / URL → `locations`；答案是一段话 → `memories`。**
+当前路径存 `locations`、"6 月为啥搬"存 `memories`。
+
+完整 recipe 在 [`docs/recipes/paths-alias-layer.md`](recipes/paths-alias-layer.md)。
+
+---
+
 ## TL;DR
 
 1. 用 MCP 接上 mneme（§3）。
@@ -295,3 +316,5 @@ supersede —— 那会静默删掉信号。
    覆盖而非重写。** 这就是让记忆保持锋利而不膨胀的关键。
 4. 可选：如果在 Claude Code 上想让记忆自动 surface，装 §5 的 auto-recall hook。
 5. 每周跑一次 §6 的 `--health` review —— 只有反向压回来记忆库才会越用越锋利。
+6. 把常用 handle 注册进 `locations`（§7）—— `godot → E:/tools/godot`、
+   `download → E:/download`。一次 lookup vs 一次 glob 整个大目录树的差别。

@@ -352,6 +352,21 @@ export function initMemory() {
   } catch (e) { if (!isDupColumn(e)) throw e }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_anchor ON memories(is_anchor) WHERE is_anchor = 1 AND deleted_at IS NULL`)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_pinned ON memories(is_pinned) WHERE is_pinned = 1 AND deleted_at IS NULL`)
+  // migration 009 (v2.8): locations table — path alias KV layer, out of the
+  // memory store on purpose (exact-match, not RRF-ranked). See migrations/009.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS locations (
+      name TEXT PRIMARY KEY,
+      path TEXT NOT NULL,
+      kind TEXT NOT NULL DEFAULT 'dir'
+        CHECK (kind IN ('dir', 'file', 'glob_root', 'executable', 'url', 'other')),
+      aliases TEXT NOT NULL DEFAULT '[]',
+      notes TEXT,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+      updated_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_locations_kind ON locations(kind)`)
 
   // Vector search virtual table (sqlite-vec)
   // Dimension determined by _embeddingConfig; skip if not available
@@ -2342,6 +2357,148 @@ export async function compressAllOldConversations(opts = {}) {
   return results
 }
 
+// ============================================================
+// v2.8 · locations layer — path alias KV
+// ============================================================
+// Exact-match lookup for handles like "download" → "E:/download". Deliberately
+// separate from `memories`: mixing exact-match KV into an RRF-ranked recall
+// pipeline poisons ranking and gives you fuzzy answers where you wanted a
+// definite one. Consumers (CLI --set-path/--get-path/…, MCP tools, hooks)
+// call these five exports; the SQL and the aliases-JSON handling live in
+// exactly one place.
+
+const LOCATION_KINDS = ['dir', 'file', 'glob_root', 'executable', 'url', 'other']
+
+function normalizeAliases(input) {
+  if (!input) return []
+  const arr = Array.isArray(input) ? input : String(input).split(',')
+  const cleaned = arr.map(s => String(s).trim()).filter(Boolean)
+  // Dedupe while preserving order.
+  const seen = new Set()
+  const out = []
+  for (const a of cleaned) { if (!seen.has(a)) { seen.add(a); out.push(a) } }
+  return out
+}
+
+/**
+ * setLocation({ name, path, kind, aliases, notes, force })
+ * Upserts a location. Without `force`, an existing name with a different
+ * path is rejected — user should confirm with `force: true` to overwrite.
+ * @returns {{ name, path, kind, aliases, notes, created, updated }}
+ */
+export function setLocation(loc) {
+  if (!loc || typeof loc.name !== 'string' || !loc.name.trim()) {
+    throw new Error('setLocation: name is required')
+  }
+  if (typeof loc.path !== 'string' || !loc.path.trim()) {
+    throw new Error('setLocation: path is required')
+  }
+  const name = loc.name.trim()
+  const path = loc.path.trim()
+  const kind = loc.kind || 'dir'
+  if (!LOCATION_KINDS.includes(kind)) {
+    throw new Error(`setLocation: invalid kind "${kind}"; expected one of ${LOCATION_KINDS.join(', ')}`)
+  }
+  const aliases = normalizeAliases(loc.aliases)
+  const notes = loc.notes ?? null
+
+  const db = getDb()
+  const now = Date.now()
+  const existing = db.prepare('SELECT name, path FROM locations WHERE name = ?').get(name)
+  if (existing && existing.path !== path && !loc.force) {
+    throw new Error(`setLocation: "${name}" already resolves to ${existing.path}; pass force:true to overwrite`)
+  }
+  const stmt = db.prepare(`
+    INSERT INTO locations (name, path, kind, aliases, notes, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(name) DO UPDATE SET
+      path = excluded.path,
+      kind = excluded.kind,
+      aliases = excluded.aliases,
+      notes = excluded.notes,
+      updated_at = excluded.updated_at
+  `)
+  stmt.run(name, path, kind, JSON.stringify(aliases), notes, now, now)
+  return { name, path, kind, aliases, notes, created: !existing, updated: !!existing }
+}
+
+/**
+ * getLocation(nameOrAlias) → row or null.
+ * Resolves by primary key first, then by alias membership. Alias scan is a
+ * linear pass over the (small) table + JSON check per row.
+ */
+export function getLocation(nameOrAlias) {
+  if (!nameOrAlias) return null
+  const query = String(nameOrAlias).trim()
+  if (!query) return null
+  const db = getDb()
+  const direct = db.prepare(`
+    SELECT name, path, kind, aliases, notes, created_at, updated_at
+    FROM locations WHERE name = ?
+  `).get(query)
+  if (direct) {
+    return { ...direct, aliases: safeJsonParse(direct.aliases, []) }
+  }
+  const rows = db.prepare(`
+    SELECT name, path, kind, aliases, notes, created_at, updated_at
+    FROM locations WHERE aliases LIKE ?
+  `).all('%' + JSON.stringify(query).slice(1, -1) + '%')
+  for (const r of rows) {
+    const list = safeJsonParse(r.aliases, [])
+    if (list.includes(query)) return { ...r, aliases: list }
+  }
+  return null
+}
+
+/**
+ * listLocations({ kind }) → array sorted by name.
+ */
+export function listLocations(opts = {}) {
+  const db = getDb()
+  const rows = opts.kind
+    ? db.prepare(`SELECT name, path, kind, aliases, notes, created_at, updated_at FROM locations WHERE kind = ? ORDER BY name ASC`).all(opts.kind)
+    : db.prepare(`SELECT name, path, kind, aliases, notes, created_at, updated_at FROM locations ORDER BY name ASC`).all()
+  return rows.map(r => ({ ...r, aliases: safeJsonParse(r.aliases, []) }))
+}
+
+/**
+ * deleteLocation(name) → true if removed, false if the row didn't exist.
+ */
+export function deleteLocation(name) {
+  if (!name) return false
+  const db = getDb()
+  const info = db.prepare('DELETE FROM locations WHERE name = ?').run(String(name).trim())
+  return info.changes > 0
+}
+
+/**
+ * importLocations(entries, { force }) — bulk upsert.
+ * @param entries either an array of {name, path, kind?, aliases?, notes?}
+ *                or an object keyed by name.
+ * @returns { added, updated, skipped, errors: [{name, error}] }
+ */
+export function importLocations(entries, opts = {}) {
+  const force = !!opts.force
+  const rows = Array.isArray(entries)
+    ? entries
+    : Object.entries(entries || {}).map(([name, v]) => (typeof v === 'string' ? { name, path: v } : { name, ...v }))
+  const stats = { added: 0, updated: 0, skipped: 0, errors: [] }
+  for (const row of rows) {
+    try {
+      const res = setLocation({ ...row, force })
+      if (res.created) stats.added++
+      else stats.updated++
+    } catch (e) {
+      if (/already resolves to/.test(e.message) && !force) {
+        stats.skipped++
+        continue
+      }
+      stats.errors.push({ name: row?.name, error: e.message })
+    }
+  }
+  return stats
+}
+
 // ── Utility Functions ───────────────────────────────────────
 
 function safeJsonParse(str, fallback) {
@@ -2615,6 +2772,94 @@ if (_isMain) {
       const res = await extractMissingEntities(limit)
       process.stdout.write(JSON.stringify(res, null, 2) + '\n')
 
+    } else if (getFlag('--set-path') !== null) {
+      // v2.8: `--set-path <name> <path> [--kind K] [--alias a1,a2] [--notes "..."] [--force]`
+      // getFlag returns the argument AFTER the flag; the value AFTER that is the path.
+      const name = getFlag('--set-path')
+      const pathIdx = args.indexOf('--set-path')
+      const path = args[pathIdx + 2]
+      if (!name || !path || path.startsWith('--')) {
+        process.stderr.write('usage: --set-path <name> <path> [--kind K] [--alias a1,a2] [--notes "..."] [--force]\n')
+        process.exit(2)
+      }
+      const kind = getFlag('--kind') || 'dir'
+      const aliasesRaw = getFlag('--alias')
+      const notes = getFlag('--notes') || null
+      const force = hasFlag('--force')
+      try {
+        const res = setLocation({ name, path, kind, aliases: aliasesRaw ? aliasesRaw.split(',') : [], notes, force })
+        process.stdout.write(JSON.stringify(res, null, 2) + '\n')
+      } catch (e) {
+        process.stderr.write(`error: ${e.message}\n`)
+        process.exit(1)
+      }
+
+    } else if (getFlag('--get-path') !== null) {
+      // v2.8: `--get-path <nameOrAlias> [--format text|json]`
+      // Text mode prints just the path (empty line if not found; exit 0 either way
+      // so shell pipelines can conditionally use it).
+      const query = getFlag('--get-path')
+      if (!query) {
+        process.stderr.write('usage: --get-path <nameOrAlias> [--format text|json]\n')
+        process.exit(2)
+      }
+      const row = getLocation(query)
+      if ((getFlag('--format') || 'text') === 'json') {
+        process.stdout.write(JSON.stringify(row, null, 2) + '\n')
+      } else if (row) {
+        process.stdout.write(row.path + '\n')
+      }
+      process.exit(row ? 0 : 1)
+
+    } else if (hasFlag('--list-paths')) {
+      // v2.8: `--list-paths [--kind K] [--format text|json]`
+      const kind = getFlag('--kind') || undefined
+      const rows = listLocations({ kind })
+      if ((getFlag('--format') || 'text') === 'json') {
+        process.stdout.write(JSON.stringify(rows, null, 2) + '\n')
+      } else {
+        if (rows.length === 0) {
+          process.stdout.write('(no locations)\n')
+        } else {
+          const w = Math.max(4, ...rows.map(r => r.name.length))
+          for (const r of rows) {
+            const al = r.aliases.length ? ` (aliases: ${r.aliases.join(', ')})` : ''
+            process.stdout.write(`  ${r.name.padEnd(w)}  [${r.kind}]  ${r.path}${al}\n`)
+          }
+        }
+      }
+
+    } else if (getFlag('--delete-path') !== null) {
+      // v2.8: `--delete-path <name>`
+      const name = getFlag('--delete-path')
+      if (!name) {
+        process.stderr.write('usage: --delete-path <name>\n')
+        process.exit(2)
+      }
+      const removed = deleteLocation(name)
+      process.stdout.write(JSON.stringify({ name, removed }, null, 2) + '\n')
+      process.exit(removed ? 0 : 1)
+
+    } else if (getFlag('--import-paths') !== null) {
+      // v2.8: `--import-paths <file.json> [--force]`
+      // File is either an array of {name,path,kind?,aliases?,notes?} or an
+      // object `{ name: <path-string-or-object>, ... }`.
+      const filePath = getFlag('--import-paths')
+      if (!filePath) {
+        process.stderr.write('usage: --import-paths <file.json> [--force]\n')
+        process.exit(2)
+      }
+      let entries
+      try {
+        entries = JSON.parse(readFileSync(filePath, 'utf-8'))
+      } catch (e) {
+        process.stderr.write(`error reading ${filePath}: ${e.message}\n`)
+        process.exit(1)
+      }
+      const stats = importLocations(entries, { force: hasFlag('--force') })
+      process.stdout.write(JSON.stringify(stats, null, 2) + '\n')
+      process.exit(stats.errors.length > 0 ? 1 : 0)
+
     } else if (getFlag('--context') !== null) {
       const query = getFlag('--context') || ''
       const ctx = await buildMemoryContext({ query, memoryLimit: 10 })
@@ -2769,6 +3014,14 @@ if (_isMain) {
         '  node index.mjs --consolidate             Nightly pipeline: expire + decay + level-migrate',
         '    [--dry-run] [--decay-tau-hours 24] [--level-limit 30] [--level-anchor PATH]',
         '    [--skip-decay | --skip-expire | --skip-level-migrate]',
+        '  node index.mjs --set-path <name> <path>  Register a path alias (kind: dir/file/glob_root/executable/url/other)',
+        '    [--kind K] [--alias a1,a2] [--notes "..."] [--force]',
+        '  node index.mjs --get-path <nameOrAlias>  Resolve an alias to its path (exit 1 if not found)',
+        '    [--format text|json]',
+        '  node index.mjs --list-paths              List all registered path aliases',
+        '    [--kind K] [--format text|json]',
+        '  node index.mjs --delete-path <name>      Remove a path alias',
+        '  node index.mjs --import-paths <f.json>   Bulk register from JSON [--force]',
         '  node index.mjs --context "query"         Build injection context',
         '  node index.mjs --recall "query"          Recall memory list',
         '  node index.mjs --recall "" --limit 20    List recent 20 memories',

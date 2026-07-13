@@ -1,6 +1,6 @@
 {
   "name": "mneme",
-  "version": "2.7.0",
+  "version": "2.8.0",
   "description": "Token-efficient persistent memory for AI agents — SQLite + FTS5 + sqlite-vec hybrid search + MCP on-demand recall. Save 80-90% memory-related token costs.",
   "type": "module",
   "main": "index.mjs",

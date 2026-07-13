@@ -323,6 +323,31 @@ Full recipe in [`docs/recipes/nightly-consolidation.md`](recipes/nightly-consoli
 
 ---
 
+## 7. Path aliases (`locations`)
+
+Not every "where is X" question is a memory question. `godot → E:/tools/godot`,
+`download → E:/download`, `docs → https://docs.example.com` — those are
+exact-match KV, and running them through FTS + vector + RRF loses precision
+and speed. v2.8 adds a `locations` table (name, path, kind, aliases, notes)
+alongside `memories`:
+
+- **CLI**: `--set-path <name> <path>`, `--get-path <nameOrAlias>`,
+  `--list-paths`, `--delete-path`, `--import-paths <file.json>`.
+- **MCP tools**: `resolve_path`, `set_path`, `list_paths`, `delete_path` —
+  the agent can look up handles and register new ones the same way it
+  stores memories.
+- **Hook front-load**: `hooks/tool-recall-pre.mjs` extracts identifier
+  tokens from Bash / Read / Grep / Glob arguments and prepends the
+  resolution to the recall banner. Cached with a short TTL.
+
+Rule of thumb: if the answer is a path or URL, use `locations`; if the
+answer is a paragraph, use `memories`. Store the current path in
+`locations`, and the "why we moved it in June" in `memories`.
+
+Full recipe in [`docs/recipes/paths-alias-layer.md`](recipes/paths-alias-layer.md).
+
+---
+
 ## TL;DR
 
 1. Connect mneme via MCP (§3).
@@ -332,5 +357,8 @@ Full recipe in [`docs/recipes/nightly-consolidation.md`](recipes/nightly-consoli
    That's what keeps the memory sharp instead of bloated.
 4. Schedule a weekly `--health` review — the store gets sharper only when you
    push back on the drift (§6).
+5. Register the handles you look up all the time as `locations` (§7) —
+   `godot → E:/tools/godot`, `download → E:/download`. It's the difference
+   between one lookup and one glob-of-a-huge-tree.
 4. Optional: enable the auto-recall hooks (§5) if you're on Claude Code and want memory
    surfaced without asking.

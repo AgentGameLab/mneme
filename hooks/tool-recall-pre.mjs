@@ -58,6 +58,10 @@ const CFG = {
   queryLen: intEnv('MNEME_TOOL_QUERY_LEN', 120),
   stateDir: process.env.MNEME_STATE_DIR || resolve(HOME, '.claude', 'hooks'),
   timeoutMs: intEnv('MNEME_TIMEOUT_MS', 2800),
+  // v2.8: alias cache — how long to reuse the last --list-paths snapshot
+  // instead of re-spawning the CLI. Kept short so cross-session updates land
+  // fast, but non-zero so back-to-back tool calls don't each spawn a probe.
+  aliasCacheTtlMs: intEnv('MNEME_ALIAS_CACHE_TTL_MS', 5 * 60 * 1000),
 }
 
 // Extract a short recall query from tool arguments.
@@ -174,6 +178,132 @@ function formatHit(h) {
   return `[id:${h.id} ★${h.importance}]${tags}${sum}\n  ${body}${trailer}`
 }
 
+// ── v2.8 alias layer ─────────────────────────────────────────
+// A session-scoped cache of `--list-paths --format json`. On tool fire we
+// pull short identifier-shaped tokens out of the tool arguments and check
+// them against known names / aliases; matches inject a definite path
+// alongside (not instead of) the FTS+vec recall — the alias tells you WHERE
+// the thing is; the memory tells you WHY it exists.
+
+const ALIAS_CACHE_PATH = resolve(CFG.stateDir, '.mneme-locations-cache.json')
+
+function loadAliasCache() {
+  try {
+    if (!existsSync(ALIAS_CACHE_PATH)) return null
+    const data = JSON.parse(readFileSync(ALIAS_CACHE_PATH, 'utf-8'))
+    if (!Array.isArray(data.locations)) return null
+    if (typeof data.ts !== 'number' || Date.now() - data.ts > CFG.aliasCacheTtlMs) return null
+    return data.locations
+  } catch { return null }
+}
+
+function refreshAliasCache() {
+  const args = [CFG.indexPath, '--list-paths', '--format', 'json']
+  const r = spawnSync(process.execPath, args, {
+    encoding: 'utf-8',
+    timeout: Math.min(CFG.timeoutMs, 1500),
+    env: passThroughDbEnv(),
+  })
+  if (r.status !== 0 || r.error) return null
+  // The CLI prints startup logs to stderr; stdout is one JSON array.
+  const stdout = r.stdout || ''
+  const startBracket = stdout.indexOf('[')
+  if (startBracket === -1) return null
+  let locations
+  try { locations = JSON.parse(stdout.slice(startBracket)) } catch { return null }
+  if (!Array.isArray(locations)) return null
+  try {
+    if (!existsSync(CFG.stateDir)) mkdirSync(CFG.stateDir, { recursive: true })
+    const tmp = ALIAS_CACHE_PATH + '.tmp-' + process.pid
+    writeFileSync(tmp, JSON.stringify({ locations, ts: Date.now() }))
+    renameSync(tmp, ALIAS_CACHE_PATH)
+  } catch { /* cache write is best-effort */ }
+  return locations
+}
+
+function ensureAliasCache() {
+  return loadAliasCache() ?? refreshAliasCache()
+}
+
+// Pull identifier-shaped tokens out of the tool arguments. We want strings
+// that could plausibly be a registered alias (short, no slashes, no dots),
+// and reject the obviously-not (long code, file paths, etc.).
+function extractAliasCandidates(toolName, toolInput) {
+  if (!toolInput || typeof toolInput !== 'object') return []
+  let source = ''
+  switch (toolName) {
+    case 'Bash':
+      source = String(toolInput.command || '')
+      break
+    case 'Grep':
+      source = [toolInput.pattern, toolInput.path, toolInput.glob].filter(Boolean).join(' ')
+      break
+    case 'Read':
+      source = String(toolInput.file_path || '')
+      break
+    case 'Glob':
+      source = [toolInput.pattern, toolInput.path].filter(Boolean).join(' ')
+      break
+    default:
+      return []
+  }
+  if (!source) return []
+  // Split on whitespace + path separators. Keep tokens matching the alias shape:
+  // 2-40 chars, alphanumeric plus _-, plus CJK; exclude anything with a dot
+  // (looks like extension) or that is a common shell keyword.
+  const SHELL_STOP = new Set([
+    'cd', 'ls', 'cat', 'echo', 'node', 'npm', 'npx', 'git', 'grep', 'sed', 'awk',
+    'if', 'then', 'else', 'fi', 'for', 'do', 'done', 'while', 'exit', 'return',
+    'sudo', 'pwd', 'export', 'source', 'env', 'set',
+  ])
+  const seen = new Set()
+  const out = []
+  for (const token of source.split(/[\s/\\:]+/)) {
+    const t = token.trim()
+    if (!t) continue
+    if (t.includes('.')) continue
+    if (t.length < 2 || t.length > 40) continue
+    if (!/^[A-Za-z0-9_\-一-鿿]+$/.test(t)) continue
+    if (SHELL_STOP.has(t)) continue
+    if (seen.has(t)) continue
+    seen.add(t)
+    out.push(t)
+    if (out.length >= 8) break
+  }
+  return out
+}
+
+function matchAliases(candidates, locations) {
+  if (!candidates || candidates.length === 0 || !locations || locations.length === 0) return []
+  const nameMap = new Map()
+  const aliasMap = new Map()
+  for (const row of locations) {
+    nameMap.set(row.name, row)
+    for (const a of row.aliases || []) {
+      if (!aliasMap.has(a)) aliasMap.set(a, row)
+    }
+  }
+  const hits = []
+  const seenRow = new Set()
+  for (const c of candidates) {
+    const row = nameMap.get(c) || aliasMap.get(c)
+    if (row && !seenRow.has(row.name)) {
+      seenRow.add(row.name)
+      hits.push({ matched: c, ...row })
+    }
+  }
+  return hits
+}
+
+function formatAliasBanner(hits) {
+  const lines = hits.map(h => {
+    const via = h.matched === h.name ? '' : ` (via alias "${h.matched}")`
+    const notes = h.notes ? ` — ${h.notes}` : ''
+    return `  ${h.name} → ${h.path}  [${h.kind}]${via}${notes}`
+  })
+  return `📍 [mneme locations] ${hits.length} known path${hits.length > 1 ? 's' : ''} in this call — resolve to the registered path instead of guessing or globbing:\n${lines.join('\n')}`
+}
+
 // ── main ─────────────────────────────────────────────────
 let input = ''
 process.stdin.setEncoding('utf-8')
@@ -184,28 +314,46 @@ process.stdin.on('end', () => {
 
   const sessionId = payload.session_id || payload.sessionId || 'unknown'
   const toolName = payload.tool_name || ''
-  const query = extractQuery(toolName, payload.tool_input || {})
-  if (!query || query.length < 3) process.exit(0)
+  const toolInput = payload.tool_input || {}
 
-  const recalled = runRecall(query, sessionId)
-  if (!recalled || !Array.isArray(recalled.hits)) process.exit(0)
+  // v2.8: alias front-load. Cheap and definite — if any candidate token
+  // matches a registered location, emit the resolution banner. This does
+  // not block or replace the FTS+vec recall below; the two compose.
+  const aliasBanners = []
+  try {
+    const candidates = extractAliasCandidates(toolName, toolInput)
+    if (candidates.length > 0) {
+      const cache = ensureAliasCache()
+      if (cache && cache.length > 0) {
+        const hits = matchAliases(candidates, cache)
+        if (hits.length > 0) aliasBanners.push(formatAliasBanner(hits))
+      }
+    }
+  } catch { /* alias front-load is best-effort */ }
 
-  const hits = recalled.hits
-  if (hits.length === 0) process.exit(0)
+  const query = extractQuery(toolName, toolInput)
+  let recallSection = ''
+  if (query && query.length >= 3) {
+    const recalled = runRecall(query, sessionId)
+    const hits = recalled?.hits || []
+    if (hits.length > 0) {
+      const injected = loadInjected(sessionId)
+      const fresh = hits.filter(h => !injected.has(h.id))
+      if (fresh.length > 0) {
+        const top = fresh.slice(0, 3)
+        recallSection =
+          `🔧 [mneme tool-recall] Before running \`${toolName}\`, mneme found ${top.length} memory hit(s) related to the arguments. ` +
+          `Check them — you may be able to skip the tool call entirely, or you'll at least have the context.\n\n` +
+          top.map(formatHit).join('\n\n')
+        for (const h of top) injected.add(h.id)
+        saveInjected(sessionId, injected)
+      }
+    }
+  }
 
-  const injected = loadInjected(sessionId)
-  const fresh = hits.filter(h => !injected.has(h.id))
-  if (fresh.length === 0) process.exit(0)
+  if (!aliasBanners.length && !recallSection) process.exit(0)
 
-  const top = fresh.slice(0, 3)
-  const additionalContext =
-    `🔧 [mneme tool-recall] Before running \`${toolName}\`, mneme found ${top.length} memory hit(s) related to the arguments. ` +
-    `Check them — you may be able to skip the tool call entirely, or you'll at least have the context.\n\n` +
-    top.map(formatHit).join('\n\n')
-
-  for (const h of top) injected.add(h.id)
-  saveInjected(sessionId, injected)
-
+  const additionalContext = [...aliasBanners, recallSection].filter(Boolean).join('\n\n')
   process.stdout.write(JSON.stringify({
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
