@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ============================================================
-// mneme MCP Server v2.7.0
+// mneme MCP Server v2.8.0
 // Exposes recall_memory / store_memory / recall_by_id / memory_stats tools
 // On-demand recall for any MCP-compatible AI agent — saves 80-90% memory token costs
 //
@@ -35,6 +35,10 @@ import {
   embedMissingVectors,
   indexSessionTranscripts,
   closeMemory,
+  setLocation,
+  getLocation,
+  listLocations,
+  deleteLocation,
 } from './index.mjs'
 
 // ── Load .env.local BEFORE initMemory() ────────────────────────────────
@@ -64,7 +68,7 @@ embedMissingVectors(500).then(r => {
 }).catch(e => console.error(`[mneme] startup self-heal failed: ${e.message}`))
 
 const SERVER_NAME = 'mneme'
-const SERVER_VERSION = '2.6.0'
+const SERVER_VERSION = '2.8.0'
 
 // ── Factory: each call returns a fresh McpServer with all 4 tools registered ──
 // Why factory: HTTP stateful multi-client mode requires per-session McpServer
@@ -202,6 +206,84 @@ function createServer() {
         `Vector search: ${stats.embeddingConfigured ? 'configured' : 'not configured (FTS5 only)'}`,
       ].join('\n')
       return { content: [{ type: 'text', text }] }
+    }
+  )
+
+  // ── Tool: resolve_path ──────────────────────────────────────
+  // v2.8 locations layer: exact-match KV, separate from the RRF-ranked recall
+  // path so that "which directory did I mean by X" gets a definite answer.
+  s.tool(
+    'resolve_path',
+    'Resolve a short handle (name or alias) to its registered path. Use this BEFORE guessing a path, running Glob against a large root, or asking the user "where is X". Returns { name, path, kind, aliases, notes } or null. Exact-match — not FTS, not semantic. If null, either the alias is not registered yet (call set_path) or the user meant something else (fall back to recall_memory).',
+    {
+      name_or_alias: z.string().describe('Either the location primary name or one of its aliases'),
+    },
+    async ({ name_or_alias }) => {
+      const row = getLocation(name_or_alias)
+      if (!row) {
+        return { content: [{ type: 'text', text: `(no location registered for "${name_or_alias}")` }] }
+      }
+      const al = row.aliases.length ? ` · aliases: ${row.aliases.join(', ')}` : ''
+      const notes = row.notes ? `\nnotes: ${row.notes}` : ''
+      return { content: [{ type: 'text', text: `${row.name} → ${row.path}  [${row.kind}]${al}${notes}` }] }
+    }
+  )
+
+  // ── Tool: set_path ──────────────────────────────────────────
+  s.tool(
+    'set_path',
+    'Register a path alias so future turns (and other sessions) can resolve it with resolve_path. Kinds: dir (default), file, glob_root, executable, url, other. `force: true` overwrites an existing name; without it, changing a registered path errors so you notice the conflict. `aliases` accepts alternate names that also resolve to this path.',
+    {
+      name: z.string().describe('Primary handle, e.g. "download", "godot", "workspace"'),
+      path: z.string().describe('Absolute path or URL. mneme stores it verbatim; no expansion.'),
+      kind: z.enum(['dir', 'file', 'glob_root', 'executable', 'url', 'other']).optional().default('dir').describe('What kind of location this is. `glob_root` signals "commonly globbed from"; `executable` marks something you spawn; `url` for docs/dashboards.'),
+      aliases: z.array(z.string()).optional().describe('Alternate names that should also resolve to this path'),
+      notes: z.string().optional().describe('Free-form remark (why this exists, what to remember about it)'),
+      force: z.boolean().optional().describe('Overwrite an existing entry even if its path changed'),
+    },
+    async ({ name, path, kind = 'dir', aliases, notes, force }) => {
+      try {
+        const res = setLocation({ name, path, kind, aliases, notes, force })
+        const al = res.aliases.length ? ` · aliases: ${res.aliases.join(', ')}` : ''
+        const verb = res.created ? 'created' : 'updated'
+        return { content: [{ type: 'text', text: `${verb} ${res.name} → ${res.path}  [${res.kind}]${al}` }] }
+      } catch (e) {
+        return { content: [{ type: 'text', text: `error: ${e.message}` }] }
+      }
+    }
+  )
+
+  // ── Tool: list_paths ────────────────────────────────────────
+  s.tool(
+    'list_paths',
+    'List every registered path alias. Optionally filter by kind. Useful before setting a new alias (avoid duplicates) or when you want to remind yourself what handles exist.',
+    {
+      kind: z.enum(['dir', 'file', 'glob_root', 'executable', 'url', 'other']).optional().describe('Filter by kind'),
+    },
+    async ({ kind }) => {
+      const rows = listLocations({ kind })
+      if (rows.length === 0) {
+        return { content: [{ type: 'text', text: '(no path aliases registered yet)' }] }
+      }
+      const w = Math.max(4, ...rows.map(r => r.name.length))
+      const lines = rows.map(r => {
+        const al = r.aliases.length ? ` · aliases: ${r.aliases.join(', ')}` : ''
+        return `  ${r.name.padEnd(w)}  [${r.kind}]  ${r.path}${al}`
+      })
+      return { content: [{ type: 'text', text: lines.join('\n') }] }
+    }
+  )
+
+  // ── Tool: delete_path ───────────────────────────────────────
+  s.tool(
+    'delete_path',
+    'Remove a registered path alias by primary name. Returns whether a row was actually removed.',
+    {
+      name: z.string().describe('Primary name to remove (aliases follow the row and are removed with it)'),
+    },
+    async ({ name }) => {
+      const removed = deleteLocation(name)
+      return { content: [{ type: 'text', text: removed ? `removed ${name}` : `no location named "${name}"` }] }
     }
   )
 

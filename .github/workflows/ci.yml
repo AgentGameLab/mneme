@@ -60,3 +60,8 @@ jobs:
         env:
           TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-memhealth.db
         run: node memory-health.test.mjs
+
+      - name: End-to-end test (locations alias layer)
+        env:
+          TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-locations.db
+        run: node locations.test.mjs
