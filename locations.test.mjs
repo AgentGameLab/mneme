@@ -178,6 +178,72 @@ function cli(args, opts = {}) {
   }
 }
 
+// ── v2.8 review-fix regression coverage ──
+{
+  for (const suffix of ['', '-shm', '-wal']) {
+    const p = DB_PATH + suffix
+    if (existsSync(p)) unlinkSync(p)
+  }
+  const { initMemory, closeMemory, setLocation, getLocation, importLocations, deleteLocation } = await import('./index.mjs?fresh=' + Math.random())
+  initMemory()
+
+  // Alias namespace uniqueness: second row cannot claim an alias that's already
+  // used, and cannot use an alias that's another row's primary name.
+  setLocation({ name: 'godot', path: '/godot', aliases: ['gd'] })
+  let claim = false
+  try { setLocation({ name: 'gnome-desktop', path: '/gnome', aliases: ['gd'] }) } catch { claim = true }
+  check('alias collision with another row\'s alias throws', claim)
+  let clashName = false
+  try { setLocation({ name: 'godot-fork', path: '/fork', aliases: ['godot'] }) } catch { clashName = true }
+  check('alias collision with another row\'s primary name throws', clashName)
+  // Self-alias is silently dropped, not treated as a collision.
+  const selfAlias = setLocation({ name: 'godot', path: '/godot', aliases: ['gd', 'godot'], force: true })
+  check('self-alias dropped silently', !selfAlias.aliases.includes('godot') && selfAlias.aliases.includes('gd'))
+
+  // Partial-update: re-setting name + path preserves aliases/kind/notes.
+  setLocation({ name: 'blender', path: '/blender/3.6', kind: 'executable', aliases: ['b3d'], notes: 'main' })
+  const partialUpdate = setLocation({ name: 'blender', path: '/blender/4.0', force: true })
+  check('partial re-set preserves aliases', JSON.stringify(partialUpdate.aliases) === JSON.stringify(['b3d']))
+  check('partial re-set preserves kind', partialUpdate.kind === 'executable')
+  check('partial re-set preserves notes', partialUpdate.notes === 'main')
+  check('partial re-set updates path', partialUpdate.path === '/blender/4.0')
+  // Explicitly clearing metadata still works.
+  const cleared = setLocation({ name: 'blender', path: '/blender/4.0', aliases: [], notes: null, kind: 'dir', force: true })
+  check('explicit aliases=[] clears aliases', cleared.aliases.length === 0)
+  check('explicit notes=null clears notes', cleared.notes === null)
+
+  // LIKE-metachar in alias must resolve exactly and not degrade to full scan.
+  // Both `%` and `_` should be escaped in the LIKE prefilter.
+  setLocation({ name: 'wildcard', path: '/wild', aliases: ['a%b', 'c_d'] })
+  check('alias containing % resolves via exact match', getLocation('a%b')?.name === 'wildcard')
+  check('alias containing _ resolves via exact match', getLocation('c_d')?.name === 'wildcard')
+  check('non-existent % pattern does not overmatch', getLocation('%%%') === null)
+
+  // importLocations input validation: strings, numbers, arrays-of-primitives.
+  let rejectedStr = false, rejectedNum = false
+  try { importLocations('just a string') } catch { rejectedStr = true }
+  try { importLocations(42) } catch { rejectedNum = true }
+  check('importLocations rejects a string input', rejectedStr)
+  check('importLocations rejects a number input', rejectedNum)
+
+  // importLocations transactional atomicity: a batch with a mid-loop unrecoverable
+  // error still reports errors accumulator; skipped-conflicts stay counted.
+  deleteLocation('wildcard')
+  deleteLocation('godot')
+  deleteLocation('blender')
+  const preCount = 0
+  const mixed = importLocations([
+    { name: 'ok1', path: '/1' },
+    { path: 'no-name' },                             // errors: missing name
+    { name: 'ok2', path: '/2' },
+    { name: 'bad-kind', path: '/x', kind: 'nope' },  // errors: invalid kind
+  ])
+  check('importLocations mixed batch reports errors', mixed.errors.length === 2)
+  check('importLocations mixed batch counts adds', mixed.added === 2)
+
+  closeMemory()
+}
+
 // Cleanup
 for (const suffix of ['', '-shm', '-wal']) {
   const p = DB_PATH + suffix

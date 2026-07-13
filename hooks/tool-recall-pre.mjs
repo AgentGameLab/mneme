@@ -36,6 +36,7 @@ import { spawnSync } from 'node:child_process'
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs'
 import { resolve, dirname, basename } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { createHash } from 'node:crypto'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const HOME = process.env.USERPROFILE || process.env.HOME || __dirname
@@ -185,7 +186,17 @@ function formatHit(h) {
 // alongside (not instead of) the FTS+vec recall — the alias tells you WHERE
 // the thing is; the memory tells you WHY it exists.
 
-const ALIAS_CACHE_PATH = resolve(CFG.stateDir, '.mneme-locations-cache.json')
+// Key the cache path by a hash of the resolved DB path + index path so that
+// two mneme installs (or two databases under the same state dir) don't
+// leak locations across each other. `resolved-db` is the env-visible DB
+// the CLI would open; `index-path` is which mneme codebase this hook wires
+// to. Different pairs → different cache files.
+function fingerprintForCache() {
+  const dbEnv = process.env.MNEME_DB_PATH || process.env.TOKENMEM_DB_PATH || ''
+  const h = createHash('sha256').update(dbEnv + '\0' + CFG.indexPath).digest('hex').slice(0, 12)
+  return h
+}
+const ALIAS_CACHE_PATH = resolve(CFG.stateDir, `.mneme-locations-cache-${fingerprintForCache()}.json`)
 
 function loadAliasCache() {
   try {
@@ -205,13 +216,24 @@ function refreshAliasCache() {
     env: passThroughDbEnv(),
   })
   if (r.status !== 0 || r.error) return null
-  // The CLI prints startup logs to stderr; stdout is one JSON array.
+  // The CLI prints startup logs to stderr; stdout is one JSON array. Walk
+  // stdout for the first `[` at the start of a line — resistant to any prefix
+  // a future release might emit before the payload.
   const stdout = r.stdout || ''
-  const startBracket = stdout.indexOf('[')
-  if (startBracket === -1) return null
-  let locations
-  try { locations = JSON.parse(stdout.slice(startBracket)) } catch { return null }
-  if (!Array.isArray(locations)) return null
+  let locations = null
+  for (const line of stdout.split(/\r?\n/)) {
+    if (line.startsWith('[')) {
+      try { locations = JSON.parse(line + stdout.slice(stdout.indexOf(line) + line.length)) } catch {}
+      if (locations !== null) break
+    }
+  }
+  if (!Array.isArray(locations)) {
+    // Fallback: the JSON might straddle newlines. Try from the first '[' char.
+    const idx = stdout.indexOf('[')
+    if (idx === -1) return null
+    try { locations = JSON.parse(stdout.slice(idx)) } catch { return null }
+    if (!Array.isArray(locations)) return null
+  }
   try {
     if (!existsSync(CFG.stateDir)) mkdirSync(CFG.stateDir, { recursive: true })
     const tmp = ALIAS_CACHE_PATH + '.tmp-' + process.pid

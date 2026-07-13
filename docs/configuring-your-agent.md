@@ -229,6 +229,7 @@ be re-injected within one Claude Code session.
 | `MNEME_TOOL_QUERY_LEN` | `120` | Max chars of tool arg used as recall query |
 | `MNEME_STATE_DIR` | `~/.claude/hooks` | Where session dedup files live |
 | `MNEME_TIMEOUT_MS` | `2800` | Spawn timeout for the recall CLI |
+| `MNEME_ALIAS_CACHE_TTL_MS` | `300000` | How long the tool-recall hook reuses a `--list-paths` snapshot before re-spawning (v2.8) |
 
 ### PreToolUse matcher reference
 
@@ -358,7 +359,7 @@ Full recipe in [`docs/recipes/paths-alias-layer.md`](recipes/paths-alias-layer.m
 4. Schedule a weekly `--health` review — the store gets sharper only when you
    push back on the drift (§6).
 5. Register the handles you look up all the time as `locations` (§7) —
-   `godot → E:/tools/godot`, `download → E:/download`. It's the difference
-   between one lookup and one glob-of-a-huge-tree.
-4. Optional: enable the auto-recall hooks (§5) if you're on Claude Code and want memory
+   `godot → /path/to/godot`, `download → /path/to/download`. It's the
+   difference between one lookup and one glob-of-a-huge-tree.
+6. Optional: enable the auto-recall hooks (§5) if you're on Claude Code and want memory
    surfaced without asking.

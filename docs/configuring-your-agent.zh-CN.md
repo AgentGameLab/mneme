@@ -202,6 +202,7 @@ MCP tool 是 pull 模式——Agent 自己决定何时 `recall_memory`。有些 
 | `MNEME_TOOL_QUERY_LEN` | `120` | 从 tool 参数抽 query 的最大字符数 |
 | `MNEME_STATE_DIR` | `~/.claude/hooks` | session 去重文件放哪 |
 | `MNEME_TIMEOUT_MS` | `2800` | recall CLI 的 spawn 超时 |
+| `MNEME_ALIAS_CACHE_TTL_MS` | `300000` | tool-recall hook 复用 `--list-paths` 快照的 TTL（毫秒；v2.8）|
 
 ### PreToolUse matcher 参照
 

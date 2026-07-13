@@ -234,7 +234,7 @@ function createServer() {
     'set_path',
     'Register a path alias so future turns (and other sessions) can resolve it with resolve_path. Kinds: dir (default), file, glob_root, executable, url, other. `force: true` overwrites an existing name; without it, changing a registered path errors so you notice the conflict. `aliases` accepts alternate names that also resolve to this path.',
     {
-      name: z.string().describe('Primary handle, e.g. "download", "godot", "chinatsu-workspace"'),
+      name: z.string().describe('Primary handle, e.g. "download", "godot", "workspace"'),
       path: z.string().describe('Absolute path or URL. mneme stores it verbatim; no expansion.'),
       kind: z.enum(['dir', 'file', 'glob_root', 'executable', 'url', 'other']).optional().default('dir').describe('What kind of location this is. `glob_root` signals "commonly globbed from"; `executable` marks something you spawn; `url` for docs/dashboards.'),
       aliases: z.array(z.string()).optional().describe('Alternate names that should also resolve to this path'),
