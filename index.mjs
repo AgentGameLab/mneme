@@ -24,6 +24,7 @@ import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import { createHash } from 'node:crypto'
 import { applyMetaGate } from './meta-gate.mjs'
+import { parseTemporalWindow } from './lib/temporal-parser.mjs'
 
 const require = createRequire(import.meta.url)
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -1122,6 +1123,16 @@ export async function embedMissingVectors(limit = 200) {
 
 // ── Memory Retrieval (Core! AIRI-style composite scoring) ───
 
+const TEMPORAL_HYSTERESIS_MIN_HITS = 3
+const TEMPORAL_FALLBACK_BOOST = 1
+
+function isInTemporalWindow(row, temporalWindow) {
+  if (!temporalWindow) return false
+  const createdAt = Number(row.created_at)
+  return Number.isFinite(createdAt) &&
+    createdAt >= temporalWindow.from && createdAt <= temporalWindow.to
+}
+
 /**
  * Retrieve relevant memories
  *
@@ -1149,6 +1160,8 @@ export function recallMemories(opts = {}) {
   const { query: queryText, types, categories, tags, minImportance, limit = 10 } = opts
   const now = Date.now()
   const THIRTY_DAYS_MS = 30 * 86400_000
+  const temporalWindow = queryText ? parseTemporalWindow(queryText) : null
+  let temporalFallback = false
 
   let rows
 
@@ -1156,64 +1169,79 @@ export function recallMemories(opts = {}) {
     // FTS5 search + structured filtering
     const ftsQueryParam = sanitizeFtsText(queryText)
 
-    const structuredConditions = ['m.deleted_at IS NULL', 'm.superseded_by IS NULL']
-    const structuredParams = []
-    if (types?.length) {
-      structuredConditions.push(`m.memory_type IN (${types.map(() => '?').join(',')})`)
-      structuredParams.push(...types)
-    }
-    if (categories?.length) {
-      structuredConditions.push(`m.category IN (${categories.map(() => '?').join(',')})`)
-      structuredParams.push(...categories)
-    }
-    if (minImportance) {
-      structuredConditions.push('m.importance >= ?')
-      structuredParams.push(minImportance)
-    }
-
-    // Try FTS search
-    if (ftsQueryParam) {
-      try {
-        // With simple extension: jieba OR query (filter stop words, any word match)
-        // Without: fall back to character-level OR query
-        const orQuery = _simpleLoaded
-          ? buildJiebaOrQuery(ftsQueryParam)
-          : buildQuotedFtsOrQuery(ftsQueryParam)
-
-        if (orQuery) {
-          const sql = `
-            SELECT m.rowid AS rowid, m.*, mf.rank AS fts_rank
-            FROM memories m
-            JOIN memories_fts mf ON mf.rowid = m.rowid
-            WHERE memories_fts MATCH ?
-              AND ${structuredConditions.join(' AND ')}
-            ORDER BY mf.rank
-            LIMIT ?
-          `
-          rows = db.prepare(sql).all(orQuery, ...structuredParams, limit * 3)
-        }
-      } catch (e) {
-        log(`FTS query failed: ${e.message}`)
-        rows = []
+    const recallQueryCandidates = (candidateWindow) => {
+      const structuredConditions = ['m.deleted_at IS NULL', 'm.superseded_by IS NULL']
+      const structuredParams = []
+      if (types?.length) {
+        structuredConditions.push(`m.memory_type IN (${types.map(() => '?').join(',')})`)
+        structuredParams.push(...types)
       }
+      if (categories?.length) {
+        structuredConditions.push(`m.category IN (${categories.map(() => '?').join(',')})`)
+        structuredParams.push(...categories)
+      }
+      if (minImportance) {
+        structuredConditions.push('m.importance >= ?')
+        structuredParams.push(minImportance)
+      }
+      if (candidateWindow) {
+        structuredConditions.push('m.created_at BETWEEN ? AND ?')
+        structuredParams.push(candidateWindow.from, candidateWindow.to)
+      }
+
+      let candidateRows
+      // Try FTS search
+      if (ftsQueryParam) {
+        try {
+          // With simple extension: jieba OR query (filter stop words, any word match)
+          // Without: fall back to character-level OR query
+          const orQuery = _simpleLoaded
+            ? buildJiebaOrQuery(ftsQueryParam)
+            : buildQuotedFtsOrQuery(ftsQueryParam)
+
+          if (orQuery) {
+            const sql = `
+              SELECT m.rowid AS rowid, m.*, mf.rank AS fts_rank
+              FROM memories m
+              JOIN memories_fts mf ON mf.rowid = m.rowid
+              WHERE memories_fts MATCH ?
+                AND ${structuredConditions.join(' AND ')}
+              ORDER BY mf.rank
+              LIMIT ?
+            `
+            candidateRows = db.prepare(sql).all(orQuery, ...structuredParams, limit * 3)
+          }
+        } catch (e) {
+          log(`FTS query failed: ${e.message}`)
+          candidateRows = []
+        }
+      }
+
+      // FTS returned nothing -> fallback to LIKE + structured filtering
+      if (!candidateRows || candidateRows.length === 0) {
+        const keywords = tokenizeForLike(ftsQueryParam)
+        if (keywords.length === 0) return []
+        const likeConditions = keywords.map(() => 'm.content LIKE ?')
+        const likeParams = keywords.map(w => `%${w}%`)
+
+        const sql = `
+          SELECT m.rowid AS rowid, m.*, 0 AS fts_rank
+          FROM memories m
+          WHERE ${structuredConditions.join(' AND ')}
+            ${likeConditions.length ? `AND (${likeConditions.join(' OR ')})` : ''}
+          ORDER BY m.importance DESC, m.created_at DESC
+          LIMIT ?
+        `
+        candidateRows = db.prepare(sql).all(...structuredParams, ...likeParams, limit * 3)
+      }
+
+      return candidateRows
     }
 
-    // FTS returned nothing -> fallback to LIKE + structured filtering
-    if (!rows || rows.length === 0) {
-      const keywords = tokenizeForLike(ftsQueryParam)
-      if (keywords.length === 0) return []
-      const likeConditions = keywords.map(() => 'm.content LIKE ?')
-      const likeParams = keywords.map(w => `%${w}%`)
-
-      const sql = `
-        SELECT m.rowid AS rowid, m.*, 0 AS fts_rank
-        FROM memories m
-        WHERE ${structuredConditions.join(' AND ')}
-          ${likeConditions.length ? `AND (${likeConditions.join(' OR ')})` : ''}
-        ORDER BY m.importance DESC, m.created_at DESC
-        LIMIT ?
-      `
-      rows = db.prepare(sql).all(...structuredParams, ...likeParams, limit * 3)
+    rows = recallQueryCandidates(temporalWindow)
+    if (temporalWindow && rows.length < TEMPORAL_HYSTERESIS_MIN_HITS) {
+      temporalFallback = true
+      rows = recallQueryCandidates(null)
     }
   } else {
     // No query text: sort by importance + time
@@ -1263,9 +1291,20 @@ export function recallMemories(opts = {}) {
     // migration 003: decay_score as multiplier (periodically updated by runDecayCycle)
     // Defaults to 1.0 for records that haven't been through a decay cycle — backward compatible
     const decay = (row.decay_score != null) ? row.decay_score : 1.0
-    const score = baseScore * levelWeight * decay
+    const temporalMatch = isInTemporalWindow(row, temporalWindow)
+    const temporalBoost = temporalFallback && temporalMatch ? TEMPORAL_FALLBACK_BOOST : 0
+    const score = baseScore * levelWeight * decay + temporalBoost
+    const temporalMetadata = temporalWindow
+      ? { temporal_match: temporalMatch, temporal_fallback: temporalFallback }
+      : {}
 
-    return { ...row, score, tags: safeJsonParse(row.tags, []), metadata: safeJsonParse(row.metadata, {}) }
+    return {
+      ...row,
+      score,
+      ...temporalMetadata,
+      tags: safeJsonParse(row.tags, []),
+      metadata: safeJsonParse(row.metadata, {}),
+    }
   })
 
   // Tag filtering (application-layer, since SQLite has no array overlap operator)
@@ -1383,6 +1422,7 @@ export async function recallMemoriesHybrid(opts = {}) {
   const now = Date.now()
   const THIRTY_DAYS_MS = 30 * 86400_000
   const LEVEL_WEIGHT = { meta_knowledge: 1.3, semi_abstract: 1.0, concrete_trace: 0.7 }
+  const temporalWindow = parseTemporalWindow(queryText)
 
   // Parallel: vector query (get embedding) + FTS query
   // _internal=true so the FTS path doesn't also surface random records (hybrid surfaces once at the end)
@@ -1395,18 +1435,28 @@ export async function recallMemoriesHybrid(opts = {}) {
   let vecRows = []
   if (queryEmbedding) {
     try {
-      vecRows = db.prepare(`
-        SELECT m.rowid AS rowid, m.*, v.distance AS vec_distance
-        FROM (
-          SELECT memory_rowid, distance
-          FROM memories_vec
-          WHERE embedding MATCH ?
-          ORDER BY distance
-          LIMIT ?
-        ) AS v
-        JOIN memories m ON m.rowid = v.memory_rowid
-        WHERE m.deleted_at IS NULL AND m.superseded_by IS NULL
-      `).all(new Float32Array(queryEmbedding), limit * 3)
+      const retrieveVecRows = (candidateWindow) => {
+        const temporalCondition = candidateWindow ? 'AND m.created_at BETWEEN ? AND ?' : ''
+        const temporalParams = candidateWindow ? [candidateWindow.from, candidateWindow.to] : []
+        return db.prepare(`
+          SELECT m.rowid AS rowid, m.*, v.distance AS vec_distance
+          FROM (
+            SELECT memory_rowid, distance
+            FROM memories_vec
+            WHERE embedding MATCH ?
+            ORDER BY distance
+            LIMIT ?
+          ) AS v
+          JOIN memories m ON m.rowid = v.memory_rowid
+          WHERE m.deleted_at IS NULL AND m.superseded_by IS NULL
+            ${temporalCondition}
+        `).all(new Float32Array(queryEmbedding), limit * 3, ...temporalParams)
+      }
+
+      vecRows = retrieveVecRows(temporalWindow)
+      if (temporalWindow && vecRows.length < TEMPORAL_HYSTERESIS_MIN_HITS) {
+        vecRows = retrieveVecRows(null)
+      }
       vecRows = vecRows.map(r => ({
         ...r,
         tags: safeJsonParse(r.tags, []),
@@ -1447,7 +1497,7 @@ export async function recallMemoriesHybrid(opts = {}) {
   if (!opts._noEntity) addRanks(findEntityMatchedMemories(db, queryText, limit * 3), 'entity')
 
   // Apply Memory Transfer Learning level weighting + importance + time decay + decay_score (migration 003)
-  const merged = Array.from(rrfScores.values()).map(({ row, rrf, sources }) => {
+  let merged = Array.from(rrfScores.values()).map(({ row, rrf, sources }) => {
     const levelWeight = LEVEL_WEIGHT[row.memory_level] || 1.0
     const importanceScore = row.importance / 10
     // migration 004 (v2.2): age based on event_time when set, else created_at fallback
@@ -1466,8 +1516,21 @@ export async function recallMemoriesHybrid(opts = {}) {
     const freqScore = Math.min(1, Math.log1p(row.access_count || 0) / Math.log1p(20))
     const decay = (row.decay_score != null) ? row.decay_score : 1.0
     const score = (rrf * 10 + freqScore * 0.10 + timeScore * 0.06 + importanceScore * 0.05) * levelWeight * decay
-    return { ...row, score, rrf, recall_sources: sources }
+    const temporalMetadata = temporalWindow
+      ? { temporal_match: isInTemporalWindow(row, temporalWindow) }
+      : {}
+    return { ...row, score, rrf, recall_sources: sources, ...temporalMetadata }
   })
+
+  if (temporalWindow) {
+    const temporalRows = merged.filter(row => row.temporal_match)
+    const temporalFallback = temporalRows.length < TEMPORAL_HYSTERESIS_MIN_HITS
+    merged = (temporalFallback ? merged : temporalRows).map(row => ({
+      ...row,
+      score: row.score + (temporalFallback && row.temporal_match ? TEMPORAL_FALLBACK_BOOST : 0),
+      temporal_fallback: temporalFallback,
+    }))
+  }
 
   merged.sort((a, b) => b.score - a.score)
   let result = merged.slice(0, limit)
