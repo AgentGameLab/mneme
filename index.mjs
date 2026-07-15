@@ -1154,7 +1154,7 @@ export function recallMemories(opts = {}) {
 
   if (queryText) {
     // FTS5 search + structured filtering
-    const ftsQueryParam = queryText.trim()
+    const ftsQueryParam = sanitizeFtsText(queryText)
 
     const structuredConditions = ['m.deleted_at IS NULL']
     const structuredParams = []
@@ -1178,8 +1178,7 @@ export function recallMemories(opts = {}) {
         // Without: fall back to character-level OR query
         const orQuery = _simpleLoaded
           ? buildJiebaOrQuery(ftsQueryParam)
-          : queryText.replace(/["\u201c\u201d\u2018\u2019\u3010\u3011\uff08\uff09\u300a\u300b\uff0c\u3002\uff01\uff1f\u3001\uff1b\uff1a\s]+/g, ' ').trim()
-              .split(/\s+/).filter(w => w.length > 0).map(w => `"${w}"`).join(' OR ')
+          : buildQuotedFtsOrQuery(ftsQueryParam)
 
         if (orQuery) {
           const sql = `
@@ -1201,7 +1200,8 @@ export function recallMemories(opts = {}) {
 
     // FTS returned nothing -> fallback to LIKE + structured filtering
     if (!rows || rows.length === 0) {
-      const keywords = tokenizeForLike(queryText)
+      const keywords = tokenizeForLike(ftsQueryParam)
+      if (keywords.length === 0) return []
       const likeConditions = keywords.map(() => 'm.content LIKE ?')
       const likeParams = keywords.map(w => `%${w}%`)
 
@@ -1562,7 +1562,9 @@ export function searchConversations(queryText, opts = {}) {
   try {
     let anchorSQL, anchorParams
     if (_simpleLoaded) {
-      const convOrQuery = buildJiebaOrQuery(queryText) || queryText.trim()
+      const sanitizedQuery = sanitizeFtsText(queryText)
+      const convOrQuery = buildJiebaOrQuery(sanitizedQuery) || buildQuotedFtsOrQuery(sanitizedQuery)
+      if (!convOrQuery) return []
       anchorSQL = `
         SELECT c.rowid, c.chat_id, c.created_at, cf.rank AS fts_rank
         FROM conversations c
@@ -1574,9 +1576,7 @@ export function searchConversations(queryText, opts = {}) {
       `
       anchorParams = [convOrQuery]
     } else {
-      const ftsQuery = queryText
-        .replace(/["\u201c\u201d\u2018\u2019\u3010\u3011\uff08\uff09\u300a\u300b\uff0c\u3002\uff01\uff1f\u3001\uff1b\uff1a]/g, ' ')
-        .split(/\s+/).filter(w => w.length > 0).map(w => `"${w}"`).join(' OR ')
+      const ftsQuery = buildQuotedFtsOrQuery(sanitizeFtsText(queryText))
       if (!ftsQuery) return []
       anchorSQL = `
         SELECT c.rowid, c.chat_id, c.created_at, cf.rank AS fts_rank
@@ -2588,6 +2588,23 @@ const FTS_STOP_WORDS = new Set([
   '\u60f3','\u8fd9','\u90a3','\u8fd9\u4e2a','\u90a3\u4e2a','\u6709\u6ca1\u6709','\u53ef\u4ee5','\u53ef\u80fd','\u9700\u8981','\u5e94\u8be5','\u5982\u679c',
 ])
 
+// FTS5 operators must never reach MATCH as raw user input. The optional
+// libsimple tokenizer also treats bare '?' as syntax even though core FTS5
+// does not document it as an operator.
+function sanitizeFtsText(text) {
+  return String(text || '')
+    .replace(/["?+\-():^*!\u201c\u201d\u2018\u2019\u3010\u3011\uff08\uff09\u300a\u300b\uff0c\u3002\uff01\uff1f\u3001\uff1b\uff1a\s]+/g, ' ')
+    .trim()
+}
+
+function buildQuotedFtsOrQuery(text) {
+  if (!text) return ''
+  return text.split(/\s+/)
+    .filter(Boolean)
+    .map(term => `"${term.replace(/"/g, '""')}"`)
+    .join(' OR ')
+}
+
 /**
  * Build FTS OR query using jieba segmentation (when simple extension is loaded)
  */
@@ -2599,7 +2616,7 @@ function buildJiebaOrQuery(text) {
     const terms = [...jiebaRaw.matchAll(/"([^"]+)"/g)].map(m => m[1])
     const keywords = terms.filter(t => t.length > 1 && !FTS_STOP_WORDS.has(t))
     if (keywords.length === 0) return null
-    return keywords.map(t => `"${t}"`).join(' OR ')
+    return keywords.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ')
   } catch { return null }
 }
 
