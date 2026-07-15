@@ -5,6 +5,7 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
+import Database from 'better-sqlite3'
 
 const root = mkdtempSync(resolve(tmpdir(), 'mneme-recall-search-'))
 process.env.TOKENMEM_DB_PATH = resolve(root, 'tokenmem.test.db')
@@ -77,6 +78,46 @@ try {
   check('bare ? query returns no results without an FTS syntax error',
     bareQuestion.value.length === 0 && !/fts5: syntax error/i.test(bareQuestion.stderr),
     `segments=${JSON.stringify(bareQuestion.value)} stderr=${bareQuestion.stderr}`)
+
+  const supersededId = storeMemory({
+    content: 'obsoletebleedmarker legacy deployment setting',
+    memoryType: 'long_term',
+    category: 'project',
+    importance: 7,
+  })
+  const successorId = storeMemory({
+    content: 'current deployment setting replaces the obsolete value',
+    memoryType: 'long_term',
+    category: 'project',
+    importance: 7,
+    supersedes: [supersededId],
+  })
+
+  const db = new Database(process.env.TOKENMEM_DB_PATH, { readonly: true })
+  const supersededState = db.prepare(
+    'SELECT superseded_by, deleted_at FROM memories WHERE rowid = ?'
+  ).get(supersededId)
+  db.close()
+  check('supersede creates the pre-expiration bleed-window state',
+    String(supersededState?.superseded_by) === successorId && supersededState?.deleted_at == null,
+    `state=${JSON.stringify(supersededState)} successor=${successorId}`)
+
+  const queriedRecall = recallMemories({ query: 'obsoletebleedmarker', limit: 10, _internal: true })
+  check('queried recall excludes a superseded row before expiration',
+    !queriedRecall.some(row => String(row.rowid) === supersededId),
+    `rows=${JSON.stringify(queriedRecall)}`)
+
+  const unfilteredRecall = recallMemories({ limit: 10 })
+  check('no-query recall excludes a superseded row before expiration',
+    !unfilteredRecall.some(row => String(row.rowid) === supersededId) &&
+      unfilteredRecall.some(row => String(row.rowid) === successorId),
+    `rows=${JSON.stringify(unfilteredRecall)}`)
+
+  const fallbackRecall = searchConversations('obsoletebleedmarker', { limit: 2, contextWindow: 1 })
+  check('conversation memory fallback excludes a superseded row before expiration',
+    !fallbackRecall.some(segment => segment.messages?.some(message =>
+      String(message.metadata?.memory_rowid) === supersededId)),
+    `segments=${JSON.stringify(fallbackRecall)}`)
 
   closeMemory()
 } finally {

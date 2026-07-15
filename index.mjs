@@ -1156,7 +1156,7 @@ export function recallMemories(opts = {}) {
     // FTS5 search + structured filtering
     const ftsQueryParam = sanitizeFtsText(queryText)
 
-    const structuredConditions = ['m.deleted_at IS NULL']
+    const structuredConditions = ['m.deleted_at IS NULL', 'm.superseded_by IS NULL']
     const structuredParams = []
     if (types?.length) {
       structuredConditions.push(`m.memory_type IN (${types.map(() => '?').join(',')})`)
@@ -1217,7 +1217,7 @@ export function recallMemories(opts = {}) {
     }
   } else {
     // No query text: sort by importance + time
-    const conditions = ['deleted_at IS NULL']
+    const conditions = ['deleted_at IS NULL', 'superseded_by IS NULL']
     const params = []
     if (types?.length) {
       conditions.push(`memory_type IN (${types.map(() => '?').join(',')})`)
@@ -1405,7 +1405,7 @@ export async function recallMemoriesHybrid(opts = {}) {
           LIMIT ?
         ) AS v
         JOIN memories m ON m.rowid = v.memory_rowid
-        WHERE m.deleted_at IS NULL
+        WHERE m.deleted_at IS NULL AND m.superseded_by IS NULL
       `).all(new Float32Array(queryEmbedding), limit * 3)
       vecRows = vecRows.map(r => ({
         ...r,
