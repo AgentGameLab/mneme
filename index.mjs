@@ -1904,16 +1904,17 @@ export function runDecayCycle(opts = {}) {
 
   try {
     const rows = db.prepare(`
-      SELECT rowid, importance, access_count, created_at
+      SELECT rowid, importance, access_count, created_at, last_accessed
       FROM memories
       WHERE deleted_at IS NULL AND superseded_by IS NULL
     `).all()
 
     const items = rows.map(r => {
-      const t = Math.max(0, now - r.created_at)
-      const importance = r.importance || 5
-      const bEff = bBase / (1 + importance / 10)
-      const w = Math.pow(1 + t / tauMs, -bEff)
+      // Age from last_accessed (fall back to created_at for never-touched rows).
+      // importance is a recall-time prior, not a decay input — do NOT fold it into bEff.
+      const anchor = Math.max(r.last_accessed || 0, r.created_at)
+      const t = Math.max(0, now - anchor)
+      const w = Math.pow(1 + t / tauMs, -bBase)
       const reuseBoost = 1 + Math.min(10, r.access_count || 0) * 0.3
       const score = Math.min(1.0, w * reuseBoost)
       if (score >= 0.7) distribution.high++
