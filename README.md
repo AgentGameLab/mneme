@@ -198,9 +198,11 @@ Fetch exact memories by rowid (CLI + MCP tool), without bumping `access_count` �
 
 | Tool | Purpose |
 |------|---------|
-| `recall_memory(query, limit?, category?)` | Hybrid search: FTS5 + vector KNN + RRF fusion scoring |
+| `recall_memory(query, limit?, category?)` | Hybrid search: FTS5 + vector KNN + RRF fusion. `limit` is hard-capped at 20 by the recall contract (v2.9); larger values silently clamp — see `capped` in the JSON CLI output |
 | `store_memory(content, level?, ...)` | Store with abstraction level (meta_knowledge / semi_abstract / concrete_trace) |
 | `recall_by_id(ids)` | Fetch exact memories by rowid (no access_count bump) — citation / audit |
+| `get_recall_trace(trace_id)` | Inspect content-free candidate/filter counts and the exact IDs exposed by one recall |
+| `validate_memory_references(trace_id, text)` | Preserve in-trace `[id:N]` citations and strip fabricated/out-of-trace IDs |
 | `memory_stats()` | Stats including compression pressure, dead knowledge, search miss rate, vector coverage |
 
 ---
@@ -461,6 +463,8 @@ Reciprocal Rank Fusion uses only rank positions, not raw scores. This means FTS5
 | `ENTITY_LLM_API_BASE_URL` | — | OpenAI-compatible chat base URL for the optional entity layer (v2.5; dormant if unset) |
 | `ENTITY_LLM_API_KEY` | — | API key for entity extraction |
 | `ENTITY_LLM_MODEL` | `gpt-4o-mini` | Chat model for entity extraction |
+| `MNEME_RECALL_TRACE_RETENTION_DAYS` | `7` | Recall trace retention; clamped to 1-365 days. Traces contain hashes/counts/rowids, never raw query or memory text |
+| `MNEME_RECALL_TRACE_MAX_ROWS` | `10000` | Maximum retained recall traces; clamped to 100-100000 |
 | `CLAUDE_BIN` | `claude` | Path to Claude CLI (for compression pipeline) |
 | `TOKENMEM_COMPACT_SUMMARY` | — | Compact summary text (for SessionStart hook) |
 | `TOKENMEM_COMPACT_SESSION` | — | Session ID for compact summary |
