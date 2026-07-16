@@ -30,3 +30,4 @@ mneme.migrate.local.json
 *.tmp.json
 *-candidates.json
 staging/
+benchmarks/longmemeval/results/

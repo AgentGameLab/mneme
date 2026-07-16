@@ -1,0 +1,88 @@
+[
+  {
+    "question_id": "fixture-user",
+    "question_type": "single-session-user",
+    "question": "Where did I buy my telescope?",
+    "answer": "North Star Optics",
+    "question_date": "2026/07/15 (Wed) 12:00",
+    "haystack_session_ids": ["noise-user", "evidence-user"],
+    "haystack_dates": ["2026/07/01 (Wed) 10:00", "2026/07/02 (Thu) 10:00"],
+    "haystack_sessions": [
+      [{"role":"user","content":"I bought new hiking socks at the mall."}],
+      [{"role":"user","content":"I bought my telescope from North Star Optics.","has_answer":true},{"role":"assistant","content":"That shop has a good astronomy section."}]
+    ],
+    "answer_session_ids": ["evidence-user"]
+  },
+  {
+    "question_id": "fixture-assistant",
+    "question_type": "single-session-assistant",
+    "question": "Which museum did you suggest for the dinosaur exhibit?",
+    "answer": "Harbor Science Museum",
+    "question_date": "2026/07/15 (Wed) 12:00",
+    "haystack_session_ids": ["noise-assistant", "evidence-assistant"],
+    "haystack_dates": ["2026/07/03 (Fri) 10:00", "2026/07/04 (Sat) 10:00"],
+    "haystack_sessions": [
+      [{"role":"assistant","content":"Try the city art gallery for impressionist paintings."}],
+      [{"role":"user","content":"Where can I see a dinosaur exhibit?","has_answer":true},{"role":"assistant","content":"I suggest the Harbor Science Museum."}]
+    ],
+    "answer_session_ids": ["evidence-assistant"]
+  },
+  {
+    "question_id": "fixture-preference",
+    "question_type": "single-session-preference",
+    "question": "What kind of coffee roast do I prefer?",
+    "answer": "dark roast",
+    "question_date": "2026/07/15 (Wed) 12:00",
+    "haystack_session_ids": ["noise-preference", "evidence-preference"],
+    "haystack_dates": ["2026/07/05 (Sun) 10:00", "2026/07/06 (Mon) 10:00"],
+    "haystack_sessions": [
+      [{"role":"user","content":"I usually drink mint tea after dinner."}],
+      [{"role":"user","content":"For coffee, I strongly prefer a smoky dark roast.","has_answer":true}]
+    ],
+    "answer_session_ids": ["evidence-preference"]
+  },
+  {
+    "question_id": "fixture-temporal",
+    "question_type": "temporal-reasoning",
+    "question": "When did I photograph the solar eclipse?",
+    "answer": "July 8, 2026",
+    "question_date": "2026/07/15 (Wed) 12:00",
+    "haystack_session_ids": ["noise-temporal", "evidence-temporal"],
+    "haystack_dates": ["2026/07/07 (Tue) 09:00", "2026/07/08 (Wed) 14:30"],
+    "haystack_sessions": [
+      [{"role":"user","content":"I photographed a blue heron near the river."}],
+      [{"role":"user","content":"Today, July 8, I photographed the solar eclipse.","has_answer":true}]
+    ],
+    "answer_session_ids": ["evidence-temporal"]
+  },
+  {
+    "question_id": "fixture-update",
+    "question_type": "knowledge-update",
+    "question": "What was my delivery address before and after the move?",
+    "answer": "12 Pine Road, then 88 Lake Avenue",
+    "question_date": "2026/07/15 (Wed) 12:00",
+    "haystack_session_ids": ["evidence-update-old", "noise-update", "evidence-update-new"],
+    "haystack_dates": ["2026/06/01 (Mon) 10:00", "2026/06/10 (Wed) 10:00", "2026/07/10 (Fri) 10:00"],
+    "haystack_sessions": [
+      [{"role":"user","content":"My delivery address is 12 Pine Road.","has_answer":true}],
+      [{"role":"user","content":"The grocery delivery arrived early."}],
+      [{"role":"user","content":"After the move, update my delivery address to 88 Lake Avenue.","has_answer":true}]
+    ],
+    "answer_session_ids": ["evidence-update-old", "evidence-update-new"]
+  },
+  {
+    "question_id": "fixture-multi",
+    "question_type": "multi-session",
+    "question": "Which boots and shell did I choose for hiking?",
+    "answer": "Cedar Trail boots and a Nimbus rain shell",
+    "question_date": "2026/07/15 (Wed) 12:00",
+    "haystack_session_ids": ["evidence-multi-boots", "noise-multi", "evidence-multi-shell"],
+    "haystack_dates": ["2026/07/11 (Sat) 10:00", "2026/07/12 (Sun) 10:00", "2026/07/13 (Mon) 10:00"],
+    "haystack_sessions": [
+      [{"role":"user","content":"For hiking I chose Cedar Trail boots.","has_answer":true}],
+      [{"role":"user","content":"I packed a cotton scarf for the train."}],
+      [{"role":"user","content":"For the same hiking trip I chose a Nimbus rain shell.","has_answer":true}]
+    ],
+    "answer_session_ids": ["evidence-multi-boots", "evidence-multi-shell"]
+  }
+]
