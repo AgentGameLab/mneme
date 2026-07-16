@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // ============================================================
 // mneme MCP Server v2.8.0
-// Exposes recall_memory / store_memory / recall_by_id / memory_stats tools
+// Exposes recall/store/inspect/audit tools over MCP.
 // On-demand recall for any MCP-compatible AI agent — saves 80-90% memory token costs
 //
 // Transport modes (decided by --transport flag):
@@ -31,6 +31,8 @@ import {
   storeMemory,
   storeMemoryAsync,
   buildMemoryContext,
+  getRecallTrace,
+  validateMemoryReferences,
   getMemoryStats,
   embedMissingVectors,
   indexSessionTranscripts,
@@ -86,7 +88,7 @@ function createServer() {
     'Retrieve relevant content from the agent\'s long-term memory. Must call when dealing with personal preferences, past work, project status, relationships, or decisions.',
     {
       query: z.string().describe('Query content — describe what you want to find in natural language'),
-      limit: z.number().optional().default(8).describe('Number of results to return, default 8'),
+      limit: z.number().int().min(1).max(20).optional().default(8).describe('Number of results to return, default 8. Hard-capped at 20 by the recall contract; larger values are silently clamped.'),
       category: z.enum(['general', 'people', 'project', 'decision', 'feedback', 'bug', 'relationship', 'skill', 'preference']).optional().describe('Filter by category (optional)'),
     },
     async ({ query, limit = 8, category }) => {
@@ -99,6 +101,38 @@ function createServer() {
       }
       return { content: [{ type: 'text', text: ctx }] }
     }
+  )
+
+  s.tool(
+    'get_recall_trace',
+    'Inspect a bounded recall trace by trace-id. Returns content-free query metadata, candidate/filter counts, and the exact memory rowids exposed to the caller.',
+    {
+      trace_id: z.string().min(1).describe('Trace id emitted in the memory-citation-contract block'),
+    },
+    async ({ trace_id }) => {
+      const trace = getRecallTrace(trace_id)
+      return {
+        content: [{
+          type: 'text',
+          text: trace ? JSON.stringify(trace, null, 2) : '(recall trace not found)',
+        }],
+      }
+    }
+  )
+
+  s.tool(
+    'validate_memory_references',
+    'Validate a generated answer against the exact memory IDs exposed by one recall trace. Preserves allowed [id:N] citations and strips fabricated or out-of-trace IDs. A missing trace fails closed.',
+    {
+      trace_id: z.string().min(1).describe('Trace id emitted in the memory-citation-contract block'),
+      text: z.string().max(100_000).describe('Generated text whose [id:N] citations should be validated'),
+    },
+    async ({ trace_id, text }) => ({
+      content: [{
+        type: 'text',
+        text: JSON.stringify(validateMemoryReferences(text, trace_id), null, 2),
+      }],
+    })
   )
 
   // ── Tool: store_memory ──────────────────────────────────────

@@ -25,6 +25,19 @@ import { createRequire } from 'node:module'
 import { createHash } from 'node:crypto'
 import { applyMetaGate } from './meta-gate.mjs'
 import { parseTemporalWindow } from './lib/temporal-parser.mjs'
+import { expandRecallQuery } from './query-rewrite.mjs'
+import { normalizedFtsScore } from './recall-scoring.mjs'
+import {
+  MAX_RECALL_CANDIDATES,
+  MAX_RECALL_CONTEXT_CHARS,
+  MAX_RECALL_RESULTS,
+  createRecallTrace,
+  enforceContextBudget,
+  finishRecallTrace,
+  planRecallBudget,
+  stripHallucinatedMemoryIds,
+  traceRecallStep,
+} from './recall-contract.mjs'
 
 const require = createRequire(import.meta.url)
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -72,6 +85,8 @@ let _entityCache = null       // v2.5.1: cached entity list for the recall path 
 let _entityCacheSig = ''       // cheap change signature (count:maxId) — refreshes cross-process
 let _simpleLoaded = false  // whether the simple extension loaded successfully
 let _vecLoaded = false     // whether the sqlite-vec extension loaded successfully
+let _lastRecallTraceSweepAt = 0
+let _writesSinceRecallTraceSweep = 0
 
 /**
  * Get or create DB instance (loads optional extensions)
@@ -399,6 +414,27 @@ export function initMemory() {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_miss_query ON search_misses(query)`)
     db.exec(`CREATE INDEX IF NOT EXISTS idx_miss_created ON search_misses(created_at DESC)`)
   } catch {}
+
+  // migration 010: bounded recall trace. Keep this content-free: only hashes,
+  // counts, decisions, and the rowids actually exposed to the caller.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS recall_traces (
+      trace_id TEXT PRIMARY KEY,
+      source TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      query_hash TEXT NOT NULL,
+      query_chars INTEGER NOT NULL,
+      requested_limit INTEGER NOT NULL,
+      effective_limit INTEGER NOT NULL,
+      candidate_limit INTEGER NOT NULL,
+      kept_ids TEXT NOT NULL DEFAULT '[]',
+      steps TEXT NOT NULL DEFAULT '[]',
+      started_at INTEGER NOT NULL,
+      ended_at INTEGER NOT NULL,
+      duration_ms INTEGER NOT NULL
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_recall_traces_started ON recall_traces(started_at DESC)`)
 
   // Migration: memories.source CHECK constraint add 'compression'
   // SQLite doesn't support ALTER CHECK -> check if current CHECK includes 'compression', rebuild if not
@@ -1133,6 +1169,110 @@ function isInTemporalWindow(row, temporalWindow) {
     createdAt >= temporalWindow.from && createdAt <= temporalWindow.to
 }
 
+function attachRecallTrace(rows, trace) {
+  Object.defineProperty(rows, 'recallTrace', {
+    value: trace,
+    enumerable: false,
+    configurable: true,
+  })
+  return rows
+}
+
+function persistRecallTrace(trace, keptIds = []) {
+  finishRecallTrace(trace, keptIds)
+  try {
+    const db = getDb()
+    db.prepare(`
+      INSERT OR REPLACE INTO recall_traces (
+        trace_id, source, mode, query_hash, query_chars,
+        requested_limit, effective_limit, candidate_limit,
+        kept_ids, steps, started_at, ended_at, duration_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      trace.traceId,
+      trace.source,
+      trace.mode,
+      trace.queryHash,
+      trace.queryChars,
+      trace.requestedLimit,
+      trace.effectiveLimit,
+      trace.candidateLimit,
+      JSON.stringify(trace.keptIds),
+      JSON.stringify(trace.steps),
+      trace.startedAt,
+      trace.endedAt,
+      trace.durationMs,
+    )
+
+    // Hourly bounded sweep: trace must not become an unbounded second memory
+    // store. Environment overrides remain capped to keep accidental values safe.
+    const now = Date.now()
+    // Sweep on either a time gate (hourly) OR a write-count gate (every 200
+    // writes) so a burst cannot silently overshoot MNEME_RECALL_TRACE_MAX_ROWS
+    // intra-hour (mneme#7 P1 review).
+    _writesSinceRecallTraceSweep++
+    if (now - _lastRecallTraceSweepAt >= 3600_000 || _writesSinceRecallTraceSweep >= 200) {
+      const retentionDays = Math.min(Math.max(Number.parseInt(process.env.MNEME_RECALL_TRACE_RETENTION_DAYS || '7', 10) || 7, 1), 365)
+      const maxRows = Math.min(Math.max(Number.parseInt(process.env.MNEME_RECALL_TRACE_MAX_ROWS || '10000', 10) || 10_000, 100), 100_000)
+      db.prepare('DELETE FROM recall_traces WHERE started_at < ?').run(now - retentionDays * 86400_000)
+      db.prepare(`
+        DELETE FROM recall_traces
+        WHERE trace_id IN (
+          SELECT trace_id FROM recall_traces
+          ORDER BY started_at DESC
+          LIMIT -1 OFFSET ?
+        )
+      `).run(maxRows)
+      _lastRecallTraceSweepAt = now
+      _writesSinceRecallTraceSweep = 0
+    }
+  } catch (e) {
+    // Auditability is an enhancement on the read path. A locked/old DB must
+    // still return recall results; validation will fail closed if no trace exists.
+    log(`recall trace persist failed: ${e.message}`)
+  }
+  return trace
+}
+
+export function getRecallTrace(traceId) {
+  if (!traceId) return null
+  let row
+  try {
+    row = getDb().prepare(`
+      SELECT * FROM recall_traces WHERE trace_id = ?
+    `).get(String(traceId))
+  } catch {
+    return null
+  }
+  if (!row) return null
+  return {
+    traceId: row.trace_id,
+    source: row.source,
+    mode: row.mode,
+    queryHash: row.query_hash,
+    queryChars: row.query_chars,
+    requestedLimit: row.requested_limit,
+    effectiveLimit: row.effective_limit,
+    candidateLimit: row.candidate_limit,
+    keptIds: safeJsonParse(row.kept_ids, []),
+    steps: safeJsonParse(row.steps, []),
+    startedAt: row.started_at,
+    endedAt: row.ended_at,
+    durationMs: row.duration_ms,
+  }
+}
+
+export function validateMemoryReferences(text, traceId) {
+  const trace = getRecallTrace(traceId)
+  const checked = stripHallucinatedMemoryIds(text, trace?.keptIds || [])
+  return {
+    traceFound: Boolean(trace),
+    traceId: String(traceId || ''),
+    allowedIds: trace?.keptIds || [],
+    ...checked,
+  }
+}
+
 /**
  * Retrieve relevant memories
  *
@@ -1157,7 +1297,44 @@ function isInTemporalWindow(row, temporalWindow) {
  */
 export function recallMemories(opts = {}) {
   const db = getDb()
-  const { query: queryText, types, categories, tags, minImportance, limit = 10 } = opts
+  const { query: queryText, types, categories, tags, minImportance, limit: requestedLimit = 10 } = opts
+  const parsedPoolLimit = Number.parseInt(requestedLimit, 10)
+  const budget = opts._candidatePool
+    ? {
+        requested: Number.isFinite(parsedPoolLimit) && parsedPoolLimit > 0 ? parsedPoolLimit : 10,
+        effective: Math.min(
+          Number.isFinite(parsedPoolLimit) && parsedPoolLimit > 0 ? parsedPoolLimit : 10,
+          MAX_RECALL_CANDIDATES,
+        ),
+        candidates: Math.min(
+          Number.isFinite(parsedPoolLimit) && parsedPoolLimit > 0 ? parsedPoolLimit : 10,
+          MAX_RECALL_CANDIDATES,
+        ),
+      }
+    : planRecallBudget(requestedLimit)
+  const limit = budget.effective
+  const candidateLimit = budget.candidates
+  const trace = opts._trace || createRecallTrace({
+    query: queryText,
+    requestedLimit,
+    source: opts.traceSource || 'api',
+    mode: 'fts',
+  })
+  const ownsTrace = !opts._trace
+  if (trace.mode === 'unknown' || trace.mode === 'context') trace.mode = 'fts'
+  const rewrittenQuery = opts._noQueryExpansion
+    ? { text: String(queryText || ''), addedTerms: [] }
+    : expandRecallQuery(queryText)
+  if (rewrittenQuery.addedTerms.length > 0) {
+    traceRecallStep(trace, 'query.expand', { addedTerms: rewrittenQuery.addedTerms })
+  }
+  traceRecallStep(trace, 'recall.plan', {
+    path: 'fts',
+    requestedLimit: budget.requested,
+    effectiveLimit: limit,
+    candidateLimit,
+    candidatePool: Boolean(opts._candidatePool),
+  })
   const now = Date.now()
   const THIRTY_DAYS_MS = 30 * 86400_000
   const temporalWindow = queryText ? parseTemporalWindow(queryText) : null
@@ -1167,11 +1344,12 @@ export function recallMemories(opts = {}) {
 
   if (queryText) {
     // FTS5 search + structured filtering
-    const ftsQueryParam = sanitizeFtsText(queryText)
+    const ftsQueryParam = sanitizeFtsText(rewrittenQuery.text)
 
     const recallQueryCandidates = (candidateWindow) => {
       const structuredConditions = ['m.deleted_at IS NULL', 'm.superseded_by IS NULL']
       const structuredParams = []
+      let retrievalPath = 'none'
       if (types?.length) {
         structuredConditions.push(`m.memory_type IN (${types.map(() => '?').join(',')})`)
         structuredParams.push(...types)
@@ -1195,9 +1373,10 @@ export function recallMemories(opts = {}) {
         try {
           // With simple extension: jieba OR query (filter stop words, any word match)
           // Without: fall back to character-level OR query
+          const filterStopWords = !opts._noStopwordFiltering
           const orQuery = _simpleLoaded
-            ? buildJiebaOrQuery(ftsQueryParam)
-            : buildQuotedFtsOrQuery(ftsQueryParam)
+            ? buildJiebaOrQuery(ftsQueryParam, filterStopWords)
+            : buildQuotedFtsOrQuery(ftsQueryParam, filterStopWords)
 
           if (orQuery) {
             const sql = `
@@ -1209,7 +1388,8 @@ export function recallMemories(opts = {}) {
               ORDER BY mf.rank
               LIMIT ?
             `
-            candidateRows = db.prepare(sql).all(orQuery, ...structuredParams, limit * 3)
+            candidateRows = db.prepare(sql).all(orQuery, ...structuredParams, candidateLimit)
+            retrievalPath = 'fts'
           }
         } catch (e) {
           log(`FTS query failed: ${e.message}`)
@@ -1219,7 +1399,7 @@ export function recallMemories(opts = {}) {
 
       // FTS returned nothing -> fallback to LIKE + structured filtering
       if (!candidateRows || candidateRows.length === 0) {
-        const keywords = tokenizeForLike(ftsQueryParam)
+        const keywords = tokenizeForLike(ftsQueryParam, !opts._noStopwordFiltering)
         if (keywords.length === 0) return []
         const likeConditions = keywords.map(() => 'm.content LIKE ?')
         const likeParams = keywords.map(w => `%${w}%`)
@@ -1232,8 +1412,16 @@ export function recallMemories(opts = {}) {
           ORDER BY m.importance DESC, m.created_at DESC
           LIMIT ?
         `
-        candidateRows = db.prepare(sql).all(...structuredParams, ...likeParams, limit * 3)
+        candidateRows = db.prepare(sql).all(...structuredParams, ...likeParams, candidateLimit)
+        retrievalPath = 'like'
       }
+
+      traceRecallStep(trace, 'retrieval.path', {
+        path: retrievalPath,
+        temporalWindow: Boolean(candidateWindow),
+        count: candidateRows.length,
+        candidateLimit,
+      })
 
       return candidateRows
     }
@@ -1270,10 +1458,26 @@ export function recallMemories(opts = {}) {
     rows = db.prepare(sql).all(...params)
   }
 
+  traceRecallStep(trace, 'retrieval.candidates', {
+    count: rows.length,
+    candidateLimit,
+    temporalWindow: Boolean(temporalWindow),
+    temporalFallback,
+  })
+
   // Composite scoring (AIRI-style + Memory Transfer Learning level weighting)
   const LEVEL_WEIGHT = { meta_knowledge: 1.3, semi_abstract: 1.0, concrete_trace: 0.7 }
+  // FTS5 BM25 magnitudes depend on both corpus and query. The former `/ 10`
+  // clamp collapsed every sufficiently strong match to 1.0, discarding the
+  // ranking signal. Normalize within this candidate set instead.
+  const maxFtsMagnitude = rows.reduce(
+    (max, row) => Math.max(max, Math.abs(Number(row.fts_rank) || 0)),
+    0,
+  )
   const scored = rows.map(row => {
-    const ftsScore = row.fts_rank ? Math.min(1, Math.abs(row.fts_rank) / 10) : 0
+    const ftsScore = opts._legacyFtsScoring
+      ? (row.fts_rank ? Math.min(1, Math.abs(row.fts_rank) / 10) : 0)
+      : normalizedFtsScore(row.fts_rank, maxFtsMagnitude)
     const importanceScore = row.importance / 10
     // migration 004 (v2.2): age based on event_time when set, else created_at fallback.
     // Lets temporal queries ("what did I do last June?") match by when the event happened,
@@ -1281,7 +1485,7 @@ export function recallMemories(opts = {}) {
     const effectiveTime = row.event_time != null ? row.event_time : row.created_at
     const age = now - effectiveTime
     const timeScore = Math.max(0, 1 - age / THIRTY_DAYS_MS)
-    // v2.4 (2026-06-22): align with hybrid path. ftsScore (already 0-1 ranged, unlike RRF)
+    // v2.4 (2026-06-22): align with hybrid path. ftsScore (normalized 0-1, unlike RRF)
     // leads at 0.55; importance demoted to weak prior 0.1; frequency log-damped (same form
     // as hybrid freqScore) at 0.2. R1: don't let saturated self-rated importance drive order.
     const accessScore = Math.min(1, Math.log1p(row.access_count || 0) / Math.log1p(20))
@@ -1312,6 +1516,12 @@ export function recallMemories(opts = {}) {
   if (tags?.length) {
     filtered = scored.filter(r => tags.some(t => r.tags.includes(t)))
   }
+  traceRecallStep(trace, 'retrieval.filters', {
+    input: scored.length,
+    kept: filtered.length,
+    dropped: scored.length - filtered.length,
+    tagFilter: Boolean(tags?.length),
+  })
 
   // Sort by score descending, take top N
   filtered.sort((a, b) => b.score - a.score)
@@ -1326,7 +1536,10 @@ export function recallMemories(opts = {}) {
   }
 
   // Update last_accessed
-  if (result.length > 0) {
+  // _deferAccessBump lets buildMemoryContext bump only the rowids that
+  // survive the section-level context budget, not every candidate returned
+  // (mneme#7 P1 — avoids access_count feedback for budget-dropped rows).
+  if (!opts._candidatePool && !opts._deferAccessBump && result.length > 0) {
     const updateStmt = db.prepare(`
       UPDATE memories SET last_accessed = ?, access_count = access_count + 1 WHERE rowid = ?
     `)
@@ -1337,14 +1550,20 @@ export function recallMemories(opts = {}) {
   }
 
   // Search miss tracking: queried but found nothing = knowledge blind spot signal
-  if (queryText && result.length === 0 && !opts.suppressMiss) {
+  if (!opts._candidatePool && queryText && result.length === 0 && !opts.suppressMiss) {
     try {
       db.prepare('INSERT INTO search_misses (query, source, hit_count) VALUES (?, ?, 0)')
         .run(queryText.slice(0, 500), 'recall')
     } catch {}
   }
 
-  return result
+  traceRecallStep(trace, 'recall.final', {
+    kept: result.length,
+    dropped: Math.max(0, filtered.length - result.length),
+    effectiveLimit: limit,
+  })
+  if (ownsTrace) persistRecallTrace(trace, result.map(row => row.rowid))
+  return attachRecallTrace(result, trace)
 }
 
 // ── Hybrid Retrieval: FTS5 + Vector + RRF Fusion ────────────
@@ -1411,12 +1630,30 @@ function findEntityMatchedMemories(db, queryText, limit) {
 }
 
 export async function recallMemoriesHybrid(opts = {}) {
-  const { query: queryText, limit = 10 } = opts
+  const { query: queryText, limit: requestedLimit = 10 } = opts
 
   // No query or extensions not ready -> fall back to sync version
   if (!queryText || !_vecLoaded || !_embeddingConfig) {
     return recallMemories(opts)
   }
+
+  const budget = planRecallBudget(requestedLimit)
+  const limit = budget.effective
+  const candidateLimit = budget.candidates
+  const trace = opts._trace || createRecallTrace({
+    query: queryText,
+    requestedLimit,
+    source: opts.traceSource || 'api',
+    mode: 'hybrid',
+  })
+  const ownsTrace = !opts._trace
+  trace.mode = 'hybrid'
+  traceRecallStep(trace, 'recall.plan', {
+    path: 'hybrid',
+    requestedLimit: budget.requested,
+    effectiveLimit: limit,
+    candidateLimit,
+  })
 
   const db = getDb()
   const now = Date.now()
@@ -1428,7 +1665,13 @@ export async function recallMemoriesHybrid(opts = {}) {
   // _internal=true so the FTS path doesn't also surface random records (hybrid surfaces once at the end)
   const [queryEmbedding, ftsRows] = await Promise.all([
     generateEmbedding(queryText),
-    Promise.resolve(recallMemories({ ...opts, limit: limit * 3, _internal: true })),
+    Promise.resolve(recallMemories({
+      ...opts,
+      limit: candidateLimit,
+      _internal: true,
+      _candidatePool: true,
+      _trace: trace,
+    })),
   ])
 
   // Vector path: KNN top N
@@ -1450,7 +1693,7 @@ export async function recallMemoriesHybrid(opts = {}) {
           JOIN memories m ON m.rowid = v.memory_rowid
           WHERE m.deleted_at IS NULL AND m.superseded_by IS NULL
             ${temporalCondition}
-        `).all(new Float32Array(queryEmbedding), limit * 3, ...temporalParams)
+        `).all(new Float32Array(queryEmbedding), candidateLimit, ...temporalParams)
       }
 
       vecRows = retrieveVecRows(temporalWindow)
@@ -1494,10 +1737,27 @@ export async function recallMemoriesHybrid(opts = {}) {
   // v2.5: entity path as RRF 4th source (ranked list, NOT an additive boost — additive at any
   // weight > the rrf*10 spread (~0.16) would re-drown relevance, the exact v2.4 fix). Pure SQL.
   // opts._noEntity skips it (A/B harness baseline only).
-  if (!opts._noEntity) addRanks(findEntityMatchedMemories(db, queryText, limit * 3), 'entity')
+  const entityRows = opts._noEntity ? [] : findEntityMatchedMemories(db, queryText, candidateLimit)
+  if (!opts._noEntity) addRanks(entityRows, 'entity')
+
+  traceRecallStep(trace, 'retrieval.candidates', {
+    fts: ftsRows.length,
+    vector: vecRows.length,
+    entity: entityRows.length,
+    fusedUnique: rrfScores.size,
+    candidateLimit,
+  })
 
   // Apply Memory Transfer Learning level weighting + importance + time decay + decay_score (migration 003)
-  let merged = Array.from(rrfScores.values()).map(({ row, rrf, sources }) => {
+  const fusedCandidates = Array.from(rrfScores.values())
+    .sort((a, b) => b.rrf - a.rrf)
+    .slice(0, candidateLimit)
+  traceRecallStep(trace, 'fusion.cap', {
+    input: rrfScores.size,
+    kept: fusedCandidates.length,
+    dropped: Math.max(0, rrfScores.size - fusedCandidates.length),
+  })
+  let merged = fusedCandidates.map(({ row, rrf, sources }) => {
     const levelWeight = LEVEL_WEIGHT[row.memory_level] || 1.0
     const importanceScore = row.importance / 10
     // migration 004 (v2.2): age based on event_time when set, else created_at fallback
@@ -1530,6 +1790,12 @@ export async function recallMemoriesHybrid(opts = {}) {
       score: row.score + (temporalFallback && row.temporal_match ? TEMPORAL_FALLBACK_BOOST : 0),
       temporal_fallback: temporalFallback,
     }))
+    traceRecallStep(trace, 'temporal.filter', {
+      input: fusedCandidates.length,
+      matches: temporalRows.length,
+      kept: merged.length,
+      fallback: temporalFallback,
+    })
   }
 
   merged.sort((a, b) => b.score - a.score)
@@ -1541,8 +1807,10 @@ export async function recallMemoriesHybrid(opts = {}) {
     if (surfaced.length > 0) result = result.concat(surfaced)
   }
 
-  // Update last_accessed
-  if (result.length > 0) {
+  // Update last_accessed — same _deferAccessBump gate as recallMemories, so
+  // callers wrapping this in a downstream trim (buildMemoryContext) can bump
+  // only the rowids they actually inject (mneme#7 P1).
+  if (!opts._deferAccessBump && result.length > 0) {
     const stmt = db.prepare(`UPDATE memories SET last_accessed = ?, access_count = access_count + 1 WHERE rowid = ?`)
     const tx = db.transaction((items) => { for (const item of items) stmt.run(now, item.rowid) })
     try { tx(result) } catch {}
@@ -1556,7 +1824,13 @@ export async function recallMemoriesHybrid(opts = {}) {
     } catch {}
   }
 
-  return result
+  traceRecallStep(trace, 'recall.final', {
+    kept: result.length,
+    dropped: Math.max(0, merged.length - result.length),
+    effectiveLimit: limit,
+  })
+  if (ownsTrace) persistRecallTrace(trace, result.map(row => row.rowid))
+  return attachRecallTrace(result, trace)
 }
 
 // ── Conversation History Retrieval ──────────────────────────
@@ -1709,27 +1983,74 @@ export function searchConversations(queryText, opts = {}) {
  * @returns {Promise<string>} formatted memory context (empty string if none)
  */
 export async function buildMemoryContext(opts = {}) {
-  const { query: queryText, chatId, memoryLimit = 8 } = opts
+  const {
+    query: queryText,
+    chatId,
+    memoryLimit = 8,
+    maxContextChars: requestedContextChars = MAX_RECALL_CONTEXT_CHARS,
+  } = opts
+  const parsedContextChars = Number.parseInt(requestedContextChars, 10)
+  const maxContextChars = Math.min(
+    Number.isFinite(parsedContextChars) && parsedContextChars > 0
+      ? parsedContextChars
+      : MAX_RECALL_CONTEXT_CHARS,
+    MAX_RECALL_CONTEXT_CHARS,
+  )
+  const trace = createRecallTrace({
+    query: queryText,
+    requestedLimit: memoryLimit,
+    source: 'context',
+    mode: 'context',
+  })
   const sections = []
+  let memorySection = null
+  let allowedIds = []
 
   // 1. Relevant memories (use hybrid when query available; inject high-importance base memories otherwise)
+  // _deferAccessBump defers the access_count/last_accessed write until the
+  // section-level budget below has decided which rowids actually reach the
+  // model (mneme#7 P1).
   const memories = queryText
-    ? await recallMemoriesHybrid({ query: queryText, limit: memoryLimit, minImportance: 3 })
-    : recallMemories({ limit: memoryLimit, minImportance: 7 })
+    ? await recallMemoriesHybrid({ query: queryText, limit: memoryLimit, minImportance: 3, _trace: trace, _deferAccessBump: true })
+    : recallMemories({ limit: memoryLimit, minImportance: 7, _trace: trace, _deferAccessBump: true })
 
   if (memories.length > 0) {
-    const memLines = memories.map(m => {
+    const memEntries = memories.map(m => {
       const prefix = { permanent: '[PIN]', long_term: '[LT]', short_term: '[ST]', working: '[W]' }[m.memory_type] || '[?]'
       const levelMark = { meta_knowledge: ' [pattern]', semi_abstract: '', concrete_trace: ' [trace]' }[m.memory_level] || ''
       // migration 003: mark surfaced_random records so callers know it's an "out of context" recall
       const surfaceMark = m.recall_source === 'surfaced_random' ? ' [surfaced]' : ''
-      const tagStr = m.tags?.length ? ` [${m.tags.join(', ')}]` : ''
+      const tagText = Array.isArray(m.tags) ? m.tags.slice(0, 10).join(', ').slice(0, 160) : ''
+      const tagStr = tagText ? ` [${tagText}]` : ''
       const age = Math.floor((Date.now() - m.created_at) / 86400_000)
       const ageStr = age === 0 ? 'today' : age === 1 ? 'yesterday' : `${age}d ago`
-      const text = m.summary || m.content.slice(0, 200)
-      return `${prefix}${levelMark}${surfaceMark} (${m.category}, importance:${m.importance}, ${ageStr})${tagStr}\n   ${text}`
+      const text = String(m.summary || m.content || '').slice(0, 300)
+      return {
+        id: String(m.rowid),
+        line: `[id:${m.rowid}] ${prefix}${levelMark}${surfaceMark} (${m.category}, importance:${m.importance}, ${ageStr})${tagStr}\n   ${text}`,
+      }
     })
-    sections.push(`<recalled-memories>\n${memLines.join('\n')}\n</recalled-memories>`)
+    const memoryBudget = enforceContextBudget(memEntries, {
+      maxEntries: MAX_RECALL_RESULTS,
+      maxChars: Math.max(500, maxContextChars - 700),
+      render: entries => `<recalled-memories>\n${entries.map(entry => entry.line).join('\n')}\n</recalled-memories>`,
+    })
+    allowedIds = memoryBudget.kept.map(entry => entry.id)
+    memorySection = memoryBudget.rendered
+    if (memoryBudget.kept.length > 0) sections.push(memorySection)
+    traceRecallStep(trace, 'context.filter', {
+      inputEntries: memEntries.length,
+      keptEntries: memoryBudget.kept.length,
+      droppedEntries: memoryBudget.dropped.length,
+      reason: memoryBudget.reason,
+      chars: memoryBudget.chars,
+      maxChars: Math.max(500, maxContextChars - 700),
+      maxEntries: MAX_RECALL_RESULTS,
+    })
+    traceRecallStep(trace, 'id_whitelist.prepared', {
+      validIdCount: allowedIds.length,
+      validIds: allowedIds,
+    })
   }
 
   // 2. Relevant conversation history segments
@@ -1764,15 +2085,67 @@ export async function buildMemoryContext(opts = {}) {
     }
   } catch {}
 
-  if (sections.length === 0) return ''
+  if (sections.length === 0) {
+    traceRecallStep(trace, 'context.final', { chars: 0, sections: 0, keptIds: 0 })
+    persistRecallTrace(trace, [])
+    return ''
+  }
 
-  return [
-    '',
-    '## Agent Memory System (auto-recalled)',
-    'The following are memories and history relevant to the current conversation. Reference as needed:',
-    '',
-    ...sections,
-  ].join('\n')
+  // renderContext accepts advertisedIds so the budget-packing pass can size
+  // against the upper-bound header (all candidate rowids) while the final
+  // render advertises only the IDs that actually ship in the injected section.
+  // Without the split, a section-level trim can drop memorySection entirely
+  // yet leave the header claiming its rowids were exposed (mneme#7 P1).
+  const renderContext = (keptSections, advertisedIds) => [
+      '',
+      '## Agent Memory System (auto-recalled)',
+      'The following are memories and history relevant to the current conversation. Reference as needed:',
+      `<memory-citation-contract trace-id="${trace.traceId}" allowed-ids="${advertisedIds.join(',')}">`,
+      'Only cite [id:N] values listed in allowed-ids. Validate generated citations against this trace before publishing.',
+      '</memory-citation-contract>',
+      '',
+      ...keptSections,
+    ].join('\n')
+  if (renderContext([], allowedIds).length > maxContextChars) {
+    traceRecallStep(trace, 'context.final', {
+      chars: 0,
+      sections: 0,
+      droppedSections: sections.length,
+      reason: 'fixedHeaderExceedsMaxChars',
+      maxChars: maxContextChars,
+      keptIds: 0,
+    })
+    persistRecallTrace(trace, [])
+    return ''
+  }
+  const finalBudget = enforceContextBudget(sections, {
+    maxEntries: sections.length,
+    maxChars: maxContextChars,
+    render: keptSections => renderContext(keptSections, allowedIds),
+  })
+  const injectedIds = memorySection && finalBudget.kept.includes(memorySection) ? allowedIds : []
+  const finalRendered = renderContext(finalBudget.kept, injectedIds)
+  traceRecallStep(trace, 'context.final', {
+    chars: finalRendered.length,
+    sections: finalBudget.kept.length,
+    droppedSections: finalBudget.dropped.length,
+    reason: finalBudget.reason,
+    maxChars: maxContextChars,
+    keptIds: injectedIds.length,
+  })
+  persistRecallTrace(trace, injectedIds)
+  // Bump last_accessed / access_count only for rowids that actually reached
+  // the model, not every candidate returned by the underlying recall
+  // (paired with _deferAccessBump on the recall calls above; mneme#7 P1).
+  if (injectedIds.length > 0) {
+    try {
+      const now = Date.now()
+      const stmt = getDb().prepare(`UPDATE memories SET last_accessed = ?, access_count = access_count + 1 WHERE rowid = ?`)
+      const tx = getDb().transaction((ids) => { for (const id of ids) stmt.run(now, Number(id)) })
+      tx(injectedIds)
+    } catch {}
+  }
+  return finalRendered
 }
 
 // ── migration 003: surfaced_random pool ─────────────────────
@@ -2650,6 +3023,17 @@ const FTS_STOP_WORDS = new Set([
   '\u5462','\u5417','\u554a','\u54e6','\u54c8','\u55ef','\u563f','\u5582','\u5565','\u5440','\u561b','\u5427','\u4e48',
   '\u4ec0\u4e48','\u600e\u4e48','\u54ea\u91cc','\u54ea\u4e2a','\u8c01','\u54ea','\u4e00\u4e0b','\u65b9\u4fbf','\u4ee5\u540e','\u4e00\u8d77','\u4e00','\u4e0d',
   '\u60f3','\u8fd9','\u90a3','\u8fd9\u4e2a','\u90a3\u4e2a','\u6709\u6ca1\u6709','\u53ef\u4ee5','\u53ef\u80fd','\u9700\u8981','\u5e94\u8be5','\u5982\u679c',
+  // Question scaffolding is particularly noisy with OR-style FTS over long
+  // conversation memories. Keep state/temporal concepts such as previous,
+  // current, last, and latest; they carry retrieval intent.
+  'a','an','the','am','are','as','at','be','been','being','by','do','does',
+  'for','from','had','has','have','how','i','in','into','is','it','me','my','of',
+  'on','or','our','should','that','their','them','they','this','to','were',
+  'what','when','where','which','who','why','with','would','you','your',
+  // NB: everyday English nouns/adverbs like `used`, `recently`, `many`,
+  // `types`, `different` are deliberately NOT stopwords. Short conversational
+  // queries ("what have I used recently") must still recall matching content;
+  // removing common nouns would silently under-recall (mneme#7 P1 review).
 ])
 
 // FTS5 operators must never reach MATCH as raw user input. The optional
@@ -2661,10 +3045,10 @@ function sanitizeFtsText(text) {
     .trim()
 }
 
-function buildQuotedFtsOrQuery(text) {
+function buildQuotedFtsOrQuery(text, filterStopWords = true) {
   if (!text) return ''
   return text.split(/\s+/)
-    .filter(Boolean)
+    .filter(term => term && (!filterStopWords || !FTS_STOP_WORDS.has(term.toLowerCase())))
     .map(term => `"${term.replace(/"/g, '""')}"`)
     .join(' OR ')
 }
@@ -2672,13 +3056,13 @@ function buildQuotedFtsOrQuery(text) {
 /**
  * Build FTS OR query using jieba segmentation (when simple extension is loaded)
  */
-function buildJiebaOrQuery(text) {
+function buildJiebaOrQuery(text, filterStopWords = true) {
   if (!_simpleLoaded) return null
   try {
     const db = getDb()
     const jiebaRaw = db.prepare('SELECT jieba_query(?) AS q').get(text.slice(0, 200))?.q || ''
     const terms = [...jiebaRaw.matchAll(/"([^"]+)"/g)].map(m => m[1])
-    const keywords = terms.filter(t => t.length > 1 && !FTS_STOP_WORDS.has(t))
+    const keywords = terms.filter(t => t.length > 1 && (!filterStopWords || !FTS_STOP_WORDS.has(t.toLowerCase())))
     if (keywords.length === 0) return null
     return keywords.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ')
   } catch { return null }
@@ -2688,13 +3072,13 @@ function buildJiebaOrQuery(text) {
  * CJK-friendly keyword splitting for LIKE queries
  * Splits on whitespace, then applies bigram sliding window on CJK runs
  */
-function tokenizeForLike(text) {
+function tokenizeForLike(text, filterStopWords = true) {
   const CJK = /[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]/
   const words = text
     .replace(/["\u201c\u201d\u2018\u2019\u3010\u3011\uff08\uff09\u300a\u300b\uff0c\u3002\uff01\uff1f\u3001\uff1b\uff1a\s]+/g, ' ')
     .trim()
     .split(/\s+/)
-    .filter(w => w.length > 0)
+    .filter(w => w.length > 0 && (!filterStopWords || !FTS_STOP_WORDS.has(w.toLowerCase())))
 
   const tokens = []
   for (const w of words) {
@@ -3096,7 +3480,21 @@ if (_isMain) {
           recall_sources: Array.isArray(m.recall_sources) ? m.recall_sources : [],
           vec_distance: typeof m.vec_distance === 'number' ? m.vec_distance : null,
         }))
-        process.stdout.write(JSON.stringify({ hits, count: hits.length }) + '\n')
+        // Recall-contract capacity signals (v2.9): a caller passing --limit 50
+        // needs to know they got 20 back because of the contract, not because
+        // only 20 memories matched. `capped` fires only when the contract
+        // actually clipped requested (mneme#7 P0 review).
+        const trace = memories.recallTrace
+        const effectiveLimit = trace?.effectiveLimit ?? limit
+        process.stdout.write(JSON.stringify({
+          hits,
+          count: hits.length,
+          requested_limit: limit,
+          effective_limit: effectiveLimit,
+          candidate_limit: trace?.candidateLimit ?? candidatePoolSize,
+          capped: limit > effectiveLimit,
+          trace_id: trace?.traceId ?? null,
+        }) + '\n')
       } else {
         if (memories.length === 0) {
           process.stdout.write('(no relevant memories found)\n')

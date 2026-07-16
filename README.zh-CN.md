@@ -170,12 +170,15 @@ migrations/
 └────────────────────────────────────────────────┘
 ```
 
-**对外暴露 3 个 MCP 工具：**
+**MCP 工具：**
 
 | 工具 | 用途 |
 |------|---------|
-| `recall_memory(query, limit?, category?)` | 混合检索：FTS5 + 向量 KNN + RRF 融合打分 |
+| `recall_memory(query, limit?, category?)` | 混合检索：FTS5 + 向量 KNN + RRF 融合打分。`limit` 被 recall contract 硬性限制在 20（v2.9），超过静默截断——`--format json` 输出的 `capped` 字段会指示是否触发 |
 | `store_memory(content, level?, ...)` | 存储记忆，可指定抽象层级（meta_knowledge / semi_abstract / concrete_trace） |
+| `recall_by_id(ids)` | 按 rowid 精确读取，不增加 `access_count`，用于引用和审计 |
+| `get_recall_trace(trace_id)` | 查看一次召回的候选/过滤计数，以及真正暴露给模型的 ID |
+| `validate_memory_references(trace_id, text)` | 保留本次 trace 允许的 `[id:N]`，剔除伪造或越界 ID |
 | `memory_stats()` | 统计：压缩压力、死知识、搜索未命中率 |
 
 ---
@@ -432,6 +435,8 @@ Reciprocal Rank Fusion 只用排名位置，不用原始分数。这样 FTS5 BM2
 | `ENTITY_LLM_API_BASE_URL` | — | 可选实体层的 OpenAI-compat chat base URL（v2.5；不设则休眠） |
 | `ENTITY_LLM_API_KEY` | — | 实体抽取的 API key |
 | `ENTITY_LLM_MODEL` | `gpt-4o-mini` | 实体抽取用的 chat 模型 |
+| `MNEME_RECALL_TRACE_RETENTION_DAYS` | `7` | 召回 trace 保留天数，限制为 1-365；trace 只存哈希/计数/rowid，不复制原查询和记忆正文 |
+| `MNEME_RECALL_TRACE_MAX_ROWS` | `10000` | 最多保留的召回 trace 行数，限制为 100-100000 |
 | `CLAUDE_BIN` | `claude` | Claude CLI 路径（压缩管线用） |
 | `TOKENMEM_COMPACT_SUMMARY` | — | compact 摘要文本（SessionStart hook 用） |
 | `TOKENMEM_COMPACT_SESSION` | — | compact 摘要的 session ID |

@@ -65,3 +65,13 @@ jobs:
         env:
           TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-locations.db
         run: node locations.test.mjs
+
+      - name: Unit tests (recall contract — budget, trace, allowlist)
+        env:
+          TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-recall-contract.db
+        run: node recall-contract.test.mjs
+
+      - name: Unit tests (query rewrite hook)
+        env:
+          TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-query-rewrite.db
+        run: node query-rewrite.test.mjs
