@@ -75,3 +75,6 @@ jobs:
         env:
           TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-query-rewrite.db
         run: node query-rewrite.test.mjs
+
+      - name: Adapter test (codex-recovery-proxy fault injection)
+        run: node adapters/codex-recovery-proxy/proxy.test.mjs
