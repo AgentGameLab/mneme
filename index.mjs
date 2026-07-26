@@ -1466,6 +1466,7 @@ export function recallMemories(opts = {}) {
   })
 
   // Composite scoring (AIRI-style + Memory Transfer Learning level weighting)
+  // Intentional asymmetry: normalized FTS relevance is absolute 0-1, unlike hybrid rank-only RRF.
   const LEVEL_WEIGHT = { meta_knowledge: 1.3, semi_abstract: 1.0, concrete_trace: 0.7 }
   // FTS5 BM25 magnitudes depend on both corpus and query. The former `/ 10`
   // clamp collapsed every sufficiently strong match to 1.0, discarding the
@@ -1571,8 +1572,10 @@ export function recallMemories(opts = {}) {
 // Principle:
 //   1. FTS5 path: keyword/lexical matching (strong for exact queries)
 //   2. Vector path: semantic matching (synonyms, paraphrases)
-//   3. RRF (Reciprocal Rank Fusion): score = sum(1/(k + rank)), k=60
-//      Uses only ranks, not raw scores — merges lists of different scales fairly
+//   3. RRF (Reciprocal Rank Fusion): score = sum(1/(k + rank + level_offset)), k=60
+//      Uses only ranks, not raw scores — merges lists of different scales fairly.
+//      Small level offsets demote lower abstraction tiers without turning RRF
+//      into a multiplicative level filter.
 //
 // Performance:
 //   - One embedding API call (~120ms for query vector)
@@ -1658,7 +1661,7 @@ export async function recallMemoriesHybrid(opts = {}) {
   const db = getDb()
   const now = Date.now()
   const THIRTY_DAYS_MS = 30 * 86400_000
-  const LEVEL_WEIGHT = { meta_knowledge: 1.3, semi_abstract: 1.0, concrete_trace: 0.7 }
+  const LEVEL_RANK_OFFSET = { meta_knowledge: -2, semi_abstract: 0, concrete_trace: 4 }
   const temporalWindow = parseTemporalWindow(queryText)
 
   // Parallel: vector query (get embedding) + FTS query
@@ -1716,7 +1719,8 @@ export async function recallMemoriesHybrid(opts = {}) {
     rows.forEach((row, idx) => {
       const rowid = row.rowid
       if (!rowid) return
-      const contribution = 1 / (RRF_K + idx + 1)
+      const offset = LEVEL_RANK_OFFSET[row.memory_level] || 0
+      const contribution = 1 / (RRF_K + idx + 1 + offset)
       const existing = rrfScores.get(rowid)
       if (existing) {
         existing.rrf += contribution
@@ -1748,7 +1752,7 @@ export async function recallMemoriesHybrid(opts = {}) {
     candidateLimit,
   })
 
-  // Apply Memory Transfer Learning level weighting + importance + time decay + decay_score (migration 003)
+  // Apply level-aware RRF contributions + importance + time decay + decay_score (migration 003)
   const fusedCandidates = Array.from(rrfScores.values())
     .sort((a, b) => b.rrf - a.rrf)
     .slice(0, candidateLimit)
@@ -1758,7 +1762,6 @@ export async function recallMemoriesHybrid(opts = {}) {
     dropped: Math.max(0, rrfScores.size - fusedCandidates.length),
   })
   let merged = fusedCandidates.map(({ row, rrf, sources }) => {
-    const levelWeight = LEVEL_WEIGHT[row.memory_level] || 1.0
     const importanceScore = row.importance / 10
     // migration 004 (v2.2): age based on event_time when set, else created_at fallback
     const effectiveTime = row.event_time != null ? row.event_time : row.created_at
@@ -1775,7 +1778,7 @@ export async function recallMemoriesHybrid(opts = {}) {
     // recalled->access++->ranked-higher loop), now the primary structural tiebreak.
     const freqScore = Math.min(1, Math.log1p(row.access_count || 0) / Math.log1p(20))
     const decay = (row.decay_score != null) ? row.decay_score : 1.0
-    const score = (rrf * 10 + freqScore * 0.10 + timeScore * 0.06 + importanceScore * 0.05) * levelWeight * decay
+    const score = (rrf * 10 + freqScore * 0.10 + timeScore * 0.06 + importanceScore * 0.05) * decay
     const temporalMetadata = temporalWindow
       ? { temporal_match: isInTemporalWindow(row, temporalWindow) }
       : {}
