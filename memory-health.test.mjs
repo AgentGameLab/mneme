@@ -195,6 +195,69 @@ function check(label, cond, detail = '') {
   }
 }
 
+// ── detectNearDup: supersede band (0.85 <= cos < simFloor) ──
+// Vectors are synthesized rather than embedded: the band logic is what is under
+// test, and CI has no embedding key. parseVec/normalize/dot are dimension-
+// agnostic, so 3-d unit-ish vectors reproduce the exact cosines we need.
+{
+  const Database = (await import('node:module')).createRequire(import.meta.url)('better-sqlite3')
+  const { detectNearDup } = await import('./memory-health.mjs')
+  const db = new Database(DB_PATH)
+
+  const DAY = 86400_000
+  const now = Date.now()
+  // cos(A,B) ≈ 0.906 → supersede band; cos(C,D) ≈ 0.999 → dup band.
+  const seed = [
+    ['sb-iter-old', 'people', 'semi_abstract', 7, '[1,0,0]', now - 40 * DAY],
+    ['sb-iter-new', 'people', 'semi_abstract', 7, '[0.906,0.423,0]', now - 5 * DAY],
+    ['sb-dup-a', 'relationship', 'semi_abstract', 6, '[1,0,0]', now - 9 * DAY],
+    ['sb-dup-b', 'relationship', 'semi_abstract', 6, '[0.9995,0.0316,0]', now - 8 * DAY],
+    ['sb-series-old', 'bug', 'concrete_trace', 4, '[1,0,0]', now - 20 * DAY],
+    ['sb-series-new', 'bug', 'concrete_trace', 4, '[0.906,0.423,0]', now - 2 * DAY],
+  ]
+  const ins = db.prepare(`
+    INSERT INTO memories (id, content, summary, category, memory_level, memory_type,
+                          importance, content_vector, created_at, updated_at, last_accessed, access_count)
+    VALUES (?, ?, ?, ?, ?, 'long_term', ?, ?, ?, ?, ?, 0)
+  `)
+  for (const [id, cat, lvl, imp, vec, created] of seed) {
+    ins.run(id, `content for ${id}`, `summary for ${id}`, cat, lvl, imp, vec, created, created, created)
+  }
+  db.prepare(`UPDATE memories SET is_pinned = 1 WHERE id = 'sb-iter-old'`).run()
+
+  const nd = detectNearDup(db, { simFloor: 0.95, simDup: 0.97, simSupersede: 0.85 })
+  const inCat = (list, cat) => list.filter(c => c.cat === cat)
+
+  const sup = inCat(nd.supersede_candidates || [], 'people')
+  check('supersede band catches a 0.85..0.95 pair', sup.length === 1,
+    `got ${sup.length}`)
+  check('supersede band leaves dup band untouched (back-compat)',
+    inCat(nd.dup_candidates, 'relationship').length === 1 && inCat(nd.supersede_candidates || [], 'relationship').length === 0)
+
+  if (sup.length === 1) {
+    const d = sup[0].detail
+    const older = db.prepare(`SELECT rowid FROM memories WHERE id = 'sb-iter-old'`).get().rowid
+    const newer = db.prepare(`SELECT rowid FROM memories WHERE id = 'sb-iter-new'`).get().rowid
+    check('supersede detail names the newer row', d.newer_rowid === newer,
+      `newer_rowid=${d.newer_rowid} expected=${newer}`)
+    check('supersede detail reports the write gap', d.age_gap_days === 35, `gap=${d.age_gap_days}`)
+    check('supersede detail flags a pinned side', d.any_protected === true)
+    check('supersede detail carries per-side review signals',
+      d.a.rowid === older || d.b.rowid === older)
+    check('supersede detail keeps summaries readable',
+      (d.a.summary + d.b.summary).includes('summary for sb-iter'))
+  }
+
+  const series = inCat(nd.supersede_candidates || [], 'bug')
+  check('two concrete_trace rows are flagged as a repeated series, not an iteration',
+    series.length === 1 && series[0].detail.likely_series === true,
+    `len=${series.length} flag=${series[0]?.detail?.likely_series}`)
+  check('a non-concrete pair is not flagged as a series',
+    sup.length === 1 && sup[0].detail.likely_series === false)
+
+  db.close()
+}
+
 // Cleanup temp DB files
 for (const suffix of ['', '-shm', '-wal']) {
   const p = DB_PATH + suffix

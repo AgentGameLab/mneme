@@ -55,6 +55,16 @@ export const DEFAULTS = Object.freeze({
   // Cosine floor below which we don't even record a pair. 0.95..0.97 is the
   // "near-duplicate, review manually" band; below 0.95 is signal-less noise.
   simFloor: 0.95,
+  // Cosine floor for the supersede band (simSupersede <= cos < simFloor).
+  // This band is NOT "the same thing said twice" — it is "the same subject,
+  // written more than once, and the wording drifted". On a real 6k-row DB it is
+  // where superseded-but-never-marked iterations live: an old design doc still
+  // active next to its revision, one script's usage recorded three times.
+  // A true duplicate is harmless (recall returns the same fact); an unmarked
+  // stale iteration is not (recall can return the version you already replaced).
+  // 0.85 was where per-category yield stayed reviewable (~75 pairs) — lower
+  // floods with same-topic-different-fact pairs.
+  simSupersede: 0.85,
   // Cosine histogram bucket edges (for the optional --dump-sim-hist calibration output).
   simBands: [0.85, 0.88, 0.90, 0.93, 0.95, 0.97, 0.99],
   // A concrete_trace row is "dead" if its access_count is 0 OR its decay_score is
@@ -80,6 +90,18 @@ const ACTIVE_CLAUSE = `deleted_at IS NULL AND superseded_by IS NULL`
 
 // ── Small text helpers ──
 const clip = (s, n = 70) => (s || '').replace(/\s+/g, ' ').slice(0, n)
+
+// Per-row signals a reviewer needs to judge "stale iteration vs both still true".
+const sideDetail = (it, now) => ({
+  rowid: it.rowid,
+  imp: it.importance,
+  level: (it.memory_level || '').slice(0, 4),
+  type: it.memory_type,
+  age_days: it.created_at ? Math.floor((now - it.created_at) / 86400_000) : null,
+  acc: it.access_count ?? 0,
+  protected: it.protected,
+  summary: clip(it.summary, 110),
+})
 
 /**
  * "Noise" queries that should not surface in blindspot repeat-query lists —
@@ -252,6 +274,7 @@ export function detectBlindspot(db, opts = {}) {
 export function detectNearDup(db, opts = {}) {
   const simDup = opts.simDup ?? DEFAULTS.simDup
   const simFloor = opts.simFloor ?? DEFAULTS.simFloor
+  const simSupersede = opts.simSupersede ?? DEFAULTS.simSupersede
   const simBands = opts.simBands ?? DEFAULTS.simBands
   const budgetMs = opts.budgetMs ?? DEFAULTS.budgetMs
   const maxPairs = opts.maxPairsPerBucket ?? DEFAULTS.maxPairsPerBucket
@@ -259,9 +282,23 @@ export function detectNearDup(db, opts = {}) {
   const warnings = []
   const t0 = Date.now()
   const overBudget = () => Date.now() - t0 > budgetMs
+  // Anything at or above this cosine gets recorded; the band it lands in is
+  // decided per-pair below.
+  const recordFloor = Math.min(simFloor, simSupersede)
+
+  // migration 008 columns — absent on DBs that have not been opened by a
+  // current initMemory() yet. This script is read-only and must not migrate,
+  // so degrade instead: without the flags the supersede band simply cannot
+  // protect anchors/pins, which is stated in the report rather than assumed.
+  const cols = new Set(db.prepare(`PRAGMA table_info(memories)`).all().map(c => c.name))
+  const hasFlags = cols.has('is_anchor') && cols.has('is_pinned')
+  const flagSel = hasFlags ? 'is_anchor, is_pinned' : '0 AS is_anchor, 0 AS is_pinned'
+  if (!hasFlags) warnings.push('is_anchor/is_pinned columns absent — supersede band cannot exclude anchored/pinned rows')
 
   const rows = db.prepare(`
-    SELECT rowid, id, category, importance, summary, content_vector
+    SELECT rowid, id, category, importance, content_vector,
+           COALESCE(NULLIF(summary, ''), substr(content, 1, 140)) AS summary,
+           created_at, access_count, memory_level, memory_type, ${flagSel}
     FROM memories
     WHERE ${ACTIVE_CLAUSE} AND content_vector IS NOT NULL AND content_vector != ''
   `).all()
@@ -274,7 +311,12 @@ export function detectNearDup(db, opts = {}) {
     const nv = normalize(v)
     if (!nv) continue
     if (!buckets.has(r.category)) buckets.set(r.category, [])
-    buckets.get(r.category).push({ rowid: r.rowid, id: r.id, importance: r.importance, summary: r.summary, nv })
+    buckets.get(r.category).push({
+      rowid: r.rowid, id: r.id, importance: r.importance, summary: r.summary, nv,
+      created_at: r.created_at, access_count: r.access_count,
+      memory_level: r.memory_level, memory_type: r.memory_type,
+      protected: !!(r.is_anchor || r.is_pinned || r.memory_type === 'permanent'),
+    })
   }
 
   const candidates = []
@@ -310,13 +352,38 @@ export function detectNearDup(db, opts = {}) {
             break
           }
         }
-        if (c >= simFloor) {
-          candidates.push({
-            cat, cosine: +c.toFixed(4),
+        if (c >= recordFloor) {
+          const band = c >= simDup ? 'dup' : (c >= simFloor ? 'near' : 'supersede')
+          const entry = {
+            cat, cosine: +c.toFixed(4), band,
             a: { rowid: items[i].rowid, id: items[i].id, imp: items[i].importance, summary: clip(items[i].summary, 60) },
             b: { rowid: items[j].rowid, id: items[j].id, imp: items[j].importance, summary: clip(items[j].summary, 60) },
             is_dup: c >= simDup,
-          })
+          }
+          // The supersede band is reviewed pair-by-pair by a human/agent, so it
+          // carries the signals that decide "is one of these a stale iteration":
+          // which side is newer, how far apart they were written, and how alive
+          // each one is. Protected rows (anchor/pin/permanent) are flagged, not
+          // dropped — an old plain row next to an anchor is still a valid
+          // supersede target, and only the reviewer can tell which side is which.
+          if (band === 'supersede') {
+            // Two concrete_trace rows that look alike are almost never an
+            // iteration of one fact — they are two runs of the same routine
+            // (nightly metric snapshots, repeated ops logs). By our own level
+            // semantics those are one-off traces that decay is supposed to bury,
+            // so superseding them would destroy a legitimate time series.
+            // Flagged rather than dropped: the reviewer still sees the pair.
+            const likelySeries = items[i].memory_level === 'concrete_trace'
+              && items[j].memory_level === 'concrete_trace'
+            entry.detail = {
+              a: sideDetail(items[i], t0), b: sideDetail(items[j], t0),
+              newer_rowid: (items[i].created_at ?? 0) >= (items[j].created_at ?? 0) ? items[i].rowid : items[j].rowid,
+              age_gap_days: Math.abs(Math.round(((items[i].created_at ?? 0) - (items[j].created_at ?? 0)) / 86400_000)),
+              any_protected: items[i].protected || items[j].protected,
+              likely_series: likelySeries,
+            }
+          }
+          candidates.push(entry)
         }
       }
     }
@@ -334,8 +401,9 @@ export function detectNearDup(db, opts = {}) {
   return {
     rows_with_vector: rows.length - noVec, no_vector: noVec,
     scanned_pairs: scannedPairs, buckets_sampled: bucketsSampled,
-    dup_candidates: candidates.filter(c => c.is_dup),
-    near_candidates: candidates.filter(c => !c.is_dup),
+    dup_candidates: candidates.filter(c => c.band === 'dup'),
+    near_candidates: candidates.filter(c => c.band === 'near'),
+    supersede_candidates: candidates.filter(c => c.band === 'supersede'),
     warnings,
     ...(dumpHist ? { histogram: hist } : {}),
   }
@@ -356,6 +424,7 @@ export function runMemoryHealth(opts = {}) {
       thresholds: {
         sim_dup: opts.simDup ?? DEFAULTS.simDup,
         sim_floor: opts.simFloor ?? DEFAULTS.simFloor,
+        sim_supersede: opts.simSupersede ?? DEFAULTS.simSupersede,
         stale_decay: opts.staleDecay ?? DEFAULTS.staleDecay,
         recall_window_days: opts.recallLogDays ?? DEFAULTS.recallLogDays,
         budget_ms: opts.budgetMs ?? DEFAULTS.budgetMs,
@@ -390,6 +459,7 @@ function defaultDbPath() {
 export function renderTextReport(report, opts = {}) {
   const simDup = report.thresholds.sim_dup
   const simFloor = report.thresholds.sim_floor
+  const simSupersede = report.thresholds.sim_supersede ?? DEFAULTS.simSupersede
   const staleDecay = report.thresholds.stale_decay
   const inf = report.inflation, nd = report.near_dup, bs = report.blindspot, ig = report.integrity
   const L = []
@@ -419,6 +489,27 @@ export function renderTextReport(report, opts = {}) {
     L.push(`\n  near-duplicates (${simFloor}<=cos<${simDup}, usually related-but-distinct):`)
     for (const c of nd.near_candidates.slice(0, 10)) L.push(`  cos=${c.cosine} [${c.cat}] #${c.a.rowid} <-> #${c.b.rowid}`)
   }
+
+  const scAll = nd.supersede_candidates || []
+  const scSeries = scAll.filter(c => c.detail?.likely_series)
+  const sc = scAll.filter(c => !c.detail?.likely_series)
+  L.push(`\n## (a2) supersede candidates — same subject rewritten (${simSupersede}<=cos<${simFloor}): ${sc.length}`)
+  L.push(`  Judge each: [stale-iteration] supersede the older -> [redundant] keep one -> [both-true] leave alone.`)
+  L.push(`  Not a duplicate scan — these are pairs whose wording drifted, which is where`)
+  L.push(`  an already-replaced version stays active and can be recalled as if current.`)
+  if (scSeries.length) {
+    L.push(`  (${scSeries.length} concrete_trace pairs hidden — repeated runs of one routine, not iterations; decay buries those)`)
+  }
+  if (!sc.length) L.push(`  (none)`)
+  for (const c of sc.slice(0, 40)) {
+    const d = c.detail
+    const mark = (s) => `#${s.rowid}${s.protected ? '[P]' : ''}`
+    const newerA = d.newer_rowid === d.a.rowid
+    L.push(`  cos=${c.cosine} [${c.cat}] gap=${d.age_gap_days}d  newer=#${d.newer_rowid}${d.any_protected ? '  ⚠ protected side present' : ''}`)
+    L.push(`     ${newerA ? 'NEW' : 'old'} ${mark(d.a)} imp=${d.a.imp} ${d.a.level} acc=${d.a.acc} age=${d.a.age_days}d: ${d.a.summary}`)
+    L.push(`     ${newerA ? 'old' : 'NEW'} ${mark(d.b)} imp=${d.b.imp} ${d.b.level} acc=${d.b.acc} age=${d.b.age_days}d: ${d.b.summary}`)
+  }
+  if (sc.length > 40) L.push(`  ... ${sc.length - 40} more (use --format json for the full list)`)
 
   L.push(`\n## (b) inflation & level<->importance audit`)
   L.push(`  level: ${inf.level.map(r => `${r.lvl}=${r.c}(${r.pct}%)`).join(' / ')}`)
@@ -486,6 +577,7 @@ function parseArgs(argv) {
     recallLogDays: parsePosInt('--days', getFlag('--days'), DEFAULTS.recallLogDays),
     budgetMs: parsePosInt('--budget-ms', getFlag('--budget-ms'), DEFAULTS.budgetMs),
     simDup: parseFloatArg('--sim-dup', getFlag('--sim-dup'), DEFAULTS.simDup),
+    simSupersede: parseFloatArg('--sim-supersede', getFlag('--sim-supersede'), DEFAULTS.simSupersede),
     dumpHist: hasFlag('--dump-sim-hist'),
     help: hasFlag('--help') || hasFlag('-h'),
   }
@@ -500,6 +592,7 @@ Flags:
   --days N                recall_log analytics window (default: ${DEFAULTS.recallLogDays})
   --budget-ms N           Wall-clock budget for the near-dup scan (default: ${DEFAULTS.budgetMs})
   --sim-dup F             Cosine floor for "true duplicate" (default: ${DEFAULTS.simDup})
+  --sim-supersede F       Cosine floor for the supersede band (default: ${DEFAULTS.simSupersede})
   --dump-sim-hist         Emit per-category cosine histogram (for calibration)
   --help, -h              Show this help
 `
