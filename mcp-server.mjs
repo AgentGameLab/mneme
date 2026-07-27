@@ -138,7 +138,7 @@ function createServer() {
   // ── Tool: store_memory ──────────────────────────────────────
   s.tool(
     'store_memory',
-    'Store important information in the agent\'s long-term memory. New preferences, decisions, key facts, and user feedback should be stored promptly. Default to semi_abstract; reserve meta_knowledge for genuinely cross-context heuristics (test: would it help in a completely unrelated project?). meta_knowledge with concrete bindings (project name / ISO date / memory rowid ref / commit hash / absolute path) is auto-downgraded to semi_abstract — the response shows the reasons so you can adjust wording next time. Importance is a weak prior for recall display ranking, NOT an input to decay / auto-forget — retention emerges from access_count / recency. The store also surfaces a near-duplicate warning when content closely matches an existing memory; supersede that one instead of duplicating.',
+    'Store important information in the agent\'s long-term memory. New preferences, decisions, key facts, and user feedback should be stored promptly. Default to semi_abstract; reserve meta_knowledge for genuinely cross-context heuristics (test: would it help in a completely unrelated project?). meta_knowledge with concrete bindings (project name / ISO date / memory rowid ref / commit hash / absolute path) is auto-downgraded to semi_abstract — the response shows the reasons so you can adjust wording next time. Importance is a weak prior for recall display ranking, NOT an input to decay / auto-forget — retention emerges from access_count / recency. The store also surfaces a near-duplicate warning when content closely matches an existing memory; supersede that one instead of duplicating. When you pass supersedes, write the FULL new version, not just what changed — supersede replaces the old entry wholesale, and a shrink warning tells you which URLs / env vars / API routes / file paths the new text stopped carrying.',
     {
       content: z.string().describe('Content to remember'),
       summary: z.string().optional().describe('One-line summary (optional)'),
@@ -189,6 +189,20 @@ function createServer() {
         text += `\n📉 meta_knowledge → semi_abstract (write-gate: content has concrete bindings)`
           + `\n   reasons: ${out.metaDowngrade.reasons.join(' | ')}`
           + `\n   next time: extract the cross-project heuristic without the specific name/date/id, or accept semi_abstract`
+      }
+      if (out.supersedeShrink?.length) {
+        text += `\n⚠️ supersede shrink — the new version dropped things the old one carried:`
+        for (const w of out.supersedeShrink.slice(0, 3)) {
+          text += `\n  #${w.id}: ${w.oldLen}B → ${w.newLen}B (${Math.round(w.ratio * 100)}%)`
+          if (w.droppedCount) {
+            const shown = w.dropped.slice(0, 6).join(', ')
+            text += `\n    dropped: ${shown}${w.droppedCount > 6 ? ` …+${w.droppedCount - 6} more` : ''}`
+          }
+        }
+        text += `\n   supersede replaces the old entry wholesale. prior_versions keeps the paper trail,`
+          + `\n   but FTS only indexes content/summary/tags — dropped facts become unrecallable.`
+          + `\n   intentional split/consolidation? ignore. otherwise re-store the full text,`
+          + `\n   or move the volatile part (counts, progress) into its own memory.`
       }
       if (out.nearDuplicates?.length) {
         const top = out.nearDuplicates.slice(0, 3)

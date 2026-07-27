@@ -816,6 +816,85 @@ function _parseEventTime(v) {
   return null
 }
 
+// v2.10: supersede shrink guard.
+//
+// supersede means "this replaces that wholesale", but callers drift into writing
+// only the delta ("inventory is now 296") and let the rest fall off. Durable
+// facts — service URLs, env vars, API routes, code locations — then leak out of
+// `content` one version at a time. They survive in prior_versions[], but
+// memories_fts only indexes content/summary/tags, so a dropped fact is
+// unrecallable even though the audit trail still holds it. "Still in the DB"
+// and "still findable" quietly diverge, and only the recall side shows it.
+//
+// Observed: a 4-hop chain went 2076B -> 568B and took 8 operational identifiers
+// with it; the live head was a one-line status ticker.
+//
+// DETECTION ONLY — same contract as the near-dup and meta gates. Legitimate
+// splits and consolidations shrink too, so this reports and lets the caller judge.
+const SHRINK_RATIO_FLOOR = 0.6
+const SHRINK_MIN_OLD_LEN = 200
+
+// What ends a URL or path token. Half-width ':' and ',' stay legal (ports,
+// and trailing commas are stripped afterwards), but CJK text and CJK punctuation
+// terminate: Chinese prose runs straight into a path with no space, so without
+// this a path swallows the rest of the sentence — "E:/Project/foo/。使用文档是".
+const PATH_STOP = '\\s"\'`)）(（\\[\\]【】，、。；：！？…\\u4e00-\\u9fff\\u3000-\\u303f'
+
+const HIGH_SIGNAL_PATTERNS = [
+  new RegExp(`https?://[^${PATH_STOP}]+`, 'g'),            // URLs
+  /\b\d{1,3}(?:\.\d{1,3}){3}:\d{2,5}\b/g,                  // host:port
+  /\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g,                    // ENV_VAR_NAMES
+  // C:/ or E:\ paths. The lookbehind keeps "http://" from yielding "p://…".
+  new RegExp(`(?<![A-Za-z0-9])[A-Za-z]:[\\\\/][^${PATH_STOP}]+`, 'g'),
+  // /api/agent/v1 routes. ':' and '/' in the lookbehind stop this from
+  // re-matching the tail of a URL or a Windows path already captured above.
+  /(?<![\w.:/])\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.{}-]+)+/g,
+  // src/db.mjs — segments deliberately exclude '.' so the greedy head can't
+  // swallow the extension and starve the required suffix match; the lookbehind
+  // stops it re-reporting a tail already covered by the URL/Windows patterns.
+  /(?<![\w./:\\-])[\w-]+(?:\/[\w-]+)*\.(?:mjs|js|ts|json|md|sql|sh|py|yml|yaml)\b/g,
+]
+
+function extractHighSignalTokens(text) {
+  if (!text) return []
+  const out = new Set()
+  for (const re of HIGH_SIGNAL_PATTERNS) {
+    for (const m of String(text).matchAll(re)) {
+      const t = m[0].replace(/[.,;:。，、）)】\]]+$/, '')
+      if (t.length >= 4) out.add(t)
+    }
+  }
+  return [...out]
+}
+
+/**
+ * @param {string} newContent content of the record doing the superseding
+ * @param {Array<{rowid:number|string, content:string}>} olds rows being superseded
+ * @returns {Array<{id,oldLen,newLen,ratio,dropped,droppedCount}>} one entry per suspicious pair
+ */
+function checkSupersedeShrink(newContent, olds) {
+  const warnings = []
+  const newTokens = new Set(extractHighSignalTokens(newContent))
+  const newLen = (newContent || '').length
+  // Length is only meaningful 1:1. Merging N rows into one legitimately compresses,
+  // so an N:1 supersede is judged purely on which identifiers went missing.
+  const oneToOne = olds.length === 1
+  for (const old of olds) {
+    const oldLen = (old.content || '').length
+    const dropped = extractHighSignalTokens(old.content).filter(t => !newTokens.has(t))
+    const ratio = oldLen ? +(newLen / oldLen).toFixed(2) : 1
+    const shrank = oneToOne && oldLen >= SHRINK_MIN_OLD_LEN && ratio < SHRINK_RATIO_FLOOR
+    if (!dropped.length && !shrank) continue
+    warnings.push({
+      id: String(old.rowid),
+      oldLen, newLen, ratio,
+      dropped: dropped.slice(0, 20),
+      droppedCount: dropped.length,
+    })
+  }
+  return warnings
+}
+
 /**
  * Store a memory
  * @param {Object} mem
@@ -957,6 +1036,10 @@ export function storeMemory(mem, opts = {}) {
     )
 
     let newId = null
+    // v2.10: rows actually retired by this write, captured inside the tx so the
+    // shrink guard compares against what was really superseded (a rowid that was
+    // already deleted/superseded is skipped by priorsLoadStmt and never lands here).
+    const supersededOlds = []
     const tx = db.transaction(() => {
       // migration 008 (v2.6): re-check anchor/pinned quotas INSIDE the tx so
       // concurrent writers can't both slip past a full cap. Downgrade the
@@ -1018,6 +1101,7 @@ export function storeMemory(mem, opts = {}) {
             source_rowid: old.rowid,
             created_at: old.created_at,
           })
+          supersededOlds.push({ rowid: old.rowid, content: old.content })
         }
         if (priors.length > 0) {
           try { priorsUpdateStmt.run(JSON.stringify(priors), newId) } catch (e) {
@@ -1038,6 +1122,14 @@ export function storeMemory(mem, opts = {}) {
     // commits — the tx populated `quotaRejected` if any flag was reset.
     if (quotaRejected.length && opts.out) {
       opts.out.quotaRejected = quotaRejected
+    }
+    // v2.10: shrink guard runs after commit — the write always stands, the
+    // caller just gets told what the new version stopped carrying.
+    if (opts.out && supersededOlds.length) {
+      try {
+        const shrink = checkSupersedeShrink(mem.content, supersededOlds)
+        if (shrink.length) opts.out.supersedeShrink = shrink
+      } catch (e) { log(`supersede shrink check failed (id=${newId}): ${e.message}`) }
     }
     return newId
   } catch (e) {
@@ -1063,11 +1155,16 @@ function findNearDuplicates(db, embedding, excludeId, { topK = 5, threshold = 0.
   if (!_vecLoaded || !embedding) return []
   let cands
   try {
+    // superseded_by IS NULL matters here, not just deleted_at: storeMemory sets
+    // superseded_by synchronously but the soft delete only lands on the next
+    // expireMemories sweep. Without it, `supersedes:["N"]` still gets told
+    // "near-duplicate #N — consider superseding it" for the row it just retired.
     cands = db.prepare(`
       SELECT m.rowid AS id, m.summary, m.content, m.content_vector
       FROM (SELECT memory_rowid, distance FROM memories_vec WHERE embedding MATCH ? ORDER BY distance LIMIT ?) v
       JOIN memories m ON m.rowid = v.memory_rowid
-      WHERE m.rowid != ? AND m.deleted_at IS NULL AND m.content_vector IS NOT NULL AND m.content_vector != ''
+      WHERE m.rowid != ? AND m.deleted_at IS NULL AND m.superseded_by IS NULL
+        AND m.content_vector IS NOT NULL AND m.content_vector != ''
     `).all(new Float32Array(embedding), topK + 1, excludeId)
   } catch { return [] }
   const out = []
