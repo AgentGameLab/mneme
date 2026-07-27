@@ -556,6 +556,9 @@ export function renderTextReport(report, opts = {}) {
 
   L.push(`## TL;DR`)
   L.push(`- true-dup candidates (cos>=${simDup}): ${nd.dup_candidates.length} pair(s)  ·  near-dup for review (>=${simFloor}): ${nd.near_candidates.length}`)
+  if (report.shrink?.available) {
+    L.push(`- shrink victims (collapsed chains, imp>=${report.thresholds.shrink_min_importance ?? DEFAULTS.shrinkMinImportance}): ${report.shrink.victims.length}  ·  ${report.shrink.ledger_growing} growing-ledger rotations excluded`)
+  }
   L.push(`- dead concrete_trace: ${report.dead_concrete.length}`)
   L.push(`- inflation: meta ${inf.meta_pct}% / imp>=7 ${inf.imp_ge7_pct}% / imp>=9 ${inf.imp_ge9_pct}%  ·  concrete imp>5 violations ${inf.concrete_importance_violations}  ·  meta zero-access downgrade candidates ${inf.meta_zero_access_downgrade_candidates}`)
   L.push(`- supersede chain: ${ig.orphan_targets} orphan / ${ig.leaked_active} leaked-active (both should be 0)  ·  dead_knowledge(${ig.dead_knowledge_days}d): ${ig.dead_knowledge_count}`)
@@ -599,12 +602,6 @@ export function renderTextReport(report, opts = {}) {
   }
   if (sc.length > 40) L.push(`  ... ${sc.length - 40} more (use --format json for the full list)`)
 
-  L.push(`\n## (b) inflation & level<->importance audit`)
-  L.push(`  level: ${inf.level.map(r => `${r.lvl}=${r.c}(${r.pct}%)`).join(' / ')}`)
-  L.push(`  importance: ${inf.importance.map(r => `${r.imp}=${r.c}`).join(' ')}`)
-  L.push(`  -> concrete importance>5 violations: ${inf.concrete_importance_violations} (rule: concrete_trace stays <=5)`)
-  L.push(`  -> meta with access_count=0 (downgrade candidates): ${inf.meta_zero_access_downgrade_candidates}`)
-
   const sh = report.shrink
   if (sh?.available) {
     const minImp = report.thresholds.shrink_min_importance ?? DEFAULTS.shrinkMinImportance
@@ -620,6 +617,12 @@ export function renderTextReport(report, opts = {}) {
     }
     if (sh.victims.length > 20) L.push(`  ... ${sh.victims.length - 20} more (use --format json for the full list)`)
   }
+
+  L.push(`\n## (b) inflation & level<->importance audit`)
+  L.push(`  level: ${inf.level.map(r => `${r.lvl}=${r.c}(${r.pct}%)`).join(' / ')}`)
+  L.push(`  importance: ${inf.importance.map(r => `${r.imp}=${r.c}`).join(' ')}`)
+  L.push(`  -> concrete importance>5 violations: ${inf.concrete_importance_violations} (rule: concrete_trace stays <=5)`)
+  L.push(`  -> meta with access_count=0 (downgrade candidates): ${inf.meta_zero_access_downgrade_candidates}`)
 
   L.push(`\n## (c) dead concrete_trace (${report.dead_concrete.length}, decay<${staleDecay} or access=0)`)
   for (const r of report.dead_concrete.slice(0, 15)) L.push(`  #${r.rowid} imp=${r.importance} acc=${r.access_count} decay=${r.decay_score} | ${r.summary}`)
