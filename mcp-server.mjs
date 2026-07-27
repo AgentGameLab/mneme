@@ -30,6 +30,9 @@ import {
   getMemoriesByIds,
   storeMemory,
   storeMemoryAsync,
+  storeMemoryQuarantined,
+  listQuarantine,
+  resolveQuarantine,
   buildMemoryContext,
   getRecallTrace,
   validateMemoryReferences,
@@ -42,6 +45,7 @@ import {
   listLocations,
   deleteLocation,
 } from './index.mjs'
+import { parseHostTokens, resolveAuthMode, resolveHost } from './auth.mjs'
 
 // ── Load .env.local BEFORE initMemory() ────────────────────────────────
 // The MCP server is often spawned by a supervisor (watchdog / launcher) that
@@ -72,11 +76,35 @@ embedMissingVectors(500).then(r => {
 const SERVER_NAME = 'mneme'
 const SERVER_VERSION = '2.8.0'
 
+// ── Channel auth (migration 011) — token -> host map, resolved once at startup ──
+// Multiple agent runtimes (cc / codex / ...) share this endpoint; each carries
+// its own token (MNEME_HOST_TOKENS="cc=tok1,codex=tok2") and the server derives
+// source_host from the token. Client-supplied host claims never exist in any tool
+// schema — provenance is channel-derived by construction.
+const HOST_TOKENS = parseHostTokens(process.env.MNEME_HOST_TOKENS)
+const AUTH_MODE = resolveAuthMode(process.env.MNEME_AUTH, HOST_TOKENS)
+const DEFAULT_HOST = process.env.MNEME_DEFAULT_HOST || 'cc'
+if (HOST_TOKENS.size > 0) {
+  console.error(`[mneme] channel auth: mode=${AUTH_MODE}, hosts=[${[...new Set(HOST_TOKENS.values())].join(', ')}], default=${DEFAULT_HOST}`)
+}
+
+// ── Quarantine routing (migration 012) — review authority is channel identity ──
+// Hosts listed in MNEME_QUARANTINE_HOSTS write into memories_quarantine instead
+// of the main pool, so recall cannot see them by construction. resolve_quarantine
+// is only registered on primary-host sessions.
+const QUARANTINE_HOSTS = new Set(
+  (process.env.MNEME_QUARANTINE_HOSTS || '').split(',').map(s => s.trim()).filter(Boolean)
+)
+const PRIMARY_HOST = process.env.MNEME_PRIMARY_HOST || DEFAULT_HOST
+if (QUARANTINE_HOSTS.size > 0) {
+  console.error(`[mneme] quarantine: hosts=[${[...QUARANTINE_HOSTS].join(', ')}], reviewer=${PRIMARY_HOST}`)
+}
+
 // ── Factory: each call returns a fresh McpServer with all 4 tools registered ──
 // Why factory: HTTP stateful multi-client mode requires per-session McpServer
 // (SDK design: transport ↔ server is 1:1, sharing tool registry across transports
 // is unsafe). Stdio mode also calls createServer() once for symmetry.
-function createServer() {
+function createServer(hostId = DEFAULT_HOST) {
   const s = new McpServer({
     name: SERVER_NAME,
     version: SERVER_VERSION,
@@ -154,6 +182,35 @@ function createServer() {
     },
     async ({ content, summary, importance = 6, memory_type = 'long_term', memory_level = 'semi_abstract', category = 'general', tags = [], supersedes, event_time, is_anchor, is_pinned }) => {
       const out = {}
+
+      // v2.9: not-yet-trusted hosts write into quarantine — a separate table
+      // the recall pool never reads. Requested supersedes are recorded but
+      // execute only if the reviewer approves.
+      if (QUARANTINE_HOSTS.has(hostId)) {
+        const qid = storeMemoryQuarantined({
+          content, summary, importance,
+          memoryType: memory_type,
+          memoryLevel: memory_level,
+          category,
+          source: 'conversation',
+          sourceHost: hostId,
+          tags, supersedes,
+          eventTime: event_time,
+        }, { out })
+        if (!qid) return { content: [{ type: 'text', text: 'Quarantine storage failed' }] }
+        let qtext = `🔒 Quarantined (qid: ${qid}, host: ${hostId}) — pending review by '${PRIMARY_HOST}'. Not recallable until approved.`
+        if (is_anchor || is_pinned) qtext += `\n(anchor/pinned flags are dropped for quarantined writes — the reviewer can re-add them after merge)`
+        if (out.encodingWarning) {
+          const e = out.encodingWarning
+          qtext += `\n⚠️ ENCODING DAMAGE: ${e.qmarkCount} '?' chars (longest run ${e.maxRun}). CJK was likely lost to a non-UTF-8 code page (cp936) — this is IRREVERSIBLE, not a display glitch. If you just wrote Chinese, it did NOT save; re-store via a UTF-8-safe path (codex exec / CC-side), not Codex Desktop.`
+        }
+        if (out.metaDowngrade) {
+          qtext += `\n📉 meta_knowledge → semi_abstract (write-gate: content has concrete bindings)`
+            + `\n   reasons: ${out.metaDowngrade.reasons.join(' | ')}`
+        }
+        return { content: [{ type: 'text', text: qtext }] }
+      }
+
       const id = await storeMemoryAsync({
         content,
         summary,
@@ -167,6 +224,7 @@ function createServer() {
         eventTime: event_time,
         isAnchor: is_anchor,
         isPinned: is_pinned,
+        sourceHost: hostId,
       }, { out })
 
       if (!id) {
@@ -230,11 +288,77 @@ function createServer() {
       const text = rows.map(r => {
         const tags = r.tags?.length ? ` [${r.tags.join(', ')}]` : ''
         const priors = r.prior_versions?.length ? ` (${r.prior_versions.length} prior versions)` : ''
-        return `[id:${r.rowid} ★${r.importance} ${r.memory_type} ${r.memory_level}]${tags}${priors}\n${r.summary ? '📌 ' + r.summary + '\n' : ''}${r.content}`
+        return `[id:${r.rowid} ★${r.importance} ${r.memory_type} ${r.memory_level}${r.source_host ? ` host:${r.source_host}` : ''}]${tags}${priors}\n${r.summary ? '📌 ' + r.summary + '\n' : ''}${r.content}`
       }).join('\n\n---\n\n')
       return { content: [{ type: 'text', text }] }
     }
   )
+
+  // ── Tool: review_quarantine (migration 012) ──────────────────────────
+  // All hosts can list; non-primary sessions are locked to their OWN rows
+  // (covers "what did I just store?" continuity on the quarantined side).
+  s.tool(
+    'review_quarantine',
+    'List quarantined memories (writes from not-yet-trusted hosts, invisible to recall until approved). Primary host sees all hosts and full content for review; other hosts see only their own entries. Use resolve_quarantine to approve/reject (primary host only).',
+    {
+      status: z.enum(['pending', 'approved', 'rejected', 'all']).optional().default('pending').describe('Filter by review status, default pending'),
+      limit: z.number().optional().default(5).describe('Max entries (full content is shown for review quality — keep small), default 5'),
+    },
+    async ({ status = 'pending', limit = 5 }) => {
+      const isPrimary = hostId === PRIMARY_HOST
+      const rows = listQuarantine({ status, host: isPrimary ? undefined : hostId, limit })
+      if (rows.length === 0) {
+        return { content: [{ type: 'text', text: `(quarantine: no ${status} entries${isPrimary ? '' : ` for host '${hostId}'`})` }] }
+      }
+      const now = Date.now()
+      const text = rows.map(r => {
+        const ageH = Math.floor((now - r.created_at) / 3600_000)
+        const ageStr = ageH < 1 ? '<1h' : ageH < 48 ? `${ageH}h` : `${Math.floor(ageH / 24)}d`
+        const tags = r.tags?.length ? ` [${r.tags.join(', ')}]` : ''
+        const sup = r.supersedes_requested?.length
+          ? `\n⚠ requests supersede of main-pool rowid(s): [${r.supersedes_requested.join(', ')}] — executes only on approve`
+          : ''
+        const reviewed = r.review_status !== 'pending'
+          ? `\n→ ${r.review_status}${r.merged_rowid ? ` as main-pool id ${r.merged_rowid}` : ''}${r.review_note ? ` | note: ${r.review_note}` : ''}`
+          : ''
+        return `[qid:${r.qid} host:${r.source_host || '(null)'} ${r.review_status} ★${r.importance} ${r.memory_type} ${r.memory_level} ${ageStr} ago]${tags}${sup}${reviewed}\n${r.summary ? '📌 ' + r.summary + '\n' : ''}${r.content}`
+      }).join('\n\n---\n\n')
+      const footer = isPrimary && status === 'pending'
+        ? `\n\n(review question per entry: would I have stored this? — judgment / importance anchor / stance / wording. resolve_quarantine(qid, approve|reject, note) to act; reject requires a note.)`
+        : ''
+      return { content: [{ type: 'text', text: text + footer }] }
+    }
+  )
+
+  // ── Tool: resolve_quarantine (migration 012, PRIMARY HOST ONLY) ──────
+  // Registration is gated on the session's channel-derived host — review
+  // authority comes from the credential, not from a tool argument.
+  if (hostId === PRIMARY_HOST) {
+    s.tool(
+      'resolve_quarantine',
+      'Approve or reject a quarantined memory (primary host only). Approve moves it into the main pool preserving source_host provenance and the original created_at, then executes any requested supersedes. Reject requires a note — rejection reasons are part of the trust record that decides when a host graduates to direct writes.',
+      {
+        qid: z.union([z.number(), z.string()]).describe('Quarantine id from review_quarantine'),
+        action: z.enum(['approve', 'reject']).describe('approve = merge into main pool; reject = keep out, record reason'),
+        note: z.string().optional().describe('Review note. REQUIRED for reject (the reason feeds rejection-rate stats); optional for approve'),
+      },
+      async ({ qid, action, note }) => {
+        if (action === 'reject' && !note?.trim()) {
+          return { content: [{ type: 'text', text: '❌ reject requires a note — 驳回原因进信任统计，不能空着' }] }
+        }
+        const r = await resolveQuarantine(qid, { action, note })
+        if (!r.ok) return { content: [{ type: 'text', text: `❌ ${r.error}` }] }
+        if (r.action === 'rejected') {
+          return { content: [{ type: 'text', text: `🚫 qid ${r.qid} rejected — reason recorded in trust stats` }] }
+        }
+        let t = `✅ qid ${r.qid} approved → main-pool id ${r.merged_rowid} (source_host + original created_at preserved)`
+        if (r.metaDowngrade) {
+          t += `\n📉 merged as semi_abstract (write-gate re-check): ${r.metaDowngrade.reasons.join(' | ')}`
+        }
+        return { content: [{ type: 'text', text: t }] }
+      }
+    )
+  }
 
   // ── Tool: memory_stats ──────────────────────────────────────
   s.tool(
@@ -403,6 +527,17 @@ if (useHttp) {
     // MCP endpoint
     if (req.url === '/mcp' || req.url?.startsWith('/mcp?')) {
       try {
+        // migration 011: resolve the writing host from the bearer token BEFORE
+        // touching sessions. In enforce mode a missing/unknown token is a hard
+        // 401; in soft/off mode it falls back to DEFAULT_HOST so existing
+        // untokened clients keep working during rollout.
+        const auth = resolveHost(req.headers['authorization'], HOST_TOKENS, { mode: AUTH_MODE, defaultHost: DEFAULT_HOST })
+        if (!auth.ok) {
+          res.writeHead(401, { 'Content-Type': 'text/plain', 'WWW-Authenticate': 'Bearer realm="mneme"' })
+          res.end(`Unauthorized: ${auth.reason}`)
+          return
+        }
+
         const sessionId = req.headers['mcp-session-id']
         let entry = sessionId ? sessions.get(sessionId) : null
         if (entry) entry.lastUsed = Date.now()  // 复用 session：刷新活跃时间
@@ -412,7 +547,7 @@ if (useHttp) {
           // Note: a single McpServer instance shared across multiple transports
           // is unsafe for tool registry (SDK design), so each session gets a new
           // server with the same tools registered.
-          const newServer = createServer()
+          const newServer = createServer(auth.host || DEFAULT_HOST)
           const newTransport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
             onsessioninitialized: (newSessionId) => {
