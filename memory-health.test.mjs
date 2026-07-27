@@ -303,6 +303,22 @@ function check(label, cond, detail = '') {
   check('(a3) honours a raised importance bar',
     detectShrinkVictims(db, { shrinkMinImportance: 10 }).victims.length === 0)
 
+  // ── review ack: "I looked, this one is fine" must be recordable ──
+  const target = v.rowid
+  const ackAt = Date.now() + 60_000   // ahead of the row's updated_at
+  db.prepare(`UPDATE memories SET metadata = json_set(COALESCE(NULLIF(metadata,''),'{}'), '$.shrink_ack', ?) WHERE rowid = ?`).run(ackAt, target)
+  const after = detectShrinkVictims(db)
+  check('(a3) acked row drops out of the queue',
+    after.victims.every(x => x.rowid !== target) && after.acked >= 1,
+    `acked=${after.acked} remaining=${after.victims.map(x => x.rowid).join(',')}`)
+
+  // Editing the row afterwards invalidates the ack — new content, new question.
+  db.prepare(`UPDATE memories SET updated_at = ? WHERE rowid = ?`).run(ackAt + 60_000, target)
+  const reopened = detectShrinkVictims(db)
+  check('(a3) ack expires once the row is edited again',
+    reopened.victims.some(x => x.rowid === target) && reopened.acked === 0,
+    `acked=${reopened.acked}`)
+
   db.close()
 }
 

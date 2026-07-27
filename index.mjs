@@ -3343,6 +3343,47 @@ if (_isMain) {
       const res = runLevelMigration({ limit, anchorPath, dryRun: hasFlag('--dry-run') })
       process.stdout.write(JSON.stringify(res, null, 2) + '\n')
 
+    } else if (getFlag('--shrink-ack') !== null) {
+      // v2.10: mark (a3) shrink victims as reviewed-and-accepted so the nightly
+      // report stops re-listing them. A queue that repeats itself gets skipped,
+      // so "I looked and this one is fine" has to be recordable.
+      //
+      // Stored in metadata JSON rather than a column: no migration, and it works
+      // the same on any fork of this schema. metadata is not one of the FTS
+      // trigger columns (content/summary/tags), so this never reindexes.
+      //
+      // The ack carries a timestamp and detectShrinkVictims only honours it while
+      // it is >= the row's updated_at — edit the row later and it comes back for
+      // review, because the question changed.
+      //   node index.mjs --shrink-ack 4520,5175,7246 [--note "why"]
+      const raw = getFlag('--shrink-ack') || ''
+      const ids = raw.split(/[,\s]+/).map(s => s.trim()).filter(s => /^\d+$/.test(s))
+      if (!ids.length) {
+        process.stdout.write(JSON.stringify({ ok: false, error: 'no valid rowids; usage: --shrink-ack 123,456' }) + '\n')
+      } else {
+        const db = getDb()
+        const now = Date.now()
+        const note = getFlag('--note') || null
+        const stmt = db.prepare(`
+          UPDATE memories
+          SET metadata = json_set(
+                json_set(COALESCE(NULLIF(metadata, ''), '{}'), '$.shrink_ack', ?),
+                '$.shrink_ack_note', ?)
+          WHERE rowid = ? AND deleted_at IS NULL
+        `)
+        let acked = 0
+        const missed = []
+        const tx = db.transaction(() => {
+          for (const id of ids) {
+            const r = stmt.run(now, note, id)
+            if (r.changes > 0) acked++; else missed.push(id)
+          }
+        })
+        tx()
+        log(`--shrink-ack: ${acked}/${ids.length} marked reviewed`)
+        process.stdout.write(JSON.stringify({ ok: true, acked, requested: ids.length, missed, at: new Date(now).toISOString(), note }, null, 2) + '\n')
+      }
+
     } else if (hasFlag('--extract-entities')) {
       // v2.5: async entity backfill (extract entities for unprocessed memories).
       //   --limit N  (default 100). No-op if ENTITY_LLM_* is not configured.
