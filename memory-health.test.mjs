@@ -258,6 +258,54 @@ function check(label, cond, detail = '') {
   db.close()
 }
 
+// ── (a3) shrink victims: collapse vs legitimate ledger rotation ──
+{
+  const { detectShrinkVictims } = await import('./memory-health.mjs')
+  const Database = (await import('better-sqlite3')).default
+  const db = new Database(DB_PATH)
+
+  const OPS = 'ops entry: http://10.0.0.5:9000 root, /api/svc/v1 routes, SVC_TOKEN and SVC_URL env, '
+    + 'code at E:/Project/svc/, handler src/http.mjs, schema src/db.mjs. '
+    + 'Padding so the row clears the 200B floor and has a real historical peak to measure against.'
+  const priors = (content) => JSON.stringify([{ content, summary: null, merged_at: Date.now(), source_rowid: 1, created_at: Date.now() }])
+  const ins = db.prepare(`INSERT INTO memories (content, summary, memory_type, category, importance, memory_level, access_count, prior_versions, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+  const t = Date.now()
+
+  // collapsed: high importance, shrank far below peak, identifiers gone
+  ins.run('svc status: now v2.', 'collapsed ref entry', 'long_term', 'general', 9, 'semi_abstract', 40, priors(OPS), t, t)
+  // ledger: rotates an old name out (so it DOES lose a token) yet still grows
+  // past its own peak — the daily-log shape, expected, must NOT flag
+  ins.run(OPS.replace('schema src/db.mjs. ', 'schema new/other.mjs. ')
+    + ' Plus a later section that makes this entry longer than any prior version, which is what a running ledger does every day.',
+    'growing ledger', 'long_term', 'general', 9, 'semi_abstract', 5, priors(OPS), t, t)
+  // low importance: shrank the same way but below the review bar
+  ins.run('svc status: now v2.', 'low-imp shrink', 'long_term', 'general', 4, 'semi_abstract', 1, priors(OPS), t, t)
+  // faithful rewrite: shorter prose, every identifier carried over
+  ins.run('http://10.0.0.5:9000 · /api/svc/v1 · SVC_TOKEN · SVC_URL · E:/Project/svc/ · src/http.mjs · src/db.mjs',
+    'faithful tightening', 'long_term', 'general', 9, 'semi_abstract', 3, priors(OPS), t, t)
+
+  const sh = detectShrinkVictims(db)
+  const by = (s) => sh.victims.filter(v => (v.summary || '').includes(s))
+  check('(a3) scan available', sh.available === true)
+  check('(a3) flags the collapsed reference entry', by('collapsed ref entry').length === 1,
+    `victims=${sh.victims.map(v => v.summary).join(' / ')}`)
+  check('(a3) growing ledger counted as rotation, not flagged',
+    by('growing ledger').length === 0 && sh.ledger_growing >= 1, `ledger_growing=${sh.ledger_growing}`)
+  check('(a3) below-importance shrink filtered out', by('low-imp shrink').length === 0)
+  check('(a3) faithful tightening not flagged', by('faithful tightening').length === 0)
+
+  const v = by('collapsed ref entry')[0]
+  check('(a3) names the lost identifiers',
+    !!v && ['SVC_TOKEN', 'SVC_URL', '/api/svc/v1', 'src/db.mjs'].every(tok => v.lost.includes(tok)),
+    JSON.stringify(v?.lost))
+  check('(a3) reports peak-relative ratio', !!v && v.ratio < 0.8 && v.peak_len > v.now_len,
+    `${v?.peak_len}->${v?.now_len} ratio=${v?.ratio}`)
+  check('(a3) honours a raised importance bar',
+    detectShrinkVictims(db, { shrinkMinImportance: 10 }).victims.length === 0)
+
+  db.close()
+}
+
 // Cleanup temp DB files
 for (const suffix of ['', '-shm', '-wal']) {
   const p = DB_PATH + suffix
