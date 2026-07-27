@@ -440,21 +440,28 @@ export function detectShrinkVictims(db, opts = {}) {
   try {
     rows = db.prepare(`
       SELECT rowid, COALESCE(NULLIF(summary, ''), substr(content, 1, 140)) AS summary,
-             content, prior_versions, importance, access_count, memory_level, ${flagSel}
+             content, prior_versions, importance, access_count, memory_level, ${flagSel},
+             CAST(COALESCE(json_extract(metadata, '$.shrink_ack'), 0) AS INTEGER) AS shrink_ack,
+             COALESCE(updated_at, created_at, 0) AS touched_at
       FROM memories
       WHERE deleted_at IS NULL AND superseded_by IS NULL
         AND prior_versions IS NOT NULL AND length(prior_versions) > 2
     `).all()
   } catch (e) {
-    return { available: false, reason: e.message, victims: [], scanned: 0, ledger_growing: 0, lost_any: 0 }
+    return { available: false, reason: e.message, victims: [], scanned: 0, ledger_growing: 0, lost_any: 0, acked: 0 }
   }
 
-  let lostAny = 0, ledgerGrowing = 0
+  let lostAny = 0, ledgerGrowing = 0, acked = 0
   const victims = []
   for (const r of rows) {
     let priors
     try { priors = JSON.parse(r.prior_versions) } catch { continue }
     if (!Array.isArray(priors) || !priors.length) continue
+
+    // A reviewer who looked and judged "acceptable" must not be asked again —
+    // a queue that re-reports the same rows every night trains you to skip it.
+    // The ack expires if the row is edited afterwards: new content, new question.
+    if (r.shrink_ack && r.shrink_ack >= r.touched_at) { acked++; continue }
 
     const nowTokens = new Set(extractHighSignalTokens(r.content))
     const lost = new Set()
@@ -490,7 +497,7 @@ export function detectShrinkVictims(db, opts = {}) {
   victims.sort((a, b) => (b.acc - a.acc) || (b.lost_count - a.lost_count))
   return {
     available: true, scanned: rows.length, lost_any: lostAny,
-    ledger_growing: ledgerGrowing, victims,
+    ledger_growing: ledgerGrowing, acked, victims,
   }
 }
 
@@ -608,7 +615,7 @@ export function renderTextReport(report, opts = {}) {
     const pr = report.thresholds.shrink_peak_ratio ?? DEFAULTS.shrinkPeakRatio
     L.push(`\n## (a3) shrink victims — supersede chains that dropped identifiers: ${sh.victims.length}`)
     L.push(`  scanned ${sh.scanned} chain(s) · ${sh.lost_any} lost >=1 identifier · ${sh.ledger_growing} still growing (ledger rotation, not a defect)`)
-    L.push(`  filter: importance>=${minImp} AND now/peak<${pr}, highest access_count first`)
+    L.push(`  filter: importance>=${minImp} AND now/peak<${pr}, highest access_count first${sh.acked ? `  ·  ${sh.acked} previously reviewed (node index.mjs --shrink-ack)` : ''}`)
     if (!sh.victims.length) L.push(`  (none)`)
     for (const v of sh.victims.slice(0, 20)) {
       L.push(`  #${v.rowid} imp=${v.imp}${v.protected ? ' [P]' : ''} acc=${v.acc} · ${v.hops} hop(s) · ${v.peak_len}B->${v.now_len}B (${Math.round(v.ratio * 100)}%) · lost ${v.lost_count}`)
