@@ -26,6 +26,7 @@ import { createHash } from 'node:crypto'
 import { applyMetaGate } from './meta-gate.mjs'
 import { parseTemporalWindow } from './lib/temporal-parser.mjs'
 import { expandRecallQuery } from './query-rewrite.mjs'
+import { checkSupersedeShrink } from './high-signal-tokens.mjs'
 import { normalizedFtsScore } from './recall-scoring.mjs'
 import {
   MAX_RECALL_CANDIDATES,
@@ -816,6 +817,24 @@ function _parseEventTime(v) {
   return null
 }
 
+// v2.10: supersede shrink guard.
+//
+// supersede means "this replaces that wholesale", but callers drift into writing
+// only the delta ("inventory is now 296") and let the rest fall off. Durable
+// facts — service URLs, env vars, API routes, code locations — then leak out of
+// `content` one version at a time. They survive in prior_versions[], but
+// memories_fts only indexes content/summary/tags, so a dropped fact is
+// unrecallable even though the audit trail still holds it. "Still in the DB"
+// and "still findable" quietly diverge, and only the recall side shows it.
+//
+// Observed: a 4-hop chain went 2076B -> 568B and took 8 operational identifiers
+// with it; the live head was a one-line status ticker.
+//
+// DETECTION ONLY — same contract as the near-dup and meta gates. Legitimate
+// splits and consolidations shrink too, so this reports and lets the caller judge.
+// Extraction lives in high-signal-tokens.mjs so memory-health.mjs audits history
+// with the exact same definition this gate applies at write time.
+
 /**
  * Store a memory
  * @param {Object} mem
@@ -957,6 +976,10 @@ export function storeMemory(mem, opts = {}) {
     )
 
     let newId = null
+    // v2.10: rows actually retired by this write, captured inside the tx so the
+    // shrink guard compares against what was really superseded (a rowid that was
+    // already deleted/superseded is skipped by priorsLoadStmt and never lands here).
+    const supersededOlds = []
     const tx = db.transaction(() => {
       // migration 008 (v2.6): re-check anchor/pinned quotas INSIDE the tx so
       // concurrent writers can't both slip past a full cap. Downgrade the
@@ -1018,6 +1041,7 @@ export function storeMemory(mem, opts = {}) {
             source_rowid: old.rowid,
             created_at: old.created_at,
           })
+          supersededOlds.push({ rowid: old.rowid, content: old.content })
         }
         if (priors.length > 0) {
           try { priorsUpdateStmt.run(JSON.stringify(priors), newId) } catch (e) {
@@ -1038,6 +1062,14 @@ export function storeMemory(mem, opts = {}) {
     // commits — the tx populated `quotaRejected` if any flag was reset.
     if (quotaRejected.length && opts.out) {
       opts.out.quotaRejected = quotaRejected
+    }
+    // v2.10: shrink guard runs after commit — the write always stands, the
+    // caller just gets told what the new version stopped carrying.
+    if (opts.out && supersededOlds.length) {
+      try {
+        const shrink = checkSupersedeShrink(mem.content, supersededOlds)
+        if (shrink.length) opts.out.supersedeShrink = shrink
+      } catch (e) { log(`supersede shrink check failed (id=${newId}): ${e.message}`) }
     }
     return newId
   } catch (e) {
@@ -1063,11 +1095,16 @@ function findNearDuplicates(db, embedding, excludeId, { topK = 5, threshold = 0.
   if (!_vecLoaded || !embedding) return []
   let cands
   try {
+    // superseded_by IS NULL matters here, not just deleted_at: storeMemory sets
+    // superseded_by synchronously but the soft delete only lands on the next
+    // expireMemories sweep. Without it, `supersedes:["N"]` still gets told
+    // "near-duplicate #N — consider superseding it" for the row it just retired.
     cands = db.prepare(`
       SELECT m.rowid AS id, m.summary, m.content, m.content_vector
       FROM (SELECT memory_rowid, distance FROM memories_vec WHERE embedding MATCH ? ORDER BY distance LIMIT ?) v
       JOIN memories m ON m.rowid = v.memory_rowid
-      WHERE m.rowid != ? AND m.deleted_at IS NULL AND m.content_vector IS NOT NULL AND m.content_vector != ''
+      WHERE m.rowid != ? AND m.deleted_at IS NULL AND m.superseded_by IS NULL
+        AND m.content_vector IS NOT NULL AND m.content_vector != ''
     `).all(new Float32Array(embedding), topK + 1, excludeId)
   } catch { return [] }
   const out = []

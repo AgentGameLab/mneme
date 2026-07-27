@@ -42,6 +42,7 @@ import { existsSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createRequire } from 'node:module'
+import { extractHighSignalTokens } from './high-signal-tokens.mjs'
 
 const require = createRequire(import.meta.url)
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -65,6 +66,10 @@ export const DEFAULTS = Object.freeze({
   // 0.85 was where per-category yield stayed reviewable (~75 pairs) — lower
   // floods with same-topic-different-fact pairs.
   simSupersede: 0.85,
+  // (a3) shrink victims: only reference entries worth a human look. Below
+  // these, a shrunk chain is usually a low-stakes note being tidied.
+  shrinkMinImportance: 8,
+  shrinkPeakRatio: 0.8,
   // Cosine histogram bucket edges (for the optional --dump-sim-hist calibration output).
   simBands: [0.85, 0.88, 0.90, 0.93, 0.95, 0.97, 0.99],
   // A concrete_trace row is "dead" if its access_count is 0 OR its decay_score is
@@ -410,6 +415,86 @@ export function detectNearDup(db, opts = {}) {
 }
 
 // ============================================================
+// (a3) shrink victims — chains that already collapsed
+//
+// The write-time guard in index.mjs catches this going forward. This finds the
+// rows where it already happened: walk prior_versions[] and ask which
+// high-signal identifiers the live content no longer carries.
+//
+// Two classes look identical by token count and are NOT the same thing:
+//   - a rolling ledger (daily log, running account) legitimately rotates old
+//     file names out while the entry keeps GROWING — expected, not a defect
+//   - a reference entry that SHRANK below its own historical peak while
+//     shedding identifiers — that is the collapse
+// Only the second is reported. Judging on lost tokens alone flags ~60% of all
+// chains and buries the real ones.
+// ============================================================
+export function detectShrinkVictims(db, opts = {}) {
+  const minImportance = opts.shrinkMinImportance ?? DEFAULTS.shrinkMinImportance
+  const peakRatio = opts.shrinkPeakRatio ?? DEFAULTS.shrinkPeakRatio
+  const cols = new Set(db.prepare(`PRAGMA table_info(memories)`).all().map(c => c.name))
+  const hasFlags = cols.has('is_anchor') && cols.has('is_pinned')
+  const flagSel = hasFlags ? 'is_anchor, is_pinned' : '0 AS is_anchor, 0 AS is_pinned'
+
+  let rows
+  try {
+    rows = db.prepare(`
+      SELECT rowid, COALESCE(NULLIF(summary, ''), substr(content, 1, 140)) AS summary,
+             content, prior_versions, importance, access_count, memory_level, ${flagSel}
+      FROM memories
+      WHERE deleted_at IS NULL AND superseded_by IS NULL
+        AND prior_versions IS NOT NULL AND length(prior_versions) > 2
+    `).all()
+  } catch (e) {
+    return { available: false, reason: e.message, victims: [], scanned: 0, ledger_growing: 0, lost_any: 0 }
+  }
+
+  let lostAny = 0, ledgerGrowing = 0
+  const victims = []
+  for (const r of rows) {
+    let priors
+    try { priors = JSON.parse(r.prior_versions) } catch { continue }
+    if (!Array.isArray(priors) || !priors.length) continue
+
+    const nowTokens = new Set(extractHighSignalTokens(r.content))
+    const lost = new Set()
+    for (const p of priors) {
+      for (const t of extractHighSignalTokens(p.content)) if (!nowTokens.has(t)) lost.add(t)
+    }
+    if (!lost.size) continue
+    lostAny++
+
+    const peakLen = Math.max(...priors.map(p => (p.content || '').length), 0)
+    const nowLen = (r.content || '').length
+    if (nowLen >= peakLen) { ledgerGrowing++; continue }   // still growing → ledger rotation
+    const ratio = peakLen ? +(nowLen / peakLen).toFixed(2) : 1
+    if (r.importance < minImportance || ratio >= peakRatio) continue
+
+    victims.push({
+      rowid: r.rowid,
+      imp: r.importance,
+      acc: r.access_count ?? 0,
+      level: (r.memory_level || '').slice(0, 4),
+      protected: !!(r.is_anchor || r.is_pinned),
+      hops: priors.length,
+      peak_len: peakLen,
+      now_len: nowLen,
+      ratio,
+      lost: [...lost].slice(0, 20),
+      lost_count: lost.size,
+      summary: clip(r.summary, 110),
+    })
+  }
+  // Highest recall traffic first: a collapsed entry nobody reads is a smaller
+  // problem than one being served hundreds of times a month.
+  victims.sort((a, b) => (b.acc - a.acc) || (b.lost_count - a.lost_count))
+  return {
+    available: true, scanned: rows.length, lost_any: lostAny,
+    ledger_growing: ledgerGrowing, victims,
+  }
+}
+
+// ============================================================
 // Orchestrator — opens the DB (readonly) and runs all five scans
 // ============================================================
 export function runMemoryHealth(opts = {}) {
@@ -425,6 +510,8 @@ export function runMemoryHealth(opts = {}) {
         sim_dup: opts.simDup ?? DEFAULTS.simDup,
         sim_floor: opts.simFloor ?? DEFAULTS.simFloor,
         sim_supersede: opts.simSupersede ?? DEFAULTS.simSupersede,
+        shrink_min_importance: opts.shrinkMinImportance ?? DEFAULTS.shrinkMinImportance,
+        shrink_peak_ratio: opts.shrinkPeakRatio ?? DEFAULTS.shrinkPeakRatio,
         stale_decay: opts.staleDecay ?? DEFAULTS.staleDecay,
         recall_window_days: opts.recallLogDays ?? DEFAULTS.recallLogDays,
         budget_ms: opts.budgetMs ?? DEFAULTS.budgetMs,
@@ -434,6 +521,7 @@ export function runMemoryHealth(opts = {}) {
       integrity: detectIntegrity(db, opts),
       blindspot: detectBlindspot(db, opts),
       near_dup: detectNearDup(db, opts),
+      shrink: detectShrinkVictims(db, opts),
       elapsed_ms: 0,
       warnings: [],
     }
@@ -468,6 +556,9 @@ export function renderTextReport(report, opts = {}) {
 
   L.push(`## TL;DR`)
   L.push(`- true-dup candidates (cos>=${simDup}): ${nd.dup_candidates.length} pair(s)  ·  near-dup for review (>=${simFloor}): ${nd.near_candidates.length}`)
+  if (report.shrink?.available) {
+    L.push(`- shrink victims (collapsed chains, imp>=${report.thresholds.shrink_min_importance ?? DEFAULTS.shrinkMinImportance}): ${report.shrink.victims.length}  ·  ${report.shrink.ledger_growing} growing-ledger rotations excluded`)
+  }
   L.push(`- dead concrete_trace: ${report.dead_concrete.length}`)
   L.push(`- inflation: meta ${inf.meta_pct}% / imp>=7 ${inf.imp_ge7_pct}% / imp>=9 ${inf.imp_ge9_pct}%  ·  concrete imp>5 violations ${inf.concrete_importance_violations}  ·  meta zero-access downgrade candidates ${inf.meta_zero_access_downgrade_candidates}`)
   L.push(`- supersede chain: ${ig.orphan_targets} orphan / ${ig.leaked_active} leaked-active (both should be 0)  ·  dead_knowledge(${ig.dead_knowledge_days}d): ${ig.dead_knowledge_count}`)
@@ -510,6 +601,22 @@ export function renderTextReport(report, opts = {}) {
     L.push(`     ${newerA ? 'old' : 'NEW'} ${mark(d.b)} imp=${d.b.imp} ${d.b.level} acc=${d.b.acc} age=${d.b.age_days}d: ${d.b.summary}`)
   }
   if (sc.length > 40) L.push(`  ... ${sc.length - 40} more (use --format json for the full list)`)
+
+  const sh = report.shrink
+  if (sh?.available) {
+    const minImp = report.thresholds.shrink_min_importance ?? DEFAULTS.shrinkMinImportance
+    const pr = report.thresholds.shrink_peak_ratio ?? DEFAULTS.shrinkPeakRatio
+    L.push(`\n## (a3) shrink victims — supersede chains that dropped identifiers: ${sh.victims.length}`)
+    L.push(`  scanned ${sh.scanned} chain(s) · ${sh.lost_any} lost >=1 identifier · ${sh.ledger_growing} still growing (ledger rotation, not a defect)`)
+    L.push(`  filter: importance>=${minImp} AND now/peak<${pr}, highest access_count first`)
+    if (!sh.victims.length) L.push(`  (none)`)
+    for (const v of sh.victims.slice(0, 20)) {
+      L.push(`  #${v.rowid} imp=${v.imp}${v.protected ? ' [P]' : ''} acc=${v.acc} · ${v.hops} hop(s) · ${v.peak_len}B->${v.now_len}B (${Math.round(v.ratio * 100)}%) · lost ${v.lost_count}`)
+      L.push(`     ${v.summary}`)
+      L.push(`     lost: ${v.lost.slice(0, 6).join(' | ')}${v.lost_count > 6 ? ` ...+${v.lost_count - 6}` : ''}`)
+    }
+    if (sh.victims.length > 20) L.push(`  ... ${sh.victims.length - 20} more (use --format json for the full list)`)
+  }
 
   L.push(`\n## (b) inflation & level<->importance audit`)
   L.push(`  level: ${inf.level.map(r => `${r.lvl}=${r.c}(${r.pct}%)`).join(' / ')}`)
