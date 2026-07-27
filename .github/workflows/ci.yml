@@ -49,6 +49,10 @@ jobs:
           TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-anchor-pinned.db
         run: node anchor-pinned.integration.test.mjs
 
+      - name: Integration test (provenance + quarantine)
+        env:
+          TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-provenance.db
+        run: node provenance-quarantine.integration.test.mjs
       - name: Integration test (supersede shrink guard)
         env:
           TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-supersede-shrink.db

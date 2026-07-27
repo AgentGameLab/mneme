@@ -27,6 +27,7 @@ import { applyMetaGate } from './meta-gate.mjs'
 import { parseTemporalWindow } from './lib/temporal-parser.mjs'
 import { expandRecallQuery } from './query-rewrite.mjs'
 import { checkSupersedeShrink } from './high-signal-tokens.mjs'
+import { HOST_LABEL_RE } from './auth.mjs'
 import { normalizedFtsScore } from './recall-scoring.mjs'
 import {
   MAX_RECALL_CANDIDATES,
@@ -436,6 +437,65 @@ export function initMemory() {
     )
   `)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_recall_traces_started ON recall_traces(started_at DESC)`)
+
+  // NOTE ON NUMBERING: 011/012 below shipped as 009/010 in a downstream runtime
+  // copy before 009 (locations) and 010 (recall trace) existed here — the two
+  // sides grew apart and reused numbers. Renumbered on the way up. Safe to
+  // renumber because this schema has no version counter: every migration is
+  // guarded by its own existence check (isDupColumn for ALTER, IF NOT EXISTS
+  // for CREATE), so re-running against a DB that already has these objects
+  // is a no-op.
+  // migration 011: source_host — which agent RUNTIME wrote the row (cc /
+  // codex / ...). Distinct axis from source_platform (which SURFACE the
+  // conversation happened on: feishu / desktop). Stamped by the serving layer
+  // from channel auth (auth.mjs bearer token → host map); client-supplied
+  // claims never reach this column — provenance is evidence, evidence comes
+  // from the channel. NULL = pre-provenance rows / auth-off writes.
+  try {
+    db.exec(`ALTER TABLE memories ADD COLUMN source_host TEXT`)
+    log('Migration 011: added source_host column')
+  } catch (e) { if (!isDupColumn(e)) throw e }
+  try {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_source_host ON memories(source_host) WHERE source_host IS NOT NULL AND deleted_at IS NULL`)
+  } catch {}
+
+  // migration 012: memories_quarantine — write isolation for
+  // not-yet-trusted hosts (Unified Agent dogfood). Quarantined writes live in
+  // a SEPARATE table so the main recall pool cannot see them BY CONSTRUCTION —
+  // no recall path needs to remember a WHERE filter (same philosophy as
+  // channel-derived provenance: structural guarantees over per-call-site
+  // discipline). Approval moves a row into `memories` preserving provenance
+  // and original created_at; requested supersedes execute only on approval.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS memories_quarantine (
+        qid INTEGER PRIMARY KEY AUTOINCREMENT,
+        content TEXT NOT NULL CHECK (length(content) > 0),
+        summary TEXT,
+        memory_type TEXT NOT NULL DEFAULT 'long_term',
+        category TEXT NOT NULL DEFAULT 'general',
+        importance INTEGER NOT NULL DEFAULT 5,
+        memory_level TEXT NOT NULL DEFAULT 'semi_abstract',
+        tags TEXT DEFAULT '[]',
+        supersedes_requested TEXT DEFAULT '[]',
+        event_time INTEGER,
+        content_hash TEXT,
+        source TEXT DEFAULT 'conversation',
+        source_platform TEXT DEFAULT 'unknown',
+        source_host TEXT,
+        metadata TEXT DEFAULT '{}',
+        created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+        review_status TEXT NOT NULL DEFAULT 'pending'
+          CHECK (review_status IN ('pending', 'approved', 'rejected')),
+        reviewed_at INTEGER,
+        review_note TEXT,
+        merged_rowid TEXT
+      )
+    `)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_quar_status ON memories_quarantine(review_status, created_at DESC)`)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_quar_host ON memories_quarantine(source_host, review_status)`)
+    log('Migration 012: memories_quarantine table ready')
+  } catch (e) { log(`Migration 012 (quarantine) failed: ${e.message}`) }
 
   // Migration: memories.source CHECK constraint add 'compression'
   // SQLite doesn't support ALTER CHECK -> check if current CHECK includes 'compression', rebuild if not
@@ -908,6 +968,14 @@ export function storeMemory(mem, opts = {}) {
   const contentHash = createHash('sha256').update(String(mem.content || '')).digest('hex').slice(0, 16)
   const eventTime = _parseEventTime(mem.eventTime)
 
+  // migration 011: source_host provenance. Validated but NEVER defaulted here —
+  // only the serving layer (channel auth) may assert a host. Absence stays NULL
+  // so unlabeled writes are visibly unlabeled rather than silently attributed.
+  // The MCP tool schema has no source field at all, so LLM callers structurally
+  // cannot forge this.
+  const sourceHost = (typeof mem.sourceHost === 'string' && HOST_LABEL_RE.test(mem.sourceHost.trim()))
+    ? mem.sourceHost.trim() : null
+
   // migration 008 (v2.6): is_anchor / is_pinned scarcity quota.
   // Hard caps force callers to trade off instead of inflating importance to
   // 9-10 for everything. DETECTION ONLY — over-quota resets the flag to 0
@@ -960,8 +1028,8 @@ export function storeMemory(mem, opts = {}) {
         (content, summary, memory_type, category, importance, emotional_impact,
          source, source_id, source_platform, tags, metadata, expires_at,
          compressed_from, is_compressed, memory_level, content_hash, event_time,
-         is_anchor, is_pinned)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         is_anchor, is_pinned, source_host)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
     const supersedeStmt = db.prepare(
       `UPDATE memories SET superseded_by = ? WHERE rowid = ? AND deleted_at IS NULL AND superseded_by IS NULL`
@@ -969,7 +1037,7 @@ export function storeMemory(mem, opts = {}) {
     // migration 003: paper trail — on supersede, push old content/summary/ts into the
     // new record's prior_versions[] (chained: absorbs old's own prior_versions too)
     const priorsLoadStmt = db.prepare(
-      `SELECT rowid, content, summary, created_at, prior_versions FROM memories WHERE rowid = ?`
+      `SELECT rowid, content, summary, created_at, prior_versions, source_host FROM memories WHERE rowid = ?`
     )
     const priorsUpdateStmt = db.prepare(
       `UPDATE memories SET prior_versions = ? WHERE rowid = ?`
@@ -1021,6 +1089,7 @@ export function storeMemory(mem, opts = {}) {
         eventTime,      // migration 004 (v2.2)
         isAnchor,       // migration 008 (v2.6)
         isPinned,       // migration 008 (v2.6)
+        sourceHost,     // migration 011: channel-derived provenance
       )
       newId = info.lastInsertRowid ? String(info.lastInsertRowid) : null
 
@@ -1040,6 +1109,10 @@ export function storeMemory(mem, opts = {}) {
             merged_at: now,
             source_rowid: old.rowid,
             created_at: old.created_at,
+            // migration 011: provenance rides the lineage chain — even after N
+            // supersede/merge rounds you can still see which host wrote each
+            // absorbed version.
+            source_host: old.source_host ?? null,
           })
           supersededOlds.push({ rowid: old.rowid, content: old.content })
         }
@@ -1075,6 +1148,170 @@ export function storeMemory(mem, opts = {}) {
   } catch (e) {
     log(`storeMemory failed: ${e.message}`)
     return null
+  }
+}
+
+// ── Quarantine layer (migration 012) ──────────────────────
+// Writes from not-yet-trusted hosts land in memories_quarantine — a separate
+// table the recall paths never touch. The primary-host agent reviews each
+// entry ("would I have stored this?") and approves it into the main pool or
+// rejects it with a reason. Approval preserves provenance (source_host) and
+// the ORIGINAL created_at, and only then executes any requested supersedes —
+// a quarantined row must not retire main-pool memories before review.
+
+export function storeMemoryQuarantined(mem, opts = {}) {
+  const db = getDb()
+  const now = Date.now()
+
+  // Same meta-gate as the main store — the writing agent gets downgrade
+  // feedback immediately, not at review time.
+  const validLevels = ['concrete_trace', 'semi_abstract', 'meta_knowledge']
+  const requestedLevel = validLevels.includes(mem.memoryLevel) ? mem.memoryLevel : 'semi_abstract'
+  const gate = applyMetaGate(mem.content || '', requestedLevel)
+  if (gate.downgraded && opts.out) {
+    opts.out.metaDowngrade = { fromLevel: 'meta_knowledge', toLevel: 'semi_abstract', reasons: gate.reasons }
+  }
+
+  // v2.10: encoding-damage detection (Codex Desktop CJK -> '?' mojibake).
+  if (opts.out) {
+    const dmg = detectEncodingDamage(mem.content, mem.summary)
+    if (dmg) opts.out.encodingWarning = dmg
+  }
+
+  const sourceHost = (typeof mem.sourceHost === 'string' && HOST_LABEL_RE.test(mem.sourceHost.trim()))
+    ? mem.sourceHost.trim() : null
+  const supersedes = Array.isArray(mem.supersedes)
+    ? mem.supersedes.filter(s => typeof s === 'string' && /^\d+$/.test(s.trim())).map(s => s.trim())
+    : []
+  const contentHash = createHash('sha256').update(String(mem.content || '')).digest('hex').slice(0, 16)
+
+  // Same 5-min retry-dedup as the main store, scoped to pending rows
+  try {
+    const dup = db.prepare(`
+      SELECT qid FROM memories_quarantine
+      WHERE content_hash = ? AND created_at > ? AND review_status = 'pending'
+      ORDER BY created_at DESC LIMIT 1
+    `).get(contentHash, now - DEDUP_WINDOW_MS)
+    if (dup) {
+      log(`storeMemoryQuarantined: dedup hit -> qid=${dup.qid} (5-min window)`)
+      return String(dup.qid)
+    }
+  } catch {}
+
+  try {
+    const info = db.prepare(`
+      INSERT INTO memories_quarantine
+        (content, summary, memory_type, category, importance, memory_level,
+         tags, supersedes_requested, event_time, content_hash,
+         source, source_platform, source_host, metadata)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      mem.content, mem.summary || null,
+      mem.memoryType || 'long_term', mem.category || 'general',
+      mem.importance || 5, gate.finalLevel,
+      JSON.stringify(mem.tags || []), JSON.stringify(supersedes),
+      _parseEventTime(mem.eventTime), contentHash,
+      mem.source || 'conversation', mem.sourcePlatform || 'unknown',
+      sourceHost, JSON.stringify(mem.metadata || {}),
+    )
+    log(`storeMemoryQuarantined: qid=${info.lastInsertRowid} host=${sourceHost || '(null)'}`)
+    return String(info.lastInsertRowid)
+  } catch (e) {
+    log(`storeMemoryQuarantined failed: ${e.message}`)
+    return null
+  }
+}
+
+export function listQuarantine({ status = 'pending', host, limit = 20 } = {}) {
+  const db = getDb()
+  const clauses = [], params = []
+  if (status && status !== 'all') { clauses.push('review_status = ?'); params.push(status) }
+  if (host) { clauses.push('source_host = ?'); params.push(host) }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
+  try {
+    return db.prepare(`
+      SELECT * FROM memories_quarantine ${where}
+      ORDER BY created_at ASC
+      LIMIT ?
+    `).all(...params, Math.max(1, Math.min(100, limit))).map(r => ({
+      ...r,
+      tags: safeJsonParse(r.tags, []),
+      supersedes_requested: safeJsonParse(r.supersedes_requested, []),
+      metadata: safeJsonParse(r.metadata, {}),
+    }))
+  } catch (e) {
+    log(`listQuarantine failed: ${e.message}`)
+    return []
+  }
+}
+
+export async function resolveQuarantine(qid, { action, note } = {}) {
+  const db = getDb()
+  const now = Date.now()
+  const id = String(qid).trim()
+  if (!/^\d+$/.test(id)) return { ok: false, error: 'invalid qid' }
+  const row = db.prepare(`SELECT * FROM memories_quarantine WHERE qid = ?`).get(id)
+  if (!row) return { ok: false, error: `qid ${id} not found` }
+  if (row.review_status !== 'pending') {
+    return { ok: false, error: `qid ${id} already ${row.review_status}${row.merged_rowid ? ` (merged as ${row.merged_rowid})` : ''}` }
+  }
+
+  if (action === 'reject') {
+    db.prepare(`UPDATE memories_quarantine SET review_status='rejected', reviewed_at=?, review_note=? WHERE qid=?`)
+      .run(now, note || null, id)
+    log(`resolveQuarantine: qid=${id} rejected (${note ? 'reason recorded' : 'no reason'})`)
+    return { ok: true, action: 'rejected', qid: id }
+  }
+  if (action !== 'approve') return { ok: false, error: `unknown action '${action}'` }
+
+  const out = {}
+  const newId = await storeMemoryAsync({
+    content: row.content,
+    summary: row.summary || undefined,
+    memoryType: row.memory_type,
+    category: row.category,
+    importance: row.importance,
+    memoryLevel: row.memory_level,
+    tags: safeJsonParse(row.tags, []),
+    supersedes: safeJsonParse(row.supersedes_requested, []),
+    eventTime: row.event_time ?? undefined,
+    source: row.source || 'conversation',
+    sourcePlatform: row.source_platform || 'unknown',
+    sourceHost: row.source_host || undefined,
+  }, { out })
+  if (!newId) return { ok: false, error: 'main-pool insert failed (see server log)' }
+
+  // Keep the ORIGINAL write time — created_at means "when it was recorded",
+  // and it was recorded when the quarantined host wrote it, not when the
+  // reviewer approved it. reviewed_at on the quarantine row holds approval time.
+  try { db.prepare(`UPDATE memories SET created_at=? WHERE rowid=?`).run(row.created_at, newId) } catch {}
+
+  db.prepare(`UPDATE memories_quarantine SET review_status='approved', reviewed_at=?, review_note=?, merged_rowid=? WHERE qid=?`)
+    .run(now, note || null, String(newId), id)
+  log(`resolveQuarantine: qid=${id} approved -> memories rowid=${newId}`)
+  return { ok: true, action: 'approved', qid: id, merged_rowid: String(newId), metaDowngrade: out.metaDowngrade || null }
+}
+
+// Per-host review stats — the trust record that decides when a quarantined
+// host graduates to direct writes (rejection rate → write_policy flip).
+export function getQuarantineStats() {
+  const db = getDb()
+  try {
+    const rows = db.prepare(`
+      SELECT review_status AS status, source_host AS host, COUNT(*) AS n
+      FROM memories_quarantine GROUP BY review_status, source_host
+    `).all()
+    const totals = { pending: 0, approved: 0, rejected: 0 }
+    const byHost = {}
+    for (const r of rows) {
+      totals[r.status] = (totals[r.status] || 0) + r.n
+      const h = r.host || '(null)'
+      byHost[h] = byHost[h] || { pending: 0, approved: 0, rejected: 0 }
+      byHost[h][r.status] = (byHost[h][r.status] || 0) + r.n
+    }
+    return { ...totals, byHost }
+  } catch {
+    return { pending: 0, approved: 0, rejected: 0, byHost: {} }
   }
 }
 
