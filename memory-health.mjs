@@ -246,12 +246,35 @@ export function detectBlindspot(db, opts = {}) {
   const minFreq = opts.repeatQueryMin ?? DEFAULTS.repeatQueryMin
   const since = Date.now() - days * 86400_000
   // Not every mneme deployment writes to recall_log — it's optional
-  // instrumentation. Skip cleanly if the table is missing or empty.
+  // instrumentation. Skip cleanly if the table is missing.
   let hasRecallLog = true
   try { db.prepare(`SELECT 1 FROM recall_log LIMIT 1`).get() } catch { hasRecallLog = false }
-  if (!hasRecallLog) return { available: false, reason: 'recall_log table not present' }
+  if (!hasRecallLog) return { available: false, reason: 'recall_log table not present (this build does not instrument recall)' }
+
   const total = db.prepare(`SELECT COUNT(*) c FROM recall_log WHERE ts > ?`).get(since).c
-  if (total === 0) return { available: false, reason: `no recall_log rows in the last ${days} days` }
+  if (total === 0) {
+    // "Never instrumented" and "was instrumented, then went silent" are very
+    // different facts, and the old message said the same bland thing for both.
+    // A refactor that drops the write call leaves the table and its history
+    // intact, so this scan degrades to "not available" and stays quiet — which
+    // is how one real deployment lost 13 days of recall telemetry unnoticed.
+    // If there is history but nothing recent, say so loudly.
+    const hist = db.prepare(`SELECT COUNT(*) c, MAX(ts) last_ts FROM recall_log`).get()
+    if (hist.c > 0 && hist.last_ts) {
+      const silentDays = Math.floor((Date.now() - hist.last_ts) / 86400_000)
+      return {
+        available: false,
+        instrumentation_stalled: true,
+        total_rows: hist.c,
+        last_write_at: new Date(hist.last_ts).toISOString(),
+        silent_days: silentDays,
+        reason: `recall_log STALLED — ${hist.c} historical rows but nothing for ${silentDays}d `
+          + `(last write ${new Date(hist.last_ts).toISOString().slice(0, 16)}Z). `
+          + `The table survived but something stopped writing to it — check whether a refactor dropped the log call.`,
+      }
+    }
+    return { available: false, reason: `no recall_log rows in the last ${days} days` }
+  }
   const bySource = db.prepare(`SELECT source, COUNT(*) c FROM recall_log WHERE ts > ? GROUP BY source ORDER BY c DESC`).all(since)
   const strictZero = db.prepare(`SELECT COUNT(*) c FROM recall_log WHERE ts > ? AND hit_count = 0`).get(since).c
   const finalZero = db.prepare(`SELECT COUNT(*) c FROM recall_log WHERE ts > ? AND final_hit_count = 0`).get(since).c
@@ -571,6 +594,8 @@ export function renderTextReport(report, opts = {}) {
   L.push(`- supersede chain: ${ig.orphan_targets} orphan / ${ig.leaked_active} leaked-active (both should be 0)  ·  dead_knowledge(${ig.dead_knowledge_days}d): ${ig.dead_knowledge_count}`)
   if (bs.available) {
     L.push(`- recall_log(${bs.window_days}d): ${bs.total_calls} calls  ·  strict-zero ${bs.strict_zero} / RRF-zero ${bs.final_zero}  ·  repeat queries (non-noise) ${bs.repeat_queries.length}`)
+  } else if (bs.instrumentation_stalled) {
+    L.push(`- 🚨 recall_log STALLED: ${bs.total_rows} rows, silent ${bs.silent_days}d (last ${bs.last_write_at?.slice(0, 16)}Z) — the writer is gone, not the data`)
   } else {
     L.push(`- recall_log: not available (${bs.reason || 'unknown'})`)
   }

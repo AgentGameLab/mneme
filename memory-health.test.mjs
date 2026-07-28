@@ -322,6 +322,54 @@ function check(label, cond, detail = '') {
   db.close()
 }
 
+// ── (d) blindspot: "never instrumented" vs "instrumented then went silent" ──
+// These used to render the same bland "not available", which is how one real
+// deployment lost 13 days of recall telemetry without anyone noticing: a
+// refactor dropped the write call, the table and its history stayed put, and
+// the scan quietly degraded.
+{
+  const { detectBlindspot } = await import('./memory-health.mjs')
+  const Database = (await import('better-sqlite3')).default
+  const db = new Database(DB_PATH)
+
+  const noTable = detectBlindspot(db)
+  check('(d) missing recall_log reads as "not instrumented"',
+    noTable.available === false && !noTable.instrumentation_stalled && /not present/.test(noTable.reason),
+    JSON.stringify(noTable))
+
+  db.exec(`CREATE TABLE IF NOT EXISTS recall_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, source TEXT, session_id TEXT,
+    query TEXT, hit_ids TEXT, hit_count INTEGER, duration_ms INTEGER,
+    filter_level TEXT, filter_min_importance INTEGER, query_path TEXT, final_hit_count INTEGER)`)
+
+  const empty = detectBlindspot(db)
+  check('(d) empty table is not reported as stalled',
+    empty.available === false && !empty.instrumentation_stalled, JSON.stringify(empty))
+
+  // History, but nothing recent — the failure mode worth shouting about.
+  const old = Date.now() - 13 * 86400_000
+  const ins = db.prepare(`INSERT INTO recall_log (ts, source, query, hit_ids, hit_count, duration_ms, query_path, final_hit_count) VALUES (?,?,?,?,?,?,?,?)`)
+  for (let i = 0; i < 5; i++) ins.run(old, 'context-builder', `historical query ${i}`, '[1]', 1, 10, 'hybrid', 1)
+
+  const stalled = detectBlindspot(db)
+  check('(d) history + no recent writes flags instrumentation_stalled',
+    stalled.instrumentation_stalled === true, JSON.stringify(stalled).slice(0, 160))
+  check('(d) stalled report carries row count and silent duration',
+    stalled.total_rows === 5 && stalled.silent_days >= 12 && !!stalled.last_write_at,
+    `rows=${stalled.total_rows} days=${stalled.silent_days}`)
+  check('(d) stalled reason points at the dropped writer, not the data',
+    /STALLED/.test(stalled.reason) && /writing/.test(stalled.reason), stalled.reason)
+
+  // Fresh writes bring it back to a normal report.
+  ins.run(Date.now(), 'context-builder', 'a live query', '[1]', 1, 10, 'hybrid', 1)
+  const live = detectBlindspot(db)
+  check('(d) a recent write clears the stall and re-enables the scan',
+    live.available === true && !live.instrumentation_stalled, JSON.stringify(live).slice(0, 120))
+
+  db.exec('DROP TABLE recall_log')
+  db.close()
+}
+
 // Cleanup temp DB files
 for (const suffix of ['', '-shm', '-wal']) {
   const p = DB_PATH + suffix
