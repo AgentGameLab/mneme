@@ -51,7 +51,9 @@ export function extractHighSignalTokens(text) {
 
 /**
  * @param {string} newContent content of the record doing the superseding
- * @param {Array<{rowid:number|string, content:string}>} olds rows being superseded
+ * @param {Array<{rowid:number|string, content:string, peakLen?:number}>} olds rows being
+ *   superseded. `peakLen` is the longest this entry has ever been (its own content and
+ *   every prior version); when supplied it enables the ledger exemption below.
  * @returns {Array<{id,oldLen,newLen,ratio,dropped,droppedCount}>} one entry per suspicious pair
  */
 export function checkSupersedeShrink(newContent, olds) {
@@ -63,6 +65,24 @@ export function checkSupersedeShrink(newContent, olds) {
   const oneToOne = olds.length === 1
   for (const old of olds) {
     const oldLen = (old.content || '').length
+
+    // Ledger exemption — mirrors detectShrinkVictims in memory-health.mjs.
+    // A rolling entry (daily log, running account) rotates yesterday's file names
+    // out while the entry itself keeps GROWING past its own historical peak. That
+    // is the shape working as intended, not a collapse. Without this the write-time
+    // guard fires on every single daily-log supersede, and a gate that cries wolf
+    // daily is a gate you stop reading.
+    //
+    // Judged against the all-time peak, not just the row being replaced: comparing
+    // only to the immediate predecessor would exempt a genuine collapse that happens
+    // to be a little longer than the already-shrunken version before it.
+    //
+    // 1:1 only. In an N:1 merge the result is naturally longer than any single
+    // input, so "longer than what it replaced" carries no information about
+    // rotation — applying it there silently swallowed real merge losses.
+    const peakLen = Math.max(old.peakLen || 0, oldLen)
+    if (oneToOne && newLen >= peakLen) continue
+
     const dropped = extractHighSignalTokens(old.content).filter(t => !newTokens.has(t))
     const ratio = oldLen ? +(newLen / oldLen).toFixed(2) : 1
     const shrank = oneToOne && oldLen >= SHRINK_MIN_OLD_LEN && ratio < SHRINK_RATIO_FLOOR

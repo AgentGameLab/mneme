@@ -1114,7 +1114,16 @@ export function storeMemory(mem, opts = {}) {
             // absorbed version.
             source_host: old.source_host ?? null,
           })
-          supersededOlds.push({ rowid: old.rowid, content: old.content })
+          // peakLen = the longest this entry has ever been, so the shrink guard can
+          // tell a growing ledger from a collapsing reference (same rule the (a3)
+          // audit applies). oldPriors is already parsed above for the paper trail.
+          let peakLen = (old.content || '').length
+          try {
+            for (const p of JSON.parse(old.prior_versions || '[]')) {
+              peakLen = Math.max(peakLen, (p.content || '').length)
+            }
+          } catch {}
+          supersededOlds.push({ rowid: old.rowid, content: old.content, peakLen })
         }
         if (priors.length > 0) {
           try { priorsUpdateStmt.run(JSON.stringify(priors), newId) } catch (e) {
