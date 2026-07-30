@@ -58,6 +58,11 @@ jobs:
           TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-supersede-shrink.db
         run: node supersede-shrink.integration.test.mjs
 
+      - name: Integration test (HTTP /recall endpoint + hook fallback)
+        env:
+          TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-recall-endpoint.db
+        run: node recall-endpoint.integration.test.mjs
+
       - name: End-to-end test (hooks)
         env:
           TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-hooks.db

@@ -896,6 +896,92 @@ function _parseEventTime(v) {
 // with the exact same definition this gate applies at write time.
 
 /**
+ * Filtered hybrid recall, shared by the `--recall` CLI and the HTTP /recall
+ * endpoint so the two cannot drift apart. Callers that spawn a process per
+ * recall pay ~1.6s of node startup for a query that takes single-digit ms;
+ * the endpoint exists so hooks can reuse the already-warm server instead.
+ *
+ * @param {Object} o
+ * @param {string} o.query
+ * @param {number} [o.limit=10] rows the caller wants back
+ * @param {number} [o.minImportance=0] importance floor (0 = no filter)
+ * @param {string[]} [o.levels] memory_level allowlist
+ * @param {boolean} [o.requireVec] keep only rows with vector evidence
+ * @param {string} [o.source] recall_log label
+ * @param {string} [o.sessionId] recall_log session
+ * @returns {Promise<Object>} { hits, count, requested_limit, effective_limit, candidate_limit, capped, trace_id }
+ */
+export async function recallForClients(o = {}) {
+  const query = o.query || ''
+  const limit = Number.isFinite(o.limit) ? o.limit : 10
+  const minImportance = Number.isFinite(o.minImportance) ? o.minImportance : 0
+  const levels = Array.isArray(o.levels) ? o.levels.filter(Boolean) : []
+
+  // Over-fetch when filtering, so the post-filter has something to keep. Probed
+  // on a real 8k-row DB: widening this pool 10x changed 1 result in 40, so 30 is
+  // enough — the filters are not silently truncating the eligible set.
+  const candidatePoolSize = (minImportance > 0 || levels.length > 0) ? Math.max(limit * 3, 30) : limit
+
+  const out = {}
+  let memories = await recallMemoriesHybrid({
+    query,
+    limit: candidatePoolSize,
+    _source: o.source || 'unknown',
+    _sessionId: o.sessionId || null,
+    _filterLevel: levels.length ? levels.join(',') : null,
+    _minImportance: minImportance > 0 ? minImportance : null,
+    _out: out,
+  })
+
+  if (minImportance > 0) memories = memories.filter(m => (m.importance || 0) >= minImportance)
+  if (levels.length > 0) memories = memories.filter(m => levels.includes(m.memory_level))
+  // requireVec: keep only rows with vector evidence, BEFORE the slice. Chinese
+  // char-level FTS OR-matches flood the RRF pool and evict semantic hits; inject
+  // callers need the vec rows to survive. With embedding down this yields 0 rows —
+  // fail-closed is correct for inject paths.
+  if (o.requireVec) memories = memories.filter(m => typeof m.vec_distance === 'number')
+  const trace = memories.recallTrace
+  memories = memories.slice(0, limit)
+
+  // hit_count is the raw pool; final_hit_count is what survived filtering and
+  // actually reached the caller. Without this the utilization stats read as if
+  // every candidate got used.
+  if (out.recallLogId) {
+    try {
+      getDb().prepare('UPDATE recall_log SET final_hit_count = ? WHERE id = ?')
+        .run(memories.length, out.recallLogId)
+    } catch {}
+  }
+
+  const hits = memories.map(m => ({
+    id: m.rowid,
+    content: m.content,
+    summary: m.summary || null,
+    importance: m.importance,
+    memory_level: m.memory_level,
+    memory_type: m.memory_type,
+    tags: Array.isArray(m.tags) ? m.tags : [],
+    score: typeof m.score === 'number' ? m.score : null,
+    created_at: m.created_at,
+    recall_sources: Array.isArray(m.recall_sources) ? m.recall_sources : [],
+    vec_distance: typeof m.vec_distance === 'number' ? m.vec_distance : null,
+  }))
+
+  // Capacity signals: a caller passing limit 50 needs to know it got 20 back
+  // because of the recall contract, not because only 20 matched.
+  const effectiveLimit = trace?.effectiveLimit ?? limit
+  return {
+    hits,
+    count: hits.length,
+    requested_limit: limit,
+    effective_limit: effectiveLimit,
+    candidate_limit: trace?.candidateLimit ?? candidatePoolSize,
+    capped: limit > effectiveLimit,
+    trace_id: trace?.traceId ?? null,
+  }
+}
+
+/**
  * Store a memory
  * @param {Object} mem
  * @returns {string|null} memory id
@@ -3776,52 +3862,18 @@ if (_isMain) {
       const levelFilter = levelArg ? levelArg.split(',').map(s => s.trim()).filter(Boolean) : []
       const format = getFlag('--format') || 'text'
 
-      const candidatePoolSize = (minImportance > 0 || levelFilter.length > 0) ? Math.max(limit * 3, 30) : limit
-      // hybrid path: FTS5 + embedding semantic + RRF (auto fallback to sync when vec/embedding unavailable)
-      let memories = await recallMemoriesHybrid({
-        query,
-        limit: candidatePoolSize,
+      // Shared with the HTTP /recall endpoint so the two cannot drift.
+      const res = await recallForClients({
+        query, limit, minImportance, levels: levelFilter,
+        requireVec: hasFlag('--require-vec'),
+        source: getFlag('--source') || 'cli',
+        sessionId: getFlag('--session-id') || null,
       })
-
-      if (minImportance > 0) memories = memories.filter(m => (m.importance || 0) >= minImportance)
-      if (levelFilter.length > 0) memories = memories.filter(m => levelFilter.includes(m.memory_level))
-      // --require-vec (v2.3): keep only rows with vector evidence, BEFORE the slice.
-      // Chinese char-level FTS OR-matches flood the RRF pool and evict semantic hits
-      // (rank-flatten); semantic-inject callers need the vec rows to survive. With
-      // embedding down this yields 0 rows — fail-closed is correct for inject paths.
-      if (hasFlag('--require-vec')) memories = memories.filter(m => typeof m.vec_distance === 'number')
-      memories = memories.slice(0, limit)
+      const memories = res.hits
 
       if (format === 'json') {
-        const hits = memories.map(m => ({
-          id: m.rowid,
-          content: m.content,
-          summary: m.summary || null,
-          importance: m.importance,
-          memory_level: m.memory_level,
-          memory_type: m.memory_type,
-          tags: Array.isArray(m.tags) ? m.tags : [],
-          score: typeof m.score === 'number' ? m.score : null,
-          created_at: m.created_at,
-          // semantic-inject gating signals (v2.3): which paths hit + raw vec distance
-          recall_sources: Array.isArray(m.recall_sources) ? m.recall_sources : [],
-          vec_distance: typeof m.vec_distance === 'number' ? m.vec_distance : null,
-        }))
-        // Recall-contract capacity signals (v2.9): a caller passing --limit 50
-        // needs to know they got 20 back because of the contract, not because
-        // only 20 memories matched. `capped` fires only when the contract
-        // actually clipped requested (mneme#7 P0 review).
-        const trace = memories.recallTrace
-        const effectiveLimit = trace?.effectiveLimit ?? limit
-        process.stdout.write(JSON.stringify({
-          hits,
-          count: hits.length,
-          requested_limit: limit,
-          effective_limit: effectiveLimit,
-          candidate_limit: trace?.candidateLimit ?? candidatePoolSize,
-          capped: limit > effectiveLimit,
-          trace_id: trace?.traceId ?? null,
-        }) + '\n')
+        process.stdout.write(JSON.stringify(res) + '\n')
+
       } else {
         if (memories.length === 0) {
           process.stdout.write('(no relevant memories found)\n')

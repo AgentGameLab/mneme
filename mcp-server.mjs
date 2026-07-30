@@ -29,6 +29,7 @@ import {
   recallMemories,
   getMemoriesByIds,
   storeMemory,
+  recallForClients,
   storeMemoryAsync,
   storeMemoryQuarantined,
   listQuarantine,
@@ -524,6 +525,63 @@ if (useHttp) {
       }))
       return
     }
+
+    // ── POST /recall — plain-JSON recall for out-of-process callers ──
+    // The auto-recall hooks used to shell out to `node index.mjs --recall` on
+    // every prompt and matching tool call. Measured on a warm 8k-row DB: the
+    // query itself is ~6ms, the surrounding node startup (boot, DB open,
+    // sqlite-vec + tokenizer extension load, embedding config) is ~1585ms —
+    // 99.6% of the wall time, on the critical path before the model sees the
+    // prompt. This server already holds all of that warm, so the same recall
+    // costs a local round trip instead.
+    //
+    // Deliberately NOT MCP: a hook is a 30-line script that should not have to
+    // speak a session-oriented protocol to ask one question.
+    if (req.url === '/recall' && req.method === 'POST') {
+      const auth = resolveHost(req.headers['authorization'], HOST_TOKENS, { mode: AUTH_MODE, defaultHost: DEFAULT_HOST })
+      if (!auth.ok) {
+        res.writeHead(401, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: `Unauthorized: ${auth.reason}` }))
+        return
+      }
+      let body = ''
+      let tooBig = false
+      req.on('data', chunk => {
+        body += chunk
+        // A recall query is a sentence. Anything past this is a client bug or
+        // an attempt to make the server hold a large buffer.
+        if (body.length > 64 * 1024) { tooBig = true; req.destroy() }
+      })
+      req.on('end', async () => {
+        if (tooBig) return
+        try {
+          const p = JSON.parse(body || '{}')
+          if (typeof p.query !== 'string') {
+            res.writeHead(400, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ error: 'query (string) is required' }))
+            return
+          }
+          const result = await recallForClients({
+            query: p.query,
+            limit: Number.isFinite(p.limit) ? p.limit : 10,
+            minImportance: Number.isFinite(p.min_importance) ? p.min_importance : 0,
+            levels: Array.isArray(p.levels) ? p.levels : (typeof p.level === 'string' && p.level ? p.level.split(',') : []),
+            requireVec: !!p.require_vec,
+            // Provenance stays channel-derived: the caller may label WHICH hook
+            // it is, but the host comes from the token, never from the body.
+            source: typeof p.source === 'string' ? p.source.slice(0, 64) : 'http',
+            sessionId: typeof p.session_id === 'string' ? p.session_id.slice(0, 128) : null,
+          })
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify(result))
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: e.message }))
+        }
+      })
+      return
+    }
+
     // MCP endpoint
     if (req.url === '/mcp' || req.url?.startsWith('/mcp?')) {
       try {
