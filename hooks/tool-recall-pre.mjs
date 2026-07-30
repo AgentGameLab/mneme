@@ -52,6 +52,16 @@ function intEnv(name, fallback) {
 }
 
 const CFG = {
+  // Prefer the already-running HTTP server: it holds the DB, extensions and
+  // embedding config warm, so a recall costs a local round trip instead of a
+  // full node cold start (~6ms vs ~1.6s measured). Falls back to spawning the
+  // CLI when the server is down, so this stays a speedup and never a new
+  // single point of failure.
+  httpUrl: process.env.MNEME_HTTP_URL || 'http://127.0.0.1:18792/recall',
+  // Deliberately much shorter than the CLI budget: a healthy server answers in
+  // single-digit ms, so anything slower means it is unwell and we should be
+  // spawning already rather than paying both costs.
+  httpTimeoutMs: intEnv('MNEME_HTTP_TIMEOUT_MS', 800),
   indexPath: process.env.MNEME_INDEX_PATH || resolve(__dirname, '..', 'index.mjs'),
   minImportance: intEnv('MNEME_TOOL_MIN_IMPORTANCE', 6),
   level: process.env.MNEME_TOOL_LEVEL || 'meta_knowledge,semi_abstract',
@@ -145,7 +155,32 @@ function passThroughDbEnv() {
   return env
 }
 
-function runRecall(query, sessionId) {
+// Ask the warm server first. Any failure at all — server down, timeout, bad
+// JSON, non-200 — returns null so the caller spawns the CLI instead.
+async function recallOverHttp(body) {
+  try {
+    const ctl = new AbortController()
+    const t = setTimeout(() => ctl.abort(), CFG.httpTimeoutMs)
+    const headers = { 'Content-Type': 'application/json' }
+    if (process.env.MNEME_HOST_TOKEN) headers.Authorization = `Bearer ${process.env.MNEME_HOST_TOKEN}`
+    const r = await fetch(CFG.httpUrl, { method: 'POST', headers, body: JSON.stringify(body), signal: ctl.signal })
+    clearTimeout(t)
+    if (!r.ok) return null
+    const j = await r.json()
+    return Array.isArray(j?.hits) ? j : null
+  } catch { return null }
+}
+async function runRecall(query, sessionId) {
+  const viaHttp = await recallOverHttp({
+    query: query,
+    limit: CFG.limit,
+    min_importance: CFG.minImportance,
+    level: CFG.level,
+    source: 'mneme-tool-recall',
+    session_id: sessionId,
+  })
+  if (viaHttp) return viaHttp
+
   const args = [
     CFG.indexPath,
     '--recall', query,
@@ -330,7 +365,7 @@ function formatAliasBanner(hits) {
 let input = ''
 process.stdin.setEncoding('utf-8')
 process.stdin.on('data', d => input += d)
-process.stdin.on('end', () => {
+process.stdin.on('end', async () => {
   let payload = {}
   try { payload = JSON.parse(input || '{}') } catch { process.exit(0) }
 
@@ -356,7 +391,7 @@ process.stdin.on('end', () => {
   const query = extractQuery(toolName, toolInput)
   let recallSection = ''
   if (query && query.length >= 3) {
-    const recalled = runRecall(query, sessionId)
+    const recalled = await runRecall(query, sessionId)
     const hits = recalled?.hits || []
     if (hits.length > 0) {
       const injected = loadInjected(sessionId)
@@ -385,4 +420,10 @@ process.stdin.on('end', () => {
   process.exit(0)
 })
 
-setTimeout(() => process.exit(0), CFG.timeoutMs + 200).unref()
+// Safety net AND event-loop lifeline. Deliberately NOT unref()d: the stdin
+// handler is async, so after the first await the synchronous frame returns and
+// stdin is already closed. With nothing else referencing the loop Node exits 0
+// before fetch can even open its socket — the hook goes silent and no recall
+// happens at all. A ref()d timer keeps the loop alive; every completion path
+// calls process.exit(0) explicitly, so this deadline is never actually waited on.
+setTimeout(() => process.exit(0), CFG.timeoutMs + 200)
