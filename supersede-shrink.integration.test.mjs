@@ -140,6 +140,55 @@ Credentials under E:/Project/nas-setup/agents/. Inventory currently 300 availabl
     out.supersedeShrink ? JSON.stringify(out.supersedeShrink[0]) : 'clean')
 }
 
+// ── Case 5b: a rolling ledger that grows past its peak is exempt ──
+// Mirrors the (a3) audit rule. A daily log rotates yesterday's file names out
+// while the entry keeps growing; without the exemption this fires every day and
+// the gate becomes noise you learn to skip.
+{
+  const day1 = storeMemory({
+    content: `${marker} ledger day 1. touched src/alpha.mjs and docs/alpha-NOTES.md. ` + 'padding '.repeat(30),
+    memoryType: 'short_term', importance: 8,
+  })
+  const out1 = {}
+  const day2 = storeMemory({
+    // different files today (rotation) AND longer than day 1 overall
+    content: `${marker} ledger day 2. touched src/beta.mjs and docs/beta-NOTES.md. ` + 'padding '.repeat(45),
+    memoryType: 'short_term', importance: 8,
+    supersedes: [String(day1)],
+  }, { out: out1 })
+  check(!out1.supersedeShrink, 'case5b growing ledger is exempt despite rotating identifiers',
+    out1.supersedeShrink ? JSON.stringify(out1.supersedeShrink[0].dropped) : 'clean')
+
+  // ...but shrinking BELOW the historical peak still reports, even though this
+  // new version is longer than the (already shrunken) row it directly replaces.
+  const out2 = {}
+  const day3 = storeMemory({
+    content: `${marker} ledger day 3. short.`,
+    memoryType: 'short_term', importance: 8,
+    supersedes: [String(day2)],
+  }, { out: out2 })
+  check(!!out2.supersedeShrink, 'case5b a real collapse below peak still reports')
+
+  // Growing relative to the row it replaces does NOT buy an exemption on its own:
+  // the exemption needs newLen >= the all-time peak. So a write that is longer than
+  // its predecessor but still below peak, and drops an identifier the predecessor
+  // carried, is still reported.
+  const carrier = storeMemory({
+    content: `${marker} ledger day 4. now tracking KEY_ONE and src/gamma.mjs.`,
+    memoryType: 'short_term', importance: 8,
+    supersedes: [String(day3)],
+  }, { out: {} })
+  const out3 = {}
+  storeMemory({
+    content: `${marker} ledger day 5. a bit longer than the previous entry, but that env var is no longer mentioned.`,
+    memoryType: 'short_term', importance: 8,
+    supersedes: [String(carrier)],
+  }, { out: out3 })
+  check(!!out3.supersedeShrink && out3.supersedeShrink[0].dropped.includes('KEY_ONE'),
+    'case5b growing vs predecessor but under peak still reports a fresh loss',
+    out3.supersedeShrink ? JSON.stringify(out3.supersedeShrink[0].dropped) : 'MISSED')
+}
+
 // ── Case 6: plain store without supersedes never carries the field ──
 {
   const out = {}
