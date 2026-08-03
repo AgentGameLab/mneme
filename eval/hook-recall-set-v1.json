@@ -1,0 +1,498 @@
+{
+  "_built_by": "eval/build-hook-recall-set.mjs",
+  "_sampling": "role=user, machine-injected text dropped, hook shouldTrigger gate, dedup by content sha256; ordered by content sha256; split on an independently salted hash",
+  "_db": "<repo>\\tokenmem.db",
+  "_population": {
+    "conversations_user_rows": 3475,
+    "passing_gate_deduped": 265
+  },
+  "_size": 60,
+  "_split": {
+    "dev": 31,
+    "held-out": 29
+  },
+  "_set_sha256": "63530af4ec182c4278abf19736d8b8fe76b2be9c1ad98f8518ab519aabce437c",
+  "_note": "Prompt text is deliberately absent — this repo is public and the sample is drawn from real conversations. Re-run the builder to regenerate the local copy.",
+  "questions": [
+    {
+      "id": "1a7ef125-81fc-47d1-9b0a-e6b949b85d03",
+      "hash": "002df6ec81fe0b14d335c47b1ff154ef3fecacf6a50d55668b4d62ac2f41b15a",
+      "split": "held-out",
+      "length": 36,
+      "created_at": 1784014630203,
+      "platform": "claude-code"
+    },
+    {
+      "id": "b5aa5a73-5a8c-4635-a45a-8f88a7095c20",
+      "hash": "00e8a68f4e1d47165e665c996cb4062db6e442b8c56470e5d2364911b5525b65",
+      "split": "held-out",
+      "length": 17,
+      "created_at": 1783834414342,
+      "platform": "claude-code"
+    },
+    {
+      "id": "83523d49-b95a-47ee-a3af-5d414ffef80e",
+      "hash": "0154b0f2b5efc2ca2eb9e5449e890e0e29f0e3cc1217d0c5687611fdfbce044a",
+      "split": "dev",
+      "length": 1033,
+      "created_at": 1785717611367,
+      "platform": "claude-code"
+    },
+    {
+      "id": "6cc111d4-338c-452e-a0bf-ec2a71989443",
+      "hash": "01acf122aff33e3ba179d7c8b3b5d5f48cd237caf7ce64a9c8d0457ba21cd2aa",
+      "split": "dev",
+      "length": 430,
+      "created_at": 1784289606565,
+      "platform": "claude-code"
+    },
+    {
+      "id": "f7d71de5-d7ce-4f14-ade9-732bde0dd6f1",
+      "hash": "028f4ea815afead61788882c442be3fbc93559d47e90c8ffdd70be5e3d64d6a3",
+      "split": "dev",
+      "length": 45,
+      "created_at": 1784641103618,
+      "platform": "claude-code"
+    },
+    {
+      "id": "8f1d91ad-8bf4-4e74-89d8-8103bc29dd73",
+      "hash": "02a7bf037d91a6e60c74403f48577dd20996d83ddd9dcf23db5e01e31c5616c8",
+      "split": "held-out",
+      "length": 37,
+      "created_at": 1783867330310,
+      "platform": "claude-code"
+    },
+    {
+      "id": "5a4ffce1-1468-41ad-be55-24792a2644c6",
+      "hash": "0366b1e6380e6368589b384c963ce40b4ac44edee03ee5896014548f57f417d5",
+      "split": "held-out",
+      "length": 814,
+      "created_at": 1785683973866,
+      "platform": "claude-code"
+    },
+    {
+      "id": "45ef2da3-de45-4e45-ac4a-b63be269b375",
+      "hash": "0440d914cfea792ea667af145a9bd34f358c3cc406c5bbf88d050cdcac298f40",
+      "split": "dev",
+      "length": 156,
+      "created_at": 1785677453455,
+      "platform": "claude-code"
+    },
+    {
+      "id": "37ca1edb-171d-47b8-b813-d6ff8be7882d",
+      "hash": "0472f5e378cb7cac4e6d3579fded465f258c2ffeb5ad965caf759da3fb67820d",
+      "split": "dev",
+      "length": 52,
+      "created_at": 1784268620076,
+      "platform": "claude-code"
+    },
+    {
+      "id": "6db1b510-06f8-4933-bb2c-c309a74e1ff5",
+      "hash": "05c6b8aa40c370731c5689cabd139009041495051e88fda5f9fc77a909462f4f",
+      "split": "held-out",
+      "length": 91,
+      "created_at": 1783865802756,
+      "platform": "claude-code"
+    },
+    {
+      "id": "25e1bf16-0356-4223-9bd9-a986e9270a67",
+      "hash": "08e1ee63857b5bb66d332a615ff6bb2bf76af3085ed22587d5ff5fa867163ce6",
+      "split": "dev",
+      "length": 488,
+      "created_at": 1785723836278,
+      "platform": "claude-code"
+    },
+    {
+      "id": "600cc3ed-7d5a-4cea-baf7-7be70b1628b3",
+      "hash": "0a5047d0f98fce2117d75a087c8287ab7839ebaf5d209c5dd5d7672005da2811",
+      "split": "held-out",
+      "length": 98,
+      "created_at": 1785394201692,
+      "platform": "claude-code"
+    },
+    {
+      "id": "8dd10d13-179b-442e-a3aa-849099aff325",
+      "hash": "0b4df1762775ccf01e0000640957f3588e2eea3e9f7d7dee87d2f348b0cd7fa6",
+      "split": "dev",
+      "length": 109,
+      "created_at": 1783264275315,
+      "platform": "claude-code"
+    },
+    {
+      "id": "757f7902-08b5-4d6c-b371-f7c4ea05f039",
+      "hash": "0c60983df3a7e3942ab36b6d8a2d65a3275b6264692f1ad9d90d79c11b549718",
+      "split": "dev",
+      "length": 646,
+      "created_at": 1784092263643,
+      "platform": "claude-code"
+    },
+    {
+      "id": "c737092d-2456-48e3-8a66-f6b0bc001687",
+      "hash": "0c76a0578e8e7ac2942302905f931eb2cf0e01b509461118b66f1c879cce949a",
+      "split": "dev",
+      "length": 34,
+      "created_at": 1783761882731,
+      "platform": "claude-code"
+    },
+    {
+      "id": "a72442e8-e638-45e1-90d4-17162d8c7542",
+      "hash": "0d8f9c09d22b8c7cb9e70dbd22de096478cb30b645c04d857516d1f694be2ed6",
+      "split": "dev",
+      "length": 14,
+      "created_at": 1783612603959,
+      "platform": "claude-code"
+    },
+    {
+      "id": "5d0cb31f-2c20-4547-bce0-64689f03e8ad",
+      "hash": "0ee1e94f93e1dfda39599b99f03018a17090012f6ae9cd139bfd3aefecb0c539",
+      "split": "dev",
+      "length": 25,
+      "created_at": 1783870433877,
+      "platform": "claude-code"
+    },
+    {
+      "id": "93d5974a-0de4-411c-9983-b3a725b245b9",
+      "hash": "0ee9036e93dd47ad3edf12773026bb775c36834c51fd44f858cccf8d90597dcb",
+      "split": "held-out",
+      "length": 22,
+      "created_at": 1784094868170,
+      "platform": "claude-code"
+    },
+    {
+      "id": "0d0f1a91-28b8-4ac3-a3e1-4ab13c236044",
+      "hash": "115623917867c34d8d6674566ec33b9629c7d60e0a3f85435321a1254ac12354",
+      "split": "dev",
+      "length": 773,
+      "created_at": 1783302081136,
+      "platform": "claude-code"
+    },
+    {
+      "id": "94e5afc4-7c50-4a35-b60b-854a3be29518",
+      "hash": "12bfb02e9b0559f2b168eeea2a68b66c0f59d6d9f605a35f0c84e87f6fb1728a",
+      "split": "held-out",
+      "length": 58,
+      "created_at": 1783487059081,
+      "platform": "claude-code"
+    },
+    {
+      "id": "010f25c6-12de-40cf-8d46-d5a2194ab592",
+      "hash": "15cf1fcfa8afd83f4ea97c1eb8ff8fe77de85de3733dcd58de369587760a6f99",
+      "split": "dev",
+      "length": 21,
+      "created_at": 1784043884380,
+      "platform": "claude-code"
+    },
+    {
+      "id": "0c2372c7-5d51-46f1-8918-0c1d6e6b9794",
+      "hash": "17181b0f8aee8e861cd36b87fa28c03446c78411efa0cafa3c45dfeb55feeaee",
+      "split": "dev",
+      "length": 23,
+      "created_at": 1783526153835,
+      "platform": "claude-code"
+    },
+    {
+      "id": "6ca4e89e-2a08-4927-840b-71778ac5823a",
+      "hash": "17bfc16d64c98c066c698d8b4e9c564b7e29faaf0c1edc360e5e9c7470ab35ba",
+      "split": "dev",
+      "length": 62,
+      "created_at": 1783759845539,
+      "platform": "claude-code"
+    },
+    {
+      "id": "56e39330-f9b7-47cd-9c27-ead5aa9f20cc",
+      "hash": "18b609adff02090fa98ef34785390e081b4d07a0426072f9db6f32671d7787f6",
+      "split": "held-out",
+      "length": 47,
+      "created_at": 1783264340519,
+      "platform": "claude-code"
+    },
+    {
+      "id": "12e83257-9b68-4ce2-b410-544b18de1ace",
+      "hash": "198b07dc5cfb72f6dc8e2bfe8d7d48b2820ca5388abbee880ad87f0b40407186",
+      "split": "dev",
+      "length": 169,
+      "created_at": 1783926336072,
+      "platform": "claude-code"
+    },
+    {
+      "id": "1f3e27c5-dc0b-471d-ad4e-ad720005939c",
+      "hash": "19d9502bf632faab63b3e654bd1d73d40839022cf734268f62c3fd0d9b20d015",
+      "split": "dev",
+      "length": 39,
+      "created_at": 1783153134668,
+      "platform": "claude-code"
+    },
+    {
+      "id": "9c5e9f36-d30b-46ff-95a9-60519259cdb4",
+      "hash": "1c70594a9e29029c264435909383a2d7bf63a0a0247422a9ef9da34aff839985",
+      "split": "dev",
+      "length": 142,
+      "created_at": 1785409419101,
+      "platform": "claude-code"
+    },
+    {
+      "id": "8d83912f-0775-4b3b-871d-a70bdf56c662",
+      "hash": "1ca75d5b189aba662ce6f7fa67b52190c7b9b92e7b3f2dda74a69e654fd3d6a4",
+      "split": "dev",
+      "length": 26,
+      "created_at": 1785657071279,
+      "platform": "claude-code"
+    },
+    {
+      "id": "c50cd025-719b-451e-9b22-12e737143fc9",
+      "hash": "1d51202849649194ef8ae6ae59583dde96b68d2911f5e6d3539fa2d6e7d7a3a1",
+      "split": "dev",
+      "length": 32,
+      "created_at": 1785670138342,
+      "platform": "claude-code"
+    },
+    {
+      "id": "c3f0be64-c867-40bd-92ad-c0de06143d34",
+      "hash": "1f3ec98d447d5d40184a58348b56fdd828533c8b1adc79c79e0dacba66539aec",
+      "split": "held-out",
+      "length": 99,
+      "created_at": 1784272224395,
+      "platform": "claude-code"
+    },
+    {
+      "id": "e51e395c-f637-423a-92f4-e7a6b06aeb45",
+      "hash": "1f7e79b08b2df82c3e08fa9f95c0a4783dc15a027cd8cff8a90916b39e4dae25",
+      "split": "held-out",
+      "length": 35,
+      "created_at": 1784640024079,
+      "platform": "claude-code"
+    },
+    {
+      "id": "fc12f2c1-962a-4db0-930c-2982e033e171",
+      "hash": "1fb48e376ed6bd8fddec245211d7d60b6b5c51915b5895ed7a828324ac4ba32c",
+      "split": "held-out",
+      "length": 46,
+      "created_at": 1783599720459,
+      "platform": "claude-code"
+    },
+    {
+      "id": "01bede97-2dd8-46bb-9917-d6eaf702a950",
+      "hash": "2130b21c223fd55c2d437433c0f445d24f4825f31362a39909575c37d43a955e",
+      "split": "dev",
+      "length": 52,
+      "created_at": 1784265295449,
+      "platform": "claude-code"
+    },
+    {
+      "id": "4ae875c7-72cb-479d-b781-176d8fdff008",
+      "hash": "240668c4c54014cf8ae4f17ec9b0615c20c68d402f1bd9b601d0a19b8f4e4aa7",
+      "split": "dev",
+      "length": 34,
+      "created_at": 1783939507213,
+      "platform": "claude-code"
+    },
+    {
+      "id": "19488a42-ad09-41e2-8abb-fd303223df26",
+      "hash": "24d2715793974033aec75d76ac31b971a47c0b844e7f54f4ef475bd94febb4a5",
+      "split": "held-out",
+      "length": 14,
+      "created_at": 1783939390751,
+      "platform": "claude-code"
+    },
+    {
+      "id": "3aebffd2-49c0-4a9a-8381-dc077410b752",
+      "hash": "27137b3b204c14ebc33023161fe518174672394f1b2c468ab8bab432e5447451",
+      "split": "dev",
+      "length": 16,
+      "created_at": 1784774867404,
+      "platform": "claude-code"
+    },
+    {
+      "id": "6b0cd8af-9c29-4cc7-8213-e7db28c8c6fd",
+      "hash": "284153e199834716cfd2e53bdf051888ad2aee851325cd84d9bc3af9577a7fea",
+      "split": "held-out",
+      "length": 15,
+      "created_at": 1785671767545,
+      "platform": "claude-code"
+    },
+    {
+      "id": "3897b236-65d5-441c-859d-e03cdf1a1de4",
+      "hash": "286ff5f9fb83b234d6b74faa6768a3ea478ec9d8759ea4bcf1a638f3bca0b49a",
+      "split": "dev",
+      "length": 45,
+      "created_at": 1782962974702,
+      "platform": "claude-code"
+    },
+    {
+      "id": "c1b24122-7ab0-44c5-9f26-95d6eaee934b",
+      "hash": "28b6fa0dc5fbafbb0aa39c00bed770cfe12c32d9ac5e63d42a2d17a4bf898f28",
+      "split": "held-out",
+      "length": 23,
+      "created_at": 1785653983641,
+      "platform": "claude-code"
+    },
+    {
+      "id": "8daf29b3-47d0-4f18-bfe3-bfa0c32cd311",
+      "hash": "29609f5fa6fa06a642dfd20e3242dfe0f618adbda177219a720b8ceb5c99bbbb",
+      "split": "dev",
+      "length": 53,
+      "created_at": 1783428503284,
+      "platform": "claude-code"
+    },
+    {
+      "id": "64e84c3f-69e9-4837-8a4a-a4b055e4e0e1",
+      "hash": "2b329dc216adc8301d2f29cfc9d28adebb35318627e2b37ad46904e1423e9793",
+      "split": "held-out",
+      "length": 18,
+      "created_at": 1785058185458,
+      "platform": "claude-code"
+    },
+    {
+      "id": "71d453f9-31aa-482e-8be4-77d294a9bc54",
+      "hash": "2ba21efea6058c8b70b61036f0809423c64d12e9420827f7701b7d1ceab03ff5",
+      "split": "held-out",
+      "length": 200,
+      "created_at": 1785395852747,
+      "platform": "claude-code"
+    },
+    {
+      "id": "d75eecee-8140-4a16-94c8-f0c1b3e1dae1",
+      "hash": "2bbd6f2f976ce46990d429d3e6d1fa848b277d9708387f974cb993b943c12374",
+      "split": "dev",
+      "length": 27,
+      "created_at": 1783481138808,
+      "platform": "claude-code"
+    },
+    {
+      "id": "ff85e733-3492-4e95-9f6e-7637f1da2fb9",
+      "hash": "2c6d8179c147bec3ca2dfaedd3f7c654ad3aa9201880c44b5ef868a7d9bdbf21",
+      "split": "held-out",
+      "length": 303,
+      "created_at": 1785396024036,
+      "platform": "claude-code"
+    },
+    {
+      "id": "202977f9-3160-4533-b491-be2b469b0ec8",
+      "hash": "2da829fe3f5c848c568a5a4cd822861a2ab7de232294efc1623d403970f81c40",
+      "split": "held-out",
+      "length": 21,
+      "created_at": 1783601885336,
+      "platform": "claude-code"
+    },
+    {
+      "id": "30c89c8b-c945-4e99-8f65-d05414adcea4",
+      "hash": "2dd2878dc3831e7bcf7c9c04e7bc7a42c57a59d3960b0a1e319b3ba2a9a1097c",
+      "split": "dev",
+      "length": 311,
+      "created_at": 1785653479905,
+      "platform": "claude-code"
+    },
+    {
+      "id": "fadb2cea-8b98-40a3-a02c-47c3d64a0bcc",
+      "hash": "2f4f1390a8eca447198fa56ae54918ae4c11416c5c3f8b2aaab198da6ac82806",
+      "split": "held-out",
+      "length": 73,
+      "created_at": 1785665621916,
+      "platform": "claude-code"
+    },
+    {
+      "id": "15548c40-7f32-46c2-9b6b-2c05f5768655",
+      "hash": "2f80398426fc22555f76b3401f006ad98fbd78b97910b73a31527055ea7e35cb",
+      "split": "held-out",
+      "length": 18,
+      "created_at": 1783868159848,
+      "platform": "claude-code"
+    },
+    {
+      "id": "24c87a2a-0f32-435d-8a12-f8bda17c0d40",
+      "hash": "305a596c61d6471469d8bada8190a37495ef7f392e0e052e27127010b5c64710",
+      "split": "held-out",
+      "length": 12,
+      "created_at": 1785725692066,
+      "platform": "claude-code"
+    },
+    {
+      "id": "3cb6ec96-528c-4569-a670-7db5e4034041",
+      "hash": "31a8369ec93bcb577e55d0a6beee488becdddffae75402116616739dcc9c6a56",
+      "split": "held-out",
+      "length": 77,
+      "created_at": 1784299474722,
+      "platform": "claude-code"
+    },
+    {
+      "id": "ff0b3a8a-9c8e-42e7-8833-f5d587f8582a",
+      "hash": "324032d311d05c01ddc51f98815085563ba5f998cbf65aa2bac4e469819ec130",
+      "split": "held-out",
+      "length": 247,
+      "created_at": 1785677998148,
+      "platform": "claude-code"
+    },
+    {
+      "id": "c766953a-6f30-48d7-8f0a-911999512f01",
+      "hash": "32aff9bde6cd843c7f729741b287019fc787b90bc9c0e8585f402f6f85266472",
+      "split": "held-out",
+      "length": 19,
+      "created_at": 1783494678881,
+      "platform": "claude-code"
+    },
+    {
+      "id": "33a655c1-fd26-4c26-801b-f445483d6ec0",
+      "hash": "32b75db6e50e1af6404ed0d24cc9757a2af16433f349da6e28810785d50ecfba",
+      "split": "held-out",
+      "length": 31,
+      "created_at": 1783751027565,
+      "platform": "claude-code"
+    },
+    {
+      "id": "fd7cc427-2833-4430-85ec-39907554225f",
+      "hash": "33177095dbab0a76ec1afb1c9a03b675044e0c59a1d1c1d2790e5fe620718d6f",
+      "split": "held-out",
+      "length": 106,
+      "created_at": 1784028386151,
+      "platform": "claude-code"
+    },
+    {
+      "id": "5763349f-67f8-47e7-b718-0cff2be80f7a",
+      "hash": "331d5cefaa9f7b8fb0607c7f0030a84cdf831e46d5b7a7f3a4ee2cbde0af98d4",
+      "split": "held-out",
+      "length": 34,
+      "created_at": 1782967924693,
+      "platform": "claude-code"
+    },
+    {
+      "id": "867978fd-113d-407c-b26d-bdf60d19edbc",
+      "hash": "338b883d00a88abeda080c75b01fa4e5097d594bef74fc795a4f7e5b7213d014",
+      "split": "dev",
+      "length": 29,
+      "created_at": 1785638542171,
+      "platform": "claude-code"
+    },
+    {
+      "id": "5510c49d-aeb9-4e18-9fab-40c8a3175fae",
+      "hash": "342c03da1e27e51328a95e9ea3cbad741b8dea9f57cffda995cbbaee8184fdf1",
+      "split": "held-out",
+      "length": 705,
+      "created_at": 1784033062927,
+      "platform": "claude-code"
+    },
+    {
+      "id": "7085a0dc-d261-4f8a-ba2c-2df4fd9c733d",
+      "hash": "34921d8c21494e60bcf0eeb9b5d7f0ea9c0ed56884be439ac55e4976107a0203",
+      "split": "dev",
+      "length": 19,
+      "created_at": 1783872794926,
+      "platform": "claude-code"
+    },
+    {
+      "id": "3996988a-b7dd-44a6-9150-f45f55ef5a10",
+      "hash": "349bbf36a4467f2d81c6ce04c20831d947250bea2a8cc5ee692329e71618dd03",
+      "split": "dev",
+      "length": 23,
+      "created_at": 1783610346716,
+      "platform": "claude-code"
+    },
+    {
+      "id": "74d94be5-1750-4ced-aa15-11aa0811191f",
+      "hash": "35a2f9ddcb835fcbe5c9642ac597803fe3a796d7be0f36b9bc524d3db883e9f7",
+      "split": "dev",
+      "length": 430,
+      "created_at": 1784289606640,
+      "platform": "claude-code"
+    }
+  ]
+}

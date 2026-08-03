@@ -37,3 +37,6 @@ logs/
 *-candidates.json
 staging/
 benchmarks/longmemeval/results/
+
+# Eval sets carry real conversation text — keep it off a public repo.
+eval/*.local.json
