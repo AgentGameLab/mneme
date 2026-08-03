@@ -238,6 +238,12 @@ function createServer(hostId = DEFAULT_HOST) {
       if (is_pinned && !out.quotaRejected?.find(q => q.flag === 'is_pinned')) flags.push('pinned')
       const flagStr = flags.length ? `, flags: [${flags.join(', ')}]` : ''
       let text = `Stored memory (id: ${id}, importance: ${importance}, type: ${memory_type}, level: ${finalLevel}${flagStr})`
+      // First among the warnings on purpose: the others say a policy adjusted the
+      // write, this one says the content that landed is already damaged.
+      if (out.encodingWarning) {
+        const e = out.encodingWarning
+        text += `\n⚠️ ENCODING DAMAGE: ${e.qmarkCount} '?' chars (longest run ${e.maxRun}). CJK was likely lost to a non-UTF-8 code page (cp936) — this is IRREVERSIBLE, not a display glitch. If you just wrote Chinese, it did NOT save; re-store via a UTF-8-safe path (codex exec / CC-side), not Codex Desktop.`
+      }
       if (out.quotaRejected?.length) {
         for (const q of out.quotaRejected) {
           text += `\n🚫 ${q.flag} quota exhausted (${q.current}/${q.limit}) — flag dropped, memory still stored`

@@ -982,6 +982,31 @@ export async function recallForClients(o = {}) {
   }
 }
 
+// v2.10: encoding-damage detector. Codex Desktop on Windows mojibakes CJK
+// into U+003F '?' when it serializes MCP tool args through the system code
+// page (cp936) instead of UTF-8 — an IRREVERSIBLE loss (openai/codex
+// #4498 / #7290 / #25359). mneme can't un-corrupt it, but it refuses to let
+// the loss be SILENT: it flags runs of '?' that don't occur in real prose so
+// the writer learns its CJK was dropped and can re-store via a UTF-8-safe
+// path (codex exec / CC-side). DETECTION ONLY — never blocks the write
+// (mneme philosophy: surface, don't drop; a false positive must not lose data).
+export function detectEncodingDamage(...texts) {
+  const s = texts.filter(Boolean).map(String).join('\n')
+  if (s.length < 8) return null
+  const runs = s.match(/\?{4,}/g) || []          // 4+ consecutive '?' — near-absent in genuine text
+  const qCount = (s.match(/\?/g) || []).length
+  const hasCJK = /[぀-ヿ㐀-鿿가-힯]/.test(s)
+  const ratio = qCount / s.length
+  // Trigger on a long run (near-certain corruption), or high '?' density on a
+  // non-trivial CJK-less string (mojibake wiped the CJK, leaving ASCII + '?').
+  if (runs.length === 0 && !(ratio > 0.15 && qCount >= 4 && !hasCJK)) return null
+  return {
+    qmarkCount: qCount,
+    maxRun: runs.reduce((m, r) => Math.max(m, r.length), 0),
+    ratio: +ratio.toFixed(2),
+  }
+}
+
 /**
  * Store a memory
  * @param {Object} mem
@@ -990,6 +1015,12 @@ export async function recallForClients(o = {}) {
 export function storeMemory(mem, opts = {}) {
   const db = getDb()
   const now = Date.now()
+
+  // v2.10: encoding-damage detection — surface silent CJK loss loudly.
+  if (opts.out) {
+    const dmg = detectEncodingDamage(mem.content, mem.summary)
+    if (dmg) opts.out.encodingWarning = dmg
+  }
 
   // Default TTL
   let expiresAt = mem.expiresAt || null
