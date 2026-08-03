@@ -29,6 +29,9 @@ mneme.migrate.local.json
 # Transcript ingest scan state (per-machine; safe to delete, full rescan is idempotent)
 .transcript-ingest-state.json
 
+# Sweep logs (per-machine run output; override path with MNEME_SWEEP_LOG)
+logs/
+
 # Local scratch — dry-run reports, migration candidate exports, one-off batches
 *.tmp.json
 *-candidates.json
