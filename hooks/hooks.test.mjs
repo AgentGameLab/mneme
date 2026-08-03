@@ -170,5 +170,91 @@ let pass = 0, fail = 0
   console.log(`${ok?'✓':'✗'} tool-recall unknown tool: status=${r.status} silent=${v.silent}`)
 }
 
+// ── which database the fast path answers from ──
+//
+// The recall request body carries no DB path, so the server answers from
+// whichever database it was started with. A hook pinned to one DB that asks a
+// server holding another gets the wrong memories — and only when a server
+// happens to be up, so it looks like flakiness rather than a wiring bug.
+//
+// These two cases pin both halves of the rule: a named DB is honoured, and an
+// explicitly named URL still wins over it.
+{
+  const { mkdtempSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const http = await import('node:http')
+  const { spawn } = await import('node:child_process')
+
+  const tmp = mkdtempSync(join(tmpdir(), 'mneme-hooks-'))
+  const DB = join(tmp, 'pinned.db')
+
+  {
+    process.env.TOKENMEM_DB_PATH = DB
+    const { initMemory, storeMemory, closeMemory } = await import('../index.mjs')
+    initMemory()
+    for (const n of [1, 2, 3]) {
+      storeMemory({ content: `zzpinmarker rig ${n}: the calibration token and port config live in .env.local`,
+        importance: 9, memoryLevel: 'meta_knowledge', memoryType: 'long_term' })
+    }
+    closeMemory()
+    delete process.env.TOKENMEM_DB_PATH
+  }
+
+  const PROMPT = 'zzpinmarker calibration 的 token 和端口 配置在哪'
+  // async spawn, not spawnSync: the stub below lives in THIS process, and
+  // spawnSync blocks this event loop — the stub could never answer, the hook
+  // would time out into the CLI, and the test would "prove" the URL is ignored.
+  const runAsync = (hookPath, payload, env) => new Promise(res => {
+    const ch = spawn(process.execPath, [hookPath], { env: { ...process.env, ...env } })
+    let stdout = '', stderr = ''
+    ch.stdout.on('data', d => stdout += d)
+    ch.stderr.on('data', d => stderr += d)
+    ch.on('close', status => res({ status, stdout, stderr }))
+    ch.stdin.end(JSON.stringify(payload))
+  })
+
+  // case 10: DB named, no URL — must answer from that DB
+  {
+    const r = await runAsync(PROMPT_HOOK,
+      { session_id: 'test-pin-' + Math.random().toString(36).slice(2, 8), prompt: PROMPT },
+      { MNEME_DB_PATH: DB, TOKENMEM_DB_PATH: DB, MNEME_STATE_DIR: join(tmp, 's1'), MNEME_HTTP_URL: '' })
+    const v = isValidHookOutput(r.stdout, 'UserPromptSubmit')
+    const ok = r.status === 0 && v.ok && (v.ctx || '').includes('zzpinmarker')
+    if (ok) pass++; else fail++
+    console.log(`${ok?'✓':'✗'} pinned DB answers from that DB: status=${r.status} ${v.err || ''}`)
+  }
+
+  // case 11: DB named AND URL named — the explicit URL wins
+  {
+    let sawRequest = false
+    const hit = (id, content) => ({ id, content, summary: null, importance: 9,
+      memory_level: 'meta_knowledge', memory_type: 'long_term', tags: [], score: 1,
+      created_at: Date.now(), recall_sources: [], vec_distance: null })
+    const stub = http.createServer((req, res) => {
+      req.on('data', () => {})
+      req.on('end', () => {
+        sawRequest = true
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        // two hits: prompt-recall only injects once it has minConsensus of them
+        res.end(JSON.stringify({ hits: [hit(999801, 'ZZSTUBMARKER one'), hit(999802, 'ZZSTUBMARKER two')],
+          count: 2, requested_limit: 5, effective_limit: 5, candidate_limit: 30, capped: false, trace_id: null }))
+      })
+    })
+    const port = 18990 + Math.floor(Math.random() * 200)
+    await new Promise(r => stub.listen(port, '127.0.0.1', r))
+
+    const r = await runAsync(PROMPT_HOOK,
+      { session_id: 'test-pin-url-' + Math.random().toString(36).slice(2, 8), prompt: PROMPT },
+      { MNEME_DB_PATH: DB, TOKENMEM_DB_PATH: DB, MNEME_STATE_DIR: join(tmp, 's2'),
+        MNEME_HTTP_URL: `http://127.0.0.1:${port}/recall` })
+    stub.close()
+    const v = isValidHookOutput(r.stdout, 'UserPromptSubmit')
+    const ok = r.status === 0 && sawRequest && (v.ctx || '').includes('ZZSTUBMARKER')
+    if (ok) pass++; else fail++
+    console.log(`${ok?'✓':'✗'} explicit URL wins over a pinned DB: status=${r.status} sawRequest=${sawRequest}`)
+  }
+}
+
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'}: ${pass} passed / ${fail} failed`)
 process.exit(fail === 0 ? 0 : 1)
