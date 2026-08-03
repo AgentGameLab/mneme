@@ -4048,6 +4048,39 @@ if (_isMain) {
       })
       process.stdout.write(`stored compact summary: memory id ${id}\n`)
 
+    } else if (hasFlag('--record-conversation')) {
+      // The per-turn counterpart to scripts/transcript-sweep.mjs: a hook pipes one
+      // turn in on stdin as it happens, instead of the sweep catching it later.
+      //
+      // This branch has now been dropped by a refactor twice, and both times the
+      // symptom was the same: the CLI falls through to usage, exits 1, and turns
+      // silently stop entering the conversations table. The first loss ran 17 days
+      // before anyone connected the ~150 daily engram_failed warnings to it.
+      //
+      // hasFlag, not getFlag: callers pass the flag with no value, so getFlag
+      // would swallow the next token (--platform).
+      const chunks = []
+      for await (const chunk of process.stdin) chunks.push(chunk)
+      const content = Buffer.concat(chunks).toString('utf-8')
+      if (!content || content.trim().length === 0) {
+        process.stderr.write('Error: --record-conversation requires content via stdin\n')
+        process.exit(1)
+      }
+      const id = await recordConversationAsync({
+        platform: getFlag('--platform') || 'claude-code',
+        chatId: getFlag('--chat-id') || 'unknown',
+        messageId: getFlag('--message-id') || null,
+        fromId: getFlag('--from-id') || null,
+        fromName: getFlag('--from-name') || '',
+        role: getFlag('--role') || 'user',
+        content,
+        isReply: hasFlag('--is-reply'),
+        replyToId: getFlag('--reply-to-id') || null,
+      })
+      // id === null means UNIQUE-dedup (already recorded) — still a success for
+      // the caller (exit 0), not a failure.
+      process.stdout.write(`recorded: ${id || 'dedup'}\n`)
+
     } else if (getFlag('--compress') !== null) {
       const chatId = getFlag('--compress')
       const days = parseInt(getFlag('--days') || '30', 10)
@@ -4083,6 +4116,8 @@ if (_isMain) {
         '  node index.mjs --context "query"         Build injection context',
         '  node index.mjs --recall "query"          Recall memory list',
         '  node index.mjs --recall "" --limit 20    List recent 20 memories',
+        '  node index.mjs --record-conversation     Record a conversation turn (content via stdin)',
+        '    [--platform P] [--chat-id C] [--role user|assistant] [--from-name N] [--from-id I] [--is-reply]',
         '  node index.mjs --store "content"         Manually store a memory',
         '    [--importance 1-10] [--category general|people|project|...]',
         '    [--type working|short_term|long_term|permanent]',
