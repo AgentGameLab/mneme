@@ -83,6 +83,33 @@ const post = async (body, init = {}) => {
   check('capacity signals ride along', typeof j.requested_limit === 'number' && typeof j.effective_limit === 'number' && 'capped' in j)
 }
 
+// ── the trace id survives the filters ──
+//
+// recallTrace rides on the returned array as a non-enumerable property, and
+// Array.prototype.filter builds a new array. Reading it after the filters
+// yielded undefined, so every filtered call answered trace_id: null — while
+// still persisting the trace. Rows piled up in recall_traces that no caller
+// could name, and get_recall_trace / validate_memory_references had nothing to
+// be called with.
+//
+// It stayed quiet because the unfiltered path, which nobody uses, worked fine.
+// Both hooks send min_importance and level on every call.
+{
+  const bare = await post({ query: 'omega calibration', limit: 3, source: 'trace-bare' })
+  check('unfiltered call returns a trace id', typeof bare.j?.trace_id === 'string' && bare.j.trace_id.length > 0,
+    JSON.stringify(bare.j?.trace_id))
+
+  for (const [label, body] of [
+    ['min_importance', { query: 'omega calibration', limit: 3, min_importance: 6, source: 'trace-imp' }],
+    ['level', { query: 'omega calibration', limit: 3, level: 'meta_knowledge,semi_abstract', source: 'trace-lvl' }],
+    ['the shape both hooks send', { query: 'omega calibration', limit: 3, min_importance: 6, level: 'meta_knowledge,semi_abstract', require_vec: false, source: 'trace-hook' }],
+  ]) {
+    const { j: r } = await post(body)
+    check(`trace id survives ${label}`, typeof r?.trace_id === 'string' && r.trace_id.length > 0,
+      `trace_id=${JSON.stringify(r?.trace_id)} hits=${r?.count}`)
+  }
+}
+
 // ── shape parity with the CLI: same query, same ids, same order ──
 {
   const args = ['index.mjs', '--recall', 'omega calibration', '--format', 'json',
