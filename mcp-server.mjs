@@ -59,7 +59,16 @@ if (existsSync(envPath)) {
   readFileSync(envPath, 'utf-8').split('\n').forEach(line => {
     const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*?)\r?$/)
     // Existing env wins — launcher-set values still override the file.
-    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2].trim()
+    if (m && process.env[m[1]] === undefined) {
+      process.env[m[1]] = m[2].trim()
+    } else if (m && m[2].trim() === '') {
+      // ...except an explicitly empty value, which CLEARS the variable. Without
+      // this, `MNEME_QUARANTINE_HOSTS=` cannot turn quarantine back off once
+      // something upstream has set it — the file says off, the env says on, and
+      // writes keep landing in a table recall never reads. "Existing env wins"
+      // is right for supplying a value and wrong for withdrawing one.
+      delete process.env[m[1]]
+    }
   })
 }
 
@@ -604,7 +613,23 @@ if (useHttp) {
 
         const sessionId = req.headers['mcp-session-id']
         let entry = sessionId ? sessions.get(sessionId) : null
-        if (entry) entry.lastUsed = Date.now()  // 复用 session：刷新活跃时间
+        if (entry) {
+          entry.lastUsed = Date.now()  // 复用 session：刷新活跃时间
+          // A session's host is bound at creation and every write on it is stamped
+          // with that host. If a later request on the same session presents a token
+          // mapping to a different host, the binding and the evidence disagree —
+          // exactly the case channel-derived provenance exists to prevent. Reject
+          // under enforce; keep the binding but say so loudly otherwise, because
+          // the silent version is provenance drifting with no signal at all.
+          if (auth.authed && entry.host !== auth.host) {
+            if (AUTH_MODE === 'enforce') {
+              res.writeHead(401, { 'Content-Type': 'text/plain' })
+              res.end(`Unauthorized: session bound to host '${entry.host}', token maps to '${auth.host}'`)
+              return
+            }
+            console.error(`[mneme] host mismatch on session ${String(sessionId).slice(0, 8)}: bound=${entry.host}, token=${auth.host} (keeping binding)`)
+          }
+        }
 
         if (!entry) {
           // New session: open transport + connect a fresh server instance
