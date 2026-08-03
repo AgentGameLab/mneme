@@ -2899,9 +2899,10 @@ export function indexSessionTranscripts() {
     return { indexed: 0, skipped: 0 }
   }
 
-  let indexed = 0, skipped = 0
+  let indexed = 0, skipped = 0, inserted = 0
 
-  const { readdirSync, statSync } = require('node:fs')
+  const { readdirSync, statSync, writeFileSync } = require('node:fs')
+  const { createHash } = require('node:crypto')
   const jsonlFiles = []
 
   function scanDir(dir) {
@@ -2918,6 +2919,13 @@ export function indexSessionTranscripts() {
   }
   scanDir(projectsDir)
 
+  // Per-file mtime scan state: live sessions keep getting re-scanned as their
+  // file grows (a session-has-rows check would freeze them after first scan).
+  // Losing this file is safe — full rescan is idempotent via INSERT OR IGNORE.
+  const statePath = resolve(__dirname, '.transcript-ingest-state.json')
+  let scanState = {}
+  try { scanState = JSON.parse(readFileSync(statePath, 'utf-8')) } catch {}
+
   const insertStmt = db.prepare(`
     INSERT OR IGNORE INTO conversations
       (id, platform, chat_id, from_id, from_name, role, content, created_at, metadata)
@@ -2925,18 +2933,26 @@ export function indexSessionTranscripts() {
   `)
 
   const insertMany = db.transaction((msgs) => {
+    let n = 0
     for (const m of msgs) {
-      insertStmt.run(m.id, m.chatId, m.fromId, m.fromName, m.role, m.content, m.createdAt)
+      n += insertStmt.run(m.id, m.chatId, m.fromId, m.fromName, m.role, m.content, m.createdAt).changes
     }
+    return n
   })
+
+  // Harness-injected wrappers are re-derivable noise, not conversation
+  const stripNoise = (text) => text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+  const isCommandWrapper = (text) =>
+    text.startsWith('<command-name>') || text.startsWith('<command-message>') ||
+    text.startsWith('<local-command-caveat>') || text.includes('<local-command-stdout>')
 
   for (const file of jsonlFiles) {
     const sessionId = file.match(/([a-f0-9-]{36})\.jsonl$/)?.[1]
     if (!sessionId) continue
 
-    const existing = db.prepare('SELECT 1 FROM conversations WHERE chat_id = ? AND platform = ? LIMIT 1')
-      .get(sessionId, 'claude-code')
-    if (existing) { skipped++; continue }
+    let mtimeMs = 0
+    try { mtimeMs = statSync(file).mtimeMs } catch {}
+    if (mtimeMs && scanState[sessionId] === mtimeMs) { skipped++; continue }
 
     try {
       const content = readFileSync(file, 'utf-8')
@@ -2946,21 +2962,31 @@ export function indexSessionTranscripts() {
         if (!line.trim()) continue
         try {
           const obj = JSON.parse(line)
-          if (!obj.timestamp || !obj.message?.content) continue
+          if (!obj.timestamp || !obj.message?.content || obj.isMeta) continue
 
           const ts = new Date(obj.timestamp).getTime()
           if (isNaN(ts)) continue
 
-          if (obj.type === 'user' && typeof obj.message.content === 'string') {
-            const text = obj.message.content.trim()
-            if (text.length > 0 && text.length < 5000) {
+          // uuid is the dedup key; content-hash fallback keeps same-second
+          // messages from colliding when uuid is absent
+          const mkId = (role, text) =>
+            obj.uuid || `cc-${sessionId}-${ts}-${role}-${createHash('md5').update(text).digest('hex').slice(0, 8)}`
+
+          if (obj.type === 'user') {
+            const raw = typeof obj.message.content === 'string'
+              ? obj.message.content
+              : Array.isArray(obj.message.content)
+                ? obj.message.content.filter(b => b.type === 'text' && b.text).map(b => b.text).join('\n')
+                : ''
+            const text = stripNoise(raw).trim()
+            if (text.length > 0 && !isCommandWrapper(text)) {
               batch.push({
-                id: obj.uuid || `cc-${sessionId}-${ts}`,
+                id: mkId('user', text),
                 chatId: sessionId,
                 fromId: 'user',
                 fromName: 'user',
                 role: 'user',
-                content: text,
+                content: text.slice(0, 5000),
                 createdAt: ts,
               })
             }
@@ -2973,7 +2999,7 @@ export function indexSessionTranscripts() {
             const fullText = textParts.join('\n').slice(0, 5000)
             if (fullText.length > 0) {
               batch.push({
-                id: obj.uuid || `cc-${sessionId}-${ts}`,
+                id: mkId('assistant', fullText),
                 chatId: sessionId,
                 fromId: 'assistant',
                 fromName: 'claude',
@@ -2986,17 +3012,26 @@ export function indexSessionTranscripts() {
         } catch {}
       }
 
-      if (batch.length > 0) {
-        insertMany(batch)
+      let n = 0
+      if (batch.length > 0) n = insertMany(batch)
+      if (n > 0) {
+        inserted += n
         indexed++
-        log(`Session indexed: ${sessionId} (${batch.length} messages)`)
+        log(`Session indexed: ${sessionId} (+${n} messages)`)
+      } else {
+        skipped++
       }
+      if (mtimeMs) scanState[sessionId] = mtimeMs
     } catch (e) {
       log(`Session index failed for ${sessionId}: ${e.message}`)
     }
   }
 
-  return { indexed, skipped, totalFiles: jsonlFiles.length }
+  try { writeFileSync(statePath, JSON.stringify(scanState), 'utf-8') } catch (e) {
+    log(`Session index state save failed: ${e.message}`)
+  }
+
+  return { indexed, skipped, inserted, totalFiles: jsonlFiles.length }
 }
 
 // ── Conversation Compression ────────────────────────────────
