@@ -58,13 +58,35 @@ function intEnv(name, fallback) {
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback
 }
 
+// A caller that names a DB means THAT DB. See the identical helper in
+// tool-recall-pre.mjs — kept duplicated because these two hooks are meant to
+// be individually copyable.
+//
+// The recall request body carries a query and filters — it does not carry a
+// database path, so the server answers from whichever DB it was started with.
+// The CLI fallback forwards the path via env, the HTTP fast path cannot. So
+// with MNEME_DB_PATH set and a server listening on the default port, the two
+// paths quietly answer from different databases, and which one you get depends
+// on whether a process happens to be up.
+//
+// An explicitly configured MNEME_HTTP_URL is the caller saying "that server
+// serves the DB I named", and is honoured. Absent that, a pinned DB turns the
+// fast path off and we spawn, which is slower and correct.
+function resolveHttpUrl() {
+  if (process.env.MNEME_HTTP_URL) return process.env.MNEME_HTTP_URL
+  if (process.env.MNEME_DB_PATH || process.env.TOKENMEM_DB_PATH) return null
+  return 'http://127.0.0.1:18792/recall'
+}
+
 const CFG = {
   // Prefer the already-running HTTP server: it holds the DB, extensions and
   // embedding config warm, so a recall costs a local round trip instead of a
   // full node cold start (~6ms vs ~1.6s measured). Falls back to spawning the
   // CLI when the server is down, so this stays a speedup and never a new
   // single point of failure.
-  httpUrl: process.env.MNEME_HTTP_URL || 'http://127.0.0.1:18792/recall',
+  //
+  // null when the caller pinned a DB but not a URL — see resolveHttpUrl().
+  httpUrl: resolveHttpUrl(),
   // Deliberately much shorter than the CLI budget: a healthy server answers in
   // single-digit ms, so anything slower means it is unwell and we should be
   // spawning already rather than paying both costs.
@@ -145,6 +167,7 @@ function passThroughDbEnv() {
 // Ask the warm server first. Any failure at all — server down, timeout, bad
 // JSON, non-200 — returns null so the caller spawns the CLI instead.
 async function recallOverHttp(body) {
+  if (!CFG.httpUrl) return null   // DB pinned without a URL — spawn instead
   try {
     const ctl = new AbortController()
     const t = setTimeout(() => ctl.abort(), CFG.httpTimeoutMs)
