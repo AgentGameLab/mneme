@@ -87,6 +87,7 @@ let _entityCache = null       // v2.5.1: cached entity list for the recall path 
 let _entityCacheSig = ''       // cheap change signature (count:maxId) — refreshes cross-process
 let _simpleLoaded = false  // whether the simple extension loaded successfully
 let _vecLoaded = false     // whether the sqlite-vec extension loaded successfully
+const _hybridDegradeWarned = new Set()  // warn once per reason, not once per recall
 let _lastRecallTraceSweepAt = 0
 let _writesSinceRecallTraceSweep = 0
 
@@ -2004,9 +2005,35 @@ function findEntityMatchedMemories(db, queryText, limit) {
 export async function recallMemoriesHybrid(opts = {}) {
   const { query: queryText, limit: requestedLimit = 10 } = opts
 
-  // No query or extensions not ready -> fall back to sync version
+  // No query or extensions not ready -> fall back to sync version.
+  //
+  // This fallback used to be fully silent, which made it indistinguishable from
+  // a working hybrid recall: callers that never ran initMemory() (in-process
+  // `import` users such as UserPromptSubmit hooks) got FTS-only results while
+  // believing they were on the hybrid path — same rowids, same order, ~2ms, no
+  // network. Surface the reason instead: warn once per process per reason, and
+  // tag the returned array so callers can assert on it.
+  // Touch the db first: sqlite-vec loads lazily inside getDb(), so reading
+  // _vecLoaded before that would report a stale "not loaded" on the very first
+  // call of a process and mislabel the reason.
+  if (queryText) { try { getDb() } catch {} }
   if (!queryText || !_vecLoaded || !_embeddingConfig) {
-    return recallMemories(opts)
+    const reason = !queryText
+      ? 'no-query'
+      : !_vecLoaded
+        ? 'vec-extension-not-loaded'
+        : 'no-embedding-config (did you load .env.local and call initMemory()?)'
+    if (queryText && !_hybridDegradeWarned.has(reason)) {
+      _hybridDegradeWarned.add(reason)
+      log(`recallMemoriesHybrid degraded to FTS-only: ${reason}`)
+    }
+    const rows = recallMemories(opts)
+    if (Array.isArray(rows)) {
+      // Non-enumerable: invisible to JSON.stringify / spread / existing callers.
+      Object.defineProperty(rows, '_degradedTo', { value: 'fts-only', enumerable: false })
+      Object.defineProperty(rows, '_degradeReason', { value: reason, enumerable: false })
+    }
+    return rows
   }
 
   const budget = planRecallBudget(requestedLimit)
