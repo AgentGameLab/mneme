@@ -33,14 +33,26 @@ const LOG_PATH =
     ? null
     : process.env.MNEME_SWEEP_LOG || resolve(__dirname, '../logs/transcript-sweep.log')
 
+// A failed log write must never take the sweep down — but it must not vanish
+// either. The log file is this script's only observable surface under cron, so
+// swallowing a permission error would turn the whole sweep into a black box
+// that looks idle rather than broken. Complain once on stderr, then stay quiet.
+let logWriteBroken = false
+
 const logLine = (msg) => {
   const line = `[${new Date().toISOString()}] ${msg}\n`
   process.stderr.write(line)
-  if (!LOG_PATH) return
+  if (!LOG_PATH || logWriteBroken) return
   try {
     mkdirSync(dirname(LOG_PATH), { recursive: true })
     appendFileSync(LOG_PATH, line, 'utf-8')
-  } catch {}
+  } catch (e) {
+    logWriteBroken = true
+    process.stderr.write(
+      `[mneme-sweep] WARNING: cannot write log at ${LOG_PATH} (${e.code || e.message}); ` +
+        `continuing with stderr only. Set MNEME_SWEEP_LOG to another path, or "-" to silence this.\n`
+    )
+  }
 }
 
 try {
