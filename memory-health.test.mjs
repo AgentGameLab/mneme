@@ -332,6 +332,13 @@ function check(label, cond, detail = '') {
   const Database = (await import('better-sqlite3')).default
   const db = new Database(DB_PATH)
 
+  // Assert the branch, not the build. Whether recall_log exists at this point
+  // depends on which engine created DB_PATH — a build that instruments recall
+  // creates the table in initMemory(), making the "no table" state unreachable
+  // and this check a false failure. Dropping it first tests detectBlindspot's
+  // logic either way.
+  db.exec('DROP TABLE IF EXISTS recall_log')
+
   const noTable = detectBlindspot(db)
   check('(d) missing recall_log reads as "not instrumented"',
     noTable.available === false && !noTable.instrumentation_stalled && /not present/.test(noTable.reason),
