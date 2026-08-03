@@ -934,6 +934,16 @@ export async function recallForClients(o = {}) {
     _out: out,
   })
 
+  // Capture the trace BEFORE the filters. recallTrace rides on the returned
+  // array as a non-enumerable property, and Array.prototype.filter builds a new
+  // array — so reading it after any filter yields undefined and the response
+  // carries trace_id: null. The trace itself was persisted either way, which is
+  // what made this quiet: rows accumulate in recall_traces that no caller can
+  // ever name. Every real caller filters (min_importance and level are how the
+  // hooks call this), so in practice trace_id was null whenever it mattered and
+  // present only in the unfiltered case nobody uses.
+  const trace = memories.recallTrace
+
   if (minImportance > 0) memories = memories.filter(m => (m.importance || 0) >= minImportance)
   if (levels.length > 0) memories = memories.filter(m => levels.includes(m.memory_level))
   // requireVec: keep only rows with vector evidence, BEFORE the slice. Chinese
@@ -941,7 +951,6 @@ export async function recallForClients(o = {}) {
   // callers need the vec rows to survive. With embedding down this yields 0 rows —
   // fail-closed is correct for inject paths.
   if (o.requireVec) memories = memories.filter(m => typeof m.vec_distance === 'number')
-  const trace = memories.recallTrace
   memories = memories.slice(0, limit)
 
   // hit_count is the raw pool; final_hit_count is what survived filtering and
