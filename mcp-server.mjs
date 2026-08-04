@@ -133,6 +133,13 @@ function createServer(hostId = DEFAULT_HOST) {
       const ctx = await buildMemoryContext({
         query,
         memoryLimit: limit,
+        // Label the caller so recall telemetry can tell an MCP tool call apart
+        // from a CLI or hook one. This was dropped in a refactor and nobody
+        // noticed for 24 days: the calls kept happening, they just landed under
+        // the default 'context-builder' label with everything else, so the
+        // by-source breakdown quietly stopped meaning what it says. Inert on
+        // builds that do not instrument recall.
+        _source: 'mcp',
       })
       if (!ctx) {
         return { content: [{ type: 'text', text: '(no relevant memories found)' }] }

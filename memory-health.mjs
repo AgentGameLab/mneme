@@ -82,6 +82,14 @@ export const DEFAULTS = Object.freeze({
   // Minimum frequency at which a repeat query surfaces as a "you keep looking
   // this up — maybe store the answer" candidate.
   repeatQueryMin: 3,
+  // A recall_log source must have written at least this many rows historically
+  // before its silence is treated as a stall. Below it, "no rows this week" is
+  // just a quiet occasional caller — one-off CLI probes and debug labels live
+  // down there and would otherwise flood the report every run.
+  sourceStallMinHistory: 200,
+  // Days of silence from a high-volume source before it counts as stalled.
+  // Deliberately shorter than a human would notice on their own.
+  sourceStallDays: 3,
   // Wall-clock budget for the O(n^2)-per-category near-dup scan. Buckets
   // whose full pair count would blow past MAX_PAIRS_PER_BUCKET are downgraded
   // to uniform sampling; buckets that would blow past the wall-clock budget
@@ -293,7 +301,45 @@ export function detectBlindspot(db, opts = {}) {
     by_source: bySource, strict_zero: strictZero, final_zero: finalZero,
     repeat_queries: repeats.slice(0, 15).map(r => ({ q: clip(r.query, 60), freq: r.freq, hits: r.hits })),
     zero_hit_real_queries: zeroQueries,
+    stalled_sources: detectStalledSources(db, opts),
   }
+}
+
+// One caller going quiet is invisible to a whole-table check.
+//
+// The stall branch above asks "has ANYTHING written recently", which is only
+// true when every writer is dead at once. In practice they die one at a time:
+// a refactor drops one CLI branch, that hook's recalls stop, and the other
+// callers keep the table busy so the table looks fine forever. Two real cases
+// on one deployment, both found by hand long after the fact — a per-turn
+// conversation writer down 17 days, and a PreToolUse recall down 19. Both had
+// been sitting in recall_log the whole time as a source whose last_ts stopped
+// on a date and never moved.
+//
+// A stall is a SIGNAL, not a verdict. A renamed source looks identical to a
+// dead one from here — the old label stops, a new one starts. That is worth a
+// human glance either way, so this reports and does not judge.
+export function detectStalledSources(db, opts = {}) {
+  const minHistory = opts.sourceStallMinHistory ?? DEFAULTS.sourceStallMinHistory
+  const stallDays = opts.sourceStallDays ?? DEFAULTS.sourceStallDays
+  const cutoff = Date.now() - stallDays * 86400_000
+  let rows
+  try {
+    rows = db.prepare(`
+      SELECT source, COUNT(*) total, MAX(ts) last_ts, MIN(ts) first_ts
+      FROM recall_log
+      GROUP BY source
+      HAVING total >= ? AND last_ts < ?
+      ORDER BY total DESC
+    `).all(minHistory, cutoff)
+  } catch { return [] }
+  return rows.map(r => ({
+    source: r.source,
+    total: r.total,
+    silent_days: Math.floor((Date.now() - r.last_ts) / 86400_000),
+    last_write_at: new Date(r.last_ts).toISOString(),
+    first_write_at: new Date(r.first_ts).toISOString(),
+  }))
 }
 
 // ============================================================
@@ -594,6 +640,9 @@ export function renderTextReport(report, opts = {}) {
   L.push(`- supersede chain: ${ig.orphan_targets} orphan / ${ig.leaked_active} leaked-active (both should be 0)  ·  dead_knowledge(${ig.dead_knowledge_days}d): ${ig.dead_knowledge_count}`)
   if (bs.available) {
     L.push(`- recall_log(${bs.window_days}d): ${bs.total_calls} calls  ·  strict-zero ${bs.strict_zero} / RRF-zero ${bs.final_zero}  ·  repeat queries (non-noise) ${bs.repeat_queries.length}`)
+    if (bs.stalled_sources?.length) {
+      L.push(`- 🚨 recall_log source STALLED: ${bs.stalled_sources.map(s => `${s.source} (${s.total} rows, silent ${s.silent_days}d)`).join(' / ')} — a caller stopped writing while the table stayed busy`)
+    }
   } else if (bs.instrumentation_stalled) {
     L.push(`- 🚨 recall_log STALLED: ${bs.total_rows} rows, silent ${bs.silent_days}d (last ${bs.last_write_at?.slice(0, 16)}Z) — the writer is gone, not the data`)
   } else {
@@ -664,6 +713,13 @@ export function renderTextReport(report, opts = {}) {
     L.push(`\n## (d) recall_log blindspots (${bs.window_days}d)`)
     L.push(`  source: ${bs.by_source.map(s => `${s.source}=${s.c}`).join(' / ')}`)
     L.push(`  strict zero-hit: ${bs.strict_zero}  ·  RRF zero: ${bs.final_zero}`)
+    if (bs.stalled_sources?.length) {
+      L.push(`  🚨 stalled sources (wrote >=${DEFAULTS.sourceStallMinHistory} rows, silent >=${DEFAULTS.sourceStallDays}d):`)
+      for (const s of bs.stalled_sources) {
+        L.push(`    ${s.source}: ${s.total} rows, last ${s.last_write_at.slice(0, 16)}Z (${s.silent_days}d ago)`)
+      }
+      L.push(`    a rename looks the same as a death from here — check whether the caller was retired or broke`)
+    }
     if (bs.zero_hit_real_queries.length) {
       L.push(`  real zero-hit queries (noise filtered): ${bs.zero_hit_real_queries.map(q => `"${clip(q, 30)}"`).join(', ')}`)
     }
