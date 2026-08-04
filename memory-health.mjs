@@ -42,7 +42,7 @@ import { existsSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createRequire } from 'node:module'
-import { extractHighSignalTokens } from './high-signal-tokens.mjs'
+import { extractHighSignalTokens, isStillCarried } from './high-signal-tokens.mjs'
 
 const require = createRequire(import.meta.url)
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -535,7 +535,11 @@ export function detectShrinkVictims(db, opts = {}) {
     const nowTokens = new Set(extractHighSignalTokens(r.content))
     const lost = new Set()
     for (const p of priors) {
-      for (const t of extractHighSignalTokens(p.content)) if (!nowTokens.has(t)) lost.add(t)
+      // Same "is it still carried" rule as the write-time guard, imported rather
+      // than reimplemented — these two drifted apart once before and the audit
+      // queue is only trustworthy if it agrees with the gate that let the write
+      // through in the first place.
+      for (const t of extractHighSignalTokens(p.content)) if (!isStillCarried(t, nowTokens)) lost.add(t)
     }
     if (!lost.size) continue
     lostAny++

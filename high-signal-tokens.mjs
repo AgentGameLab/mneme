@@ -56,6 +56,30 @@ export function extractHighSignalTokens(text) {
  *   every prior version); when supplied it enables the ledger exemption below.
  * @returns {Array<{id,oldLen,newLen,ratio,dropped,droppedCount}>} one entry per suspicious pair
  */
+// A token is still carried if the new text names it OR names something it is the
+// tail of. Writing `memory/index.mjs` out and `E:/Project/ws/memory/index.mjs` in
+// is not a loss — it is the same file, said more precisely, and set difference
+// alone calls it a drop.
+//
+// This matters more than it looks. Consolidating several memories almost always
+// expands relative references into absolute ones, so the merge that a maintainer
+// is most likely to perform is exactly the one that fires the most bogus
+// warnings. A guard that cries wolf on good edits gets ignored on the bad ones,
+// and this one exists to be read.
+//
+// Suffix must break on a separator: `send.mjs` is not carried by `feishu-send.mjs`
+// (a different file), while `memory/index.mjs` is carried by `E:/x/memory/index.mjs`.
+export function isStillCarried(token, newTokens) {
+  if (newTokens.has(token)) return true
+  for (const t of newTokens) {
+    if (t.length > token.length && t.endsWith(token)) {
+      const boundary = t[t.length - token.length - 1]
+      if (boundary === '/' || boundary === '\\') return true
+    }
+  }
+  return false
+}
+
 export function checkSupersedeShrink(newContent, olds) {
   const warnings = []
   const newTokens = new Set(extractHighSignalTokens(newContent))
@@ -83,7 +107,7 @@ export function checkSupersedeShrink(newContent, olds) {
     const peakLen = Math.max(old.peakLen || 0, oldLen)
     if (oneToOne && newLen >= peakLen) continue
 
-    const dropped = extractHighSignalTokens(old.content).filter(t => !newTokens.has(t))
+    const dropped = extractHighSignalTokens(old.content).filter(t => !isStillCarried(t, newTokens))
     const ratio = oldLen ? +(newLen / oldLen).toFixed(2) : 1
     const shrank = oneToOne && oldLen >= SHRINK_MIN_OLD_LEN && ratio < SHRINK_RATIO_FLOOR
     if (!dropped.length && !shrank) continue
