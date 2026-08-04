@@ -373,6 +373,34 @@ function check(label, cond, detail = '') {
   check('(d) a recent write clears the stall and re-enables the scan',
     live.available === true && !live.instrumentation_stalled, JSON.stringify(live).slice(0, 120))
 
+  // ── one caller going quiet while the table stays busy ──
+  //
+  // This is the case the whole-table check above cannot see, and the one that
+  // actually happens: writers die one at a time, the survivors keep the table
+  // warm, and the dead one is invisible for weeks. Both real instances were
+  // found by hand long after the fact.
+  const dead = Date.now() - 20 * 86400_000
+  for (let i = 0; i < 250; i++) ins.run(dead, 'tool-recall-hook', `tool q ${i}`, '[1]', 1, 10, 'strict', 1)
+  // A low-volume caller, silent just as long. Not a stall — an occasional one.
+  for (let i = 0; i < 12; i++) ins.run(dead, 'one-off-probe', `probe ${i}`, '[1]', 1, 10, 'sync', 1)
+  // And a busy caller that is still alive, to prove the table stays "available".
+  for (let i = 0; i < 250; i++) ins.run(Date.now(), 'context-builder', `live q ${i}`, '[1]', 1, 10, 'hybrid', 1)
+
+  const perSource = detectBlindspot(db)
+  const stalledNames = (perSource.stalled_sources || []).map(s => s.source)
+  check('(d) a high-volume source that stopped is reported as stalled',
+    stalledNames.includes('tool-recall-hook'), JSON.stringify(stalledNames))
+  check('(d) the still-writing source is not reported',
+    !stalledNames.includes('context-builder'), JSON.stringify(stalledNames))
+  check('(d) a low-volume occasional caller is not mistaken for a stall',
+    !stalledNames.includes('one-off-probe'), JSON.stringify(stalledNames))
+  check('(d) the table is still "available" — the stall is per-source, not global',
+    perSource.available === true && !perSource.instrumentation_stalled)
+  const entry = (perSource.stalled_sources || []).find(s => s.source === 'tool-recall-hook')
+  check('(d) stalled source carries volume and silence so it can be triaged',
+    !!entry && entry.total >= 250 && entry.silent_days >= 19 && !!entry.last_write_at,
+    JSON.stringify(entry))
+
   db.exec('DROP TABLE recall_log')
   db.close()
 }
