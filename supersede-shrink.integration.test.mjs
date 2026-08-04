@@ -225,5 +225,47 @@ try {
 }
 
 dbRead.close()
+// ── a token spelled more precisely is not a token dropped ──
+//
+// All three cases below are real merges from one night of memory curation. Each
+// one warned, each warning was wrong, and the reason was always the same: the
+// consolidated text expanded a relative reference into an absolute one, so plain
+// set difference saw the short form vanish.
+//
+// That is the merge a maintainer performs most often, which made this the
+// warning they would learn to ignore first — on a guard whose whole value is
+// being read.
+{
+  const { checkSupersedeShrink, isStillCarried } = await import('./high-signal-tokens.mjs')
+
+  const carried = [
+    ['memory/index.mjs', 'E:/Project/ws/memory/index.mjs'],
+    ['session-summarize.mjs', 'E:/Project/ws/memory/scripts/session-summarize.mjs'],
+    ['scripts/run.sh', 'C:/tools/scripts/run.sh'],
+  ]
+  for (const [short, long] of carried) {
+    check(`"${short}" counts as carried by "${long}"`, isStillCarried(short, new Set([long])))
+  }
+
+  // The boundary is a path separator. Same suffix, different file — must still warn.
+  check('a different file that merely ends the same way is NOT carried',
+    !isStillCarried('send.mjs', new Set(['E:/Project/ws/feishu-send.mjs'])))
+  check('a bare substring is not carried either',
+    !isStillCarried('index.mjs', new Set(['reindex.mjs'])))
+
+  const oldContent = 'runner lives at memory/index.mjs and the log rotates via scripts/run.sh, token in API_TOKEN, see https://ops.example.com/dash'
+  const newContent = 'runner lives at E:/Project/ws/memory/index.mjs and the log rotates via C:/tools/scripts/run.sh, token in API_TOKEN, see https://ops.example.com/dash — now also covers the nightly path'
+  const clean = checkSupersedeShrink(newContent, [{ id: '1', content: oldContent }])
+  check('expanding relative paths to absolute raises no warning',
+    clean.length === 0, JSON.stringify(clean))
+
+  // And the real loss still lands: same expansion, but the URL is gone.
+  const lossy = 'runner lives at E:/Project/ws/memory/index.mjs and the log rotates via C:/tools/scripts/run.sh, token in API_TOKEN'
+  const warned = checkSupersedeShrink(lossy, [{ id: '1', content: oldContent }])
+  check('a genuinely dropped identifier still warns',
+    warned.length === 1 && warned[0].dropped.some(d => d.includes('ops.example.com')),
+    JSON.stringify(warned))
+}
+
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'}: ${pass} passed / ${fail} failed`)
 process.exit(fail === 0 ? 0 : 1)
