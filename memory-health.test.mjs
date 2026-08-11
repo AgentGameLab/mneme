@@ -265,7 +265,7 @@ function check(label, cond, detail = '') {
   const db = new Database(DB_PATH)
 
   const OPS = 'ops entry: http://10.0.0.5:9000 root, /api/svc/v1 routes, SVC_TOKEN and SVC_URL env, '
-    + 'code at E:/Project/svc/, handler src/http.mjs, schema src/db.mjs. '
+    + 'code at C:/work/svc/, handler src/http.mjs, schema src/db.mjs. '
     + 'Padding so the row clears the 200B floor and has a real historical peak to measure against.'
   const priors = (content) => JSON.stringify([{ content, summary: null, merged_at: Date.now(), source_rowid: 1, created_at: Date.now() }])
   const ins = db.prepare(`INSERT INTO memories (content, summary, memory_type, category, importance, memory_level, access_count, prior_versions, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)`)
@@ -281,7 +281,7 @@ function check(label, cond, detail = '') {
   // low importance: shrank the same way but below the review bar
   ins.run('svc status: now v2.', 'low-imp shrink', 'long_term', 'general', 4, 'semi_abstract', 1, priors(OPS), t, t)
   // faithful rewrite: shorter prose, every identifier carried over
-  ins.run('http://10.0.0.5:9000 · /api/svc/v1 · SVC_TOKEN · SVC_URL · E:/Project/svc/ · src/http.mjs · src/db.mjs',
+  ins.run('http://10.0.0.5:9000 · /api/svc/v1 · SVC_TOKEN · SVC_URL · C:/work/svc/ · src/http.mjs · src/db.mjs',
     'faithful tightening', 'long_term', 'general', 9, 'semi_abstract', 3, priors(OPS), t, t)
 
   const sh = detectShrinkVictims(db)

@@ -38,7 +38,7 @@ const check = (label, cond, detail = '') => {
   check('ordinary prose with a question mark is not flagged',
     detectEncodingDamage('is the daemon up? it looked fine at 04:00') === null)
   check('intact CJK is not flagged',
-    detectEncodingDamage('daemon 重启脚本在 chinatsu-workspace/scripts 下，怎么跑？') === null)
+    detectEncodingDamage('daemon 重启脚本在 workspace/scripts 下，怎么跑？') === null)
   check('a short string is never flagged', detectEncodingDamage('??') === null)
   check('empty input is not flagged', detectEncodingDamage(null, undefined) === null)
 

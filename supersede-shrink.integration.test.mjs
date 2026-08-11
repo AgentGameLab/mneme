@@ -36,8 +36,8 @@ const FAT = `${marker} Key service ops entry.
 Service root http://100.87.169.100:8787 with agent API under /api/agent/v1.
 Set SERVICE_MANAGER_URL and SERVICE_MANAGER_TOKEN before calling.
 GET /api/agent/v1/whoami verifies identity; POST /keys/claim needs an Idempotency-Key.
-Code lives at E:/Project/key-manager/, routes in src/http.mjs, schema in src/db.mjs.
-Credentials under E:/Project/nas-setup/agents/. Inventory currently 300 available.`
+Code lives at C:/work/key-manager/, routes in src/http.mjs, schema in src/db.mjs.
+Credentials under C:/work/nas-setup/agents/. Inventory currently 300 available.`
 
 // ── Case 1: 1:1 supersede that keeps only the delta → warn on both axes ──
 {
@@ -70,8 +70,8 @@ Credentials under E:/Project/nas-setup/agents/. Inventory currently 300 availabl
   check(missed.length === 0, 'case1 high-signal tokens reported as dropped',
     missed.length ? `not reported: ${missed.join(', ')}` : `${dropped.size} tokens`)
 
-  const winPath = [...dropped].some(t => /^E:[\\/]Project/.test(t))
-  check(winPath, 'case1 windows drive path detected', [...dropped].filter(t => t.startsWith('E:')).join(', '))
+  const winPath = [...dropped].some(t => /^C:[\\/]work/.test(t))
+  check(winPath, 'case1 windows drive path detected', [...dropped].filter(t => t.startsWith('C:')).join(', '))
 }
 
 // ── Case 2: full restatement + new fact → no warning ──
@@ -239,8 +239,8 @@ dbRead.close()
   const { checkSupersedeShrink, isStillCarried } = await import('./high-signal-tokens.mjs')
 
   const carried = [
-    ['memory/index.mjs', 'E:/Project/ws/memory/index.mjs'],
-    ['session-summarize.mjs', 'E:/Project/ws/memory/scripts/session-summarize.mjs'],
+    ['memory/index.mjs', 'C:/work/ws/memory/index.mjs'],
+    ['session-summarize.mjs', 'C:/work/ws/memory/scripts/session-summarize.mjs'],
     ['scripts/run.sh', 'C:/tools/scripts/run.sh'],
   ]
   for (const [short, long] of carried) {
@@ -249,18 +249,18 @@ dbRead.close()
 
   // The boundary is a path separator. Same suffix, different file — must still warn.
   check('a different file that merely ends the same way is NOT carried',
-    !isStillCarried('send.mjs', new Set(['E:/Project/ws/feishu-send.mjs'])))
+    !isStillCarried('send.mjs', new Set(['C:/work/ws/feishu-send.mjs'])))
   check('a bare substring is not carried either',
     !isStillCarried('index.mjs', new Set(['reindex.mjs'])))
 
   const oldContent = 'runner lives at memory/index.mjs and the log rotates via scripts/run.sh, token in API_TOKEN, see https://ops.example.com/dash'
-  const newContent = 'runner lives at E:/Project/ws/memory/index.mjs and the log rotates via C:/tools/scripts/run.sh, token in API_TOKEN, see https://ops.example.com/dash — now also covers the nightly path'
+  const newContent = 'runner lives at C:/work/ws/memory/index.mjs and the log rotates via C:/tools/scripts/run.sh, token in API_TOKEN, see https://ops.example.com/dash — now also covers the nightly path'
   const clean = checkSupersedeShrink(newContent, [{ id: '1', content: oldContent }])
   check('expanding relative paths to absolute raises no warning',
     clean.length === 0, JSON.stringify(clean))
 
   // And the real loss still lands: same expansion, but the URL is gone.
-  const lossy = 'runner lives at E:/Project/ws/memory/index.mjs and the log rotates via C:/tools/scripts/run.sh, token in API_TOKEN'
+  const lossy = 'runner lives at C:/work/ws/memory/index.mjs and the log rotates via C:/tools/scripts/run.sh, token in API_TOKEN'
   const warned = checkSupersedeShrink(lossy, [{ id: '1', content: oldContent }])
   check('a genuinely dropped identifier still warns',
     warned.length === 1 && warned[0].dropped.some(d => d.includes('ops.example.com')),

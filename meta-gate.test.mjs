@@ -3,7 +3,7 @@
 
 // Configure the soft-binding vocabularies before importing the gate.
 process.env.MNEME_META_GATE_PROJECT_NAMES = 'AbyssDatabase,BlueBlob'
-process.env.MNEME_META_GATE_PERSON_NAMES = '小天,千夏,爱芮,小梦'
+process.env.MNEME_META_GATE_PERSON_NAMES = '张三,李四,王五,赵六'
 
 const { applyMetaGate } = await import('./meta-gate.mjs')
 
@@ -12,12 +12,12 @@ const cases = [
   { content: 'AbyssDatabase v0.2.0 released', expect: true, label: 'project+version' },
   { content: '2026-05-05 ship notes for the mesh refactor', expect: true, label: 'iso_date' },
   { content: 'continues from mem 6008 personality rules', expect: true, label: 'mem_ref' },
-  { content: 'edit E:/Project/example/store.mjs to add the guard', expect: true, label: 'abs_path_windows' },
+  { content: 'edit C:/work/example/store.mjs to add the guard', expect: true, label: 'abs_path_windows' },
   { content: 'the daemon config lives at /etc/mneme/config.json', expect: true, label: 'abs_path_posix' },
   { content: 'after commit 41171eb we must verify the committer', expect: true, label: 'commit_hash' },
 
   // Downgrade (soft bindings — require env-configured vocabularies)
-  { content: '小天 and 千夏 aligned on the approach', expect: true, label: 'multi_person (env)' },
+  { content: '张三 and 李四 aligned on the approach', expect: true, label: 'multi_person (env)' },
 
   // Pass — signal-word cue and no bindings
   { content: 'cross-project rule: verify before you cite, always', expect: false, label: 'meta_signal_head' },
@@ -29,7 +29,7 @@ const cases = [
   { content: 'listen on port 8080000 in the dev sandbox', expect: false, label: 'digit_only_not_hash' },
 
   // Pass — single person mention below multi-person threshold
-  { content: 'when writing 小天 should not inflate importance to please anyone', expect: false, label: 'single_person' },
+  { content: 'when writing 张三 should not inflate importance to please anyone', expect: false, label: 'single_person' },
 ]
 
 let pass = 0, fail = 0
