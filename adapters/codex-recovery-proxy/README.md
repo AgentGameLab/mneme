@@ -12,7 +12,7 @@ Codex Desktop 有一个未修复的上游 bug（[openai/codex#32470](https://git
 
 不修 codex 的 bug（那要上游修），而是**让 bug 不能传播**：
 
-- codex 侧仍看到一个 stdio MCP server（`chinatsu-memory`）
+- codex 侧仍看到一个 stdio MCP server（`mneme`）
 - proxy 内部把每次 `tools/list` 或 `tools/call` 转成一次**独立的 HTTP session** 打到真 mneme server
 - 每次调用**结束即 DELETE session**，30 秒有界 timeout
 - **写调用绝不自动重试**（保 at-most-once 语义，不会导致重复 store_memory）
@@ -29,17 +29,20 @@ Codex Desktop 有一个未修复的上游 bug（[openai/codex#32470](https://git
 编辑 `~/.codex/config.toml`：
 
 ```toml
-[mcp_servers.chinatsu-memory]
+[mcp_servers.mneme]
 command = "node"
 args = ["<mneme-path>/adapters/codex-recovery-proxy/proxy.mjs"]
 env_vars = ["MNEME_TOKEN_CODEX"]
 startup_timeout_sec = 20
 tool_timeout_sec = 40
 
-[mcp_servers.chinatsu-memory.env]
+[mcp_servers.mneme.env]
 MNEME_HTTP_URL = "http://127.0.0.1:18792/mcp"
 MNEME_PROXY_TIMEOUT_MS = "30000"
 ```
+
+> `mcp_servers` 下的这个 key 是你自己起的名字，codex 用它在配置里指代这个 server，proxy 本身不读它。
+> 早先版本的 README 用的是另一个名字，已经配好的不用改，照常能用。
 
 ### 2. 环境变量
 
