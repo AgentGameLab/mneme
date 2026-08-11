@@ -44,8 +44,8 @@ reproducible result.
 node benchmarks/longmemeval/run.mjs `
   --dataset C:\data\longmemeval_s_cleaned.json `
   --per-category 5 `
-  --engine baseline=E:\Project\mneme-baseline\index.mjs `
-  --engine candidate=E:\Project\mneme\index.mjs `
+  --engine baseline=C:\work\mneme-baseline\index.mjs `
+  --engine candidate=C:\work\mneme\index.mjs `
   --output C:\tmp\mneme-longmemeval-ab.json
 ```
 

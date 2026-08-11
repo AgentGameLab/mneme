@@ -338,7 +338,7 @@ export function initMemory() {
   // migration 003: decay_score + prior_versions (power-law decay + supersede paper trail).
   // Inline so upgrading an OLD db gets them without manually applying migrations/003 —
   // otherwise recall's `AND decay_score >= ?` (strict/cold-pool path) throws "no such column".
-  // (2026-06-10: caught during 爱芮 engram v1.1→v2.2 upgrade — 003 was the only file not inlined.)
+  // (2026-06-10: caught during an engram v1.1→v2.2 upgrade — 003 was the only file not inlined.)
   try {
     db.exec(`ALTER TABLE memories ADD COLUMN decay_score REAL NOT NULL DEFAULT 1.0`)
     log('Migration: added decay_score column')

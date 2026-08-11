@@ -19,7 +19,7 @@ export const SHRINK_MIN_OLD_LEN = 200
 // What ends a URL or path token. Half-width ':' and ',' stay legal (ports,
 // and trailing commas are stripped afterwards), but CJK text and CJK punctuation
 // terminate: Chinese prose runs straight into a path with no space, so without
-// this a path swallows the rest of the sentence — "E:/Project/foo/。使用文档是".
+// this a path swallows the rest of the sentence — "C:/work/foo/。使用文档是".
 const PATH_STOP = '\\s"\'`)）(（\\[\\]【】，、。；：！？…\\u4e00-\\u9fff\\u3000-\\u303f'
 
 const HIGH_SIGNAL_PATTERNS = [
@@ -57,7 +57,7 @@ export function extractHighSignalTokens(text) {
  * @returns {Array<{id,oldLen,newLen,ratio,dropped,droppedCount}>} one entry per suspicious pair
  */
 // A token is still carried if the new text names it OR names something it is the
-// tail of. Writing `memory/index.mjs` out and `E:/Project/ws/memory/index.mjs` in
+// tail of. Writing `memory/index.mjs` out and `C:/work/ws/memory/index.mjs` in
 // is not a loss — it is the same file, said more precisely, and set difference
 // alone calls it a drop.
 //

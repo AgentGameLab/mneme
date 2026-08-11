@@ -28,7 +28,7 @@ const require = createRequire(import.meta.url)
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
 // ── Load .env.local if present ─────────────────────────────
-// [2026-05-29 千夏 fix] .env.local 在 chinatsu-workspace/（memory/ 上一级），
+// [2026-05-29 fix] .env.local 在 workspace/（memory/ 上一级），
 // 不在 memory/。原代码 resolve(__dirname,'.env.local') 指向 memory/.env.local（不存在）→
 // 除非 shell 已 export env 否则 EMBEDDING_API_KEY 取不到直接 exit 1。两个路径都试。
 for (const p of [resolve(__dirname, '..', '.env.local'), resolve(__dirname, '.env.local')]) {
@@ -53,7 +53,7 @@ const CONCURRENCY = parseInt(getFlag('--concurrency') || '3', 10)
 const DRY_RUN = hasFlag('--dry-run')
 
 // ── Configuration ───────────────────────────────────────────
-// [2026-05-29 千夏 fix] 与 index.mjs:35-38 同一套解析：优先 engram.db（真实库），
+// [2026-05-29 fix] 与 index.mjs:35-38 同一套解析：优先 engram.db（真实库），
 // 原默认 tokenmem.db 是 fresh-install 占位库（仅 10 行）→ 回填空转。
 const DB_PATH = process.env.TOKENMEM_DB_PATH
   || (existsSync(resolve(__dirname, 'engram.db'))
