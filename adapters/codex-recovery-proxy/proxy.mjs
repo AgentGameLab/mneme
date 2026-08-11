@@ -188,11 +188,11 @@ async function withFreshRemote(label, operation) {
 }
 
 const proxy = new Server(
-  { name: 'chinatsu-memory-recovery-proxy', version: '1.0.0' },
+  { name: 'mneme-recovery-proxy', version: '1.0.0' },
   {
     capabilities: { tools: {} },
     instructions:
-      'Transparent recovery proxy for chinatsu-memory. Every tool call uses a fresh remote HTTP session. Failed calls are not retried automatically.',
+      'Transparent recovery proxy for mneme. Every tool call uses a fresh remote HTTP session. Failed calls are not retried automatically.',
   },
 )
 
