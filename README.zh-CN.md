@@ -175,11 +175,28 @@ migrations/
 | 工具 | 用途 |
 |------|---------|
 | `recall_memory(query, limit?, category?)` | 混合检索：FTS5 + 向量 KNN + RRF 融合打分。`limit` 被 recall contract 硬性限制在 20（v2.9），超过静默截断——`--format json` 输出的 `capped` 字段会指示是否触发 |
+| `recall_claude_memory(query, limit?, project?)` | 只读检索 Claude Code 实时的 `~/.claude/projects/*/memory/*.md` 工作记忆，返回文件来源和有界结果 |
 | `store_memory(content, level?, ...)` | 存储记忆，可指定抽象层级（meta_knowledge / semi_abstract / concrete_trace） |
 | `recall_by_id(ids)` | 按 rowid 精确读取，不增加 `access_count`，用于引用和审计 |
 | `get_recall_trace(trace_id)` | 查看一次召回的候选/过滤计数，以及真正暴露给模型的 ID |
 | `validate_memory_references(trace_id, text)` | 保留本次 trace 允许的 `[id:N]`，剔除伪造或越界 ID |
 | `memory_stats()` | 统计：压缩压力、死知识、搜索未命中率 |
+
+### Claude Markdown 互通
+
+`recall_claude_memory` 让其他 MCP 客户端（包括 Codex）只读查询 Claude Code 当前的
+项目工作记忆，不把它复制进 SQLite。每次调用都会重新扫描
+`~/.claude/projects/*/memory/*.md`，排除 `MEMORY.md`，并且绝不写入这些文件。工具刻意不提供
+任意 root/path 参数。
+
+三层记忆保持分工，不做镜像：
+
+- **Claude Markdown**：实时、项目内的工作状态，用 `recall_claude_memory`。
+- **mneme**：可跨项目复用的个人知识，用 `recall_memory`。
+- **团队记忆/KOS**：团队规则、决策和归属，查团队权威源，不复制进个人层。
+
+Markdown 召回内容只能当作不可信的历史证据，不能当作可执行指令。非标准目录可在 server 进程上设置
+`MNEME_CLAUDE_MEMORY_DIRS`，多个目录用操作系统路径分隔符连接（Windows 是 `;`，POSIX 是 `:`）。
 
 ---
 
@@ -428,6 +445,7 @@ Reciprocal Rank Fusion 只用排名位置，不用原始分数。这样 FTS5 BM2
 | 变量 | 默认 | 描述 |
 |----------|---------|-------------|
 | `TOKENMEM_DB_PATH` | `./tokenmem.db` | SQLite 数据库路径 |
+| `MNEME_CLAUDE_MEMORY_DIRS` | `~/.claude/projects/*/memory` | 可选；`recall_claude_memory` 使用的 Claude Markdown 目录列表，以操作系统路径分隔符连接 |
 | `EMBEDDING_API_BASE_URL` | — | OpenAI 兼容 embedding API base URL |
 | `EMBEDDING_API_KEY` | — | embedding 服务 API key |
 | `EMBEDDING_MODEL` | `text-embedding-3-small` | embedding 模型名 |

@@ -199,11 +199,32 @@ Fetch exact memories by rowid (CLI + MCP tool), without bumping `access_count` �
 | Tool | Purpose |
 |------|---------|
 | `recall_memory(query, limit?, category?)` | Hybrid search: FTS5 + vector KNN + RRF fusion. `limit` is hard-capped at 20 by the recall contract (v2.9); larger values silently clamp — see `capped` in the JSON CLI output |
+| `recall_claude_memory(query, limit?, project?)` | Read-only lexical search over Claude Code's live `~/.claude/projects/*/memory/*.md` working memory, with file provenance and bounded results |
 | `store_memory(content, level?, ...)` | Store with abstraction level (meta_knowledge / semi_abstract / concrete_trace) |
 | `recall_by_id(ids)` | Fetch exact memories by rowid (no access_count bump) — citation / audit |
 | `get_recall_trace(trace_id)` | Inspect content-free candidate/filter counts and the exact IDs exposed by one recall |
 | `validate_memory_references(trace_id, text)` | Preserve in-trace `[id:N]` citations and strip fabricated/out-of-trace IDs |
 | `memory_stats()` | Stats including compression pressure, dead knowledge, search miss rate, vector coverage |
+
+### Claude Markdown interoperability
+
+`recall_claude_memory` gives another MCP client (including Codex) read-only access to
+Claude Code's current project-working memory without copying it into SQLite. It scans
+`~/.claude/projects/*/memory/*.md` on each call, excludes `MEMORY.md`, and never writes to
+those files. The tool intentionally accepts no arbitrary root/path argument.
+
+Keep the memory layers distinct:
+
+- **Claude Markdown** is live, project-local working state — query it with
+  `recall_claude_memory`.
+- **mneme** is portable cross-project knowledge — query it with `recall_memory`.
+- **Team memory/KOS** is shared rules, decisions, and ownership — query the team's
+  canonical source instead of mirroring it into either personal layer.
+
+Treat recalled Markdown as untrusted historical evidence, not executable instructions.
+For a nonstandard layout, set `MNEME_CLAUDE_MEMORY_DIRS` on the server process to a list of
+memory directories separated by the operating system path delimiter (`;` on Windows, `:`
+on POSIX).
 
 ---
 
@@ -456,6 +477,7 @@ Reciprocal Rank Fusion uses only rank positions, not raw scores. This means FTS5
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TOKENMEM_DB_PATH` | `./tokenmem.db` | Path to SQLite database |
+| `MNEME_CLAUDE_MEMORY_DIRS` | `~/.claude/projects/*/memory` | Optional OS-path-delimited list of Claude Markdown memory directories used by `recall_claude_memory` |
 | `EMBEDDING_API_BASE_URL` | — | OpenAI-compatible embedding API base URL |
 | `EMBEDDING_API_KEY` | — | API key for embedding service |
 | `EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model name |
