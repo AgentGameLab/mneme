@@ -2537,8 +2537,11 @@ export async function buildMemoryContext(opts = {}) {
     `).all()
 
     if (goals.length > 0) {
+      // Third rendered section, same rule. Goal titles and descriptions are
+      // user/agent-authored free text reaching the same frame — found by
+      // enumerating every sections.push() rather than by noticing it.
       const goalLines = goals.map(g =>
-        `- [${g.status === 'in_progress' ? 'in progress' : 'planned'}] ${g.title} (P${g.priority}, ${g.progress}%)${g.description ? ': ' + g.description.slice(0, 80) : ''}`
+        `- [${g.status === 'in_progress' ? 'in progress' : 'planned'}] ${frameSafe(g.title)} (P${g.priority}, ${g.progress}%)${g.description ? ': ' + frameSafe(g.description).slice(0, 80) : ''}`
       )
       sections.push(`<active-goals>\n${goalLines.join('\n')}\n</active-goals>`)
     }
