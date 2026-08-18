@@ -2784,7 +2784,7 @@ export function runLevelMigration(opts = {}) {
   const out = { scanned: 0, candidates: 0, demoted: 0, promoted: 0, clamped: 0, anchor: anchorPath || null }
   try {
     const rows = db.prepare(`
-      SELECT rowid, memory_level, importance, access_count, created_at
+      SELECT rowid, memory_level, importance, access_count, created_at, is_anchor, is_pinned
       FROM memories
       WHERE deleted_at IS NULL AND superseded_by IS NULL AND memory_type != 'permanent'
     `).all()
@@ -2793,9 +2793,27 @@ export function runLevelMigration(opts = {}) {
     for (const r of rows) {
       const age = now - r.created_at
       const ac = r.access_count || 0
+      // is_anchor / is_pinned mean "keep this surfaced" — a recall floor the
+      // user set by hand, against a quota. Ageing it downward is the nightly
+      // job overruling that, and silently: the flag stays set while the weight
+      // it was meant to guarantee drops. Exempt from DEMOTION only; promotion
+      // still applies, since raising a pinned row never contradicts the pin.
+      const protectedRow = r.is_anchor === 1 || r.is_pinned === 1
       let newLevel = r.memory_level, newImp = r.importance
       if (r.memory_level === 'meta_knowledge') {
-        if ((ac === 0 && age > D30) || (ac <= 2 && age > D90)) newLevel = 'semi_abstract'
+        if (!protectedRow && ((ac === 0 && age > D30) || (ac <= 2 && age > D90))) newLevel = 'semi_abstract'
+      } else if (r.memory_level === 'semi_abstract') {
+        // Second stage. Without it semi_abstract is a terminal sink: rows arrive
+        // from meta and never leave, so an entry that stopped being useful keeps
+        // competing at weight 1.0 with live ones in every recall, forever. On the
+        // live store that was 1,276 rows past 30 days with zero recalls, while
+        // concrete_trace held 78 — nothing demotes into it, only promotes out.
+        //
+        // Deliberately stricter than the stage above (>90d and <=2, not >30d and
+        // 0). Reusing the 30-day arm would cascade a row meta -> semi -> concrete
+        // inside a single night, which is not ageing, it is deleting by ladder.
+        // Surviving 90 days on two recalls is the evidence this asks for.
+        if (!protectedRow && ac <= 2 && age > D90) newLevel = 'concrete_trace'
       } else if (r.memory_level === 'concrete_trace') {
         if (ac >= 6) newLevel = 'semi_abstract'
         if (newImp > 5) newImp = 5
@@ -2806,8 +2824,16 @@ export function runLevelMigration(opts = {}) {
     }
     const bounded = Number.isFinite(limit) ? changes.slice(0, limit) : changes
     out.candidates = bounded.length
+    // Direction by rank, not by which level it started from. The old form read
+    // `old_level === 'meta_knowledge' ? demoted : promoted`, which was correct
+    // only while meta was the sole source of demotions — with a second stage,
+    // semi -> concrete would have been counted as a promotion and the nightly
+    // report would have shown the ladder running backwards.
+    const RANK = { concrete_trace: 0, semi_abstract: 1, meta_knowledge: 2 }
     const tally = (c) => {
-      if (c.new_level !== c.old_level) { if (c.old_level === 'meta_knowledge') out.demoted++; else out.promoted++ }
+      if (c.new_level !== c.old_level) {
+        if (RANK[c.new_level] < RANK[c.old_level]) out.demoted++; else out.promoted++
+      }
       if (c.new_importance !== c.old_importance) out.clamped++
     }
     if (dryRun) {

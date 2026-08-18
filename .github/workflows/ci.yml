@@ -58,6 +58,11 @@ jobs:
           TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-encoding-damage.db
         run: node encoding-damage.integration.test.mjs
 
+      - name: Integration test (level migration ladder + pin exemption)
+        env:
+          TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-level-migration.db
+        run: node level-migration-stages.integration.test.mjs
+
       - name: Integration test (supersede shrink guard)
         env:
           TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-supersede-shrink.db
