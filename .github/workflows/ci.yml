@@ -53,6 +53,11 @@ jobs:
         env:
           TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-provenance.db
         run: node provenance-quarantine.integration.test.mjs
+      - name: Integration test (recall injection hygiene — frame escaping)
+        env:
+          TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-injection-hygiene.db
+        run: node injection-hygiene.integration.test.mjs
+
       - name: Integration test (encoding-damage detection, both write paths)
         env:
           TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-encoding-damage.db
