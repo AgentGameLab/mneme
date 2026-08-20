@@ -22,7 +22,10 @@ try {
   const offsetMatch = hybridSource.match(/const LEVEL_RANK_OFFSET = (\{[^\n]+\})/)
   const rrfMatch = source.match(/const RRF_K = (\d+)/)
   const contributionMatch = hybridSource.match(/const contribution = 1 \/ \(RRF_K \+ idx \+ 1 \+ offset\)/)
-  const scoreMatch = hybridSource.match(/const score = \(rrf \* 10 \+ freqScore \* 0\.10 \+ timeScore \* 0\.06 \+ importanceScore \* 0\.05\) \* decay/)
+  // Pins the composite's shape. importanceScore left the sum deliberately: a
+  // self-rated field measured to be uncorrelated with use was buying 2-4 rank
+  // positions against RRF's ~0.0026 spacing. See ranking-importance.integration.test.mjs.
+  const scoreMatch = hybridSource.match(/const score = \(rrf \* 10 \+ freqScore \* 0\.10 \+ timeScore \* 0\.06\) \* decay/)
   const levelWeightMatch = hybridSource.match(/const levelWeight = LEVEL_WEIGHT\[row\.memory_level\] \|\| 1\.0/)
 
   check('hybrid fusion declares the intended level rank offsets',
