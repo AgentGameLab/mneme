@@ -241,6 +241,37 @@ mneme is a standard **MCP server**, supporting both **stdio** (default, one proc
 | Windsurf | Add to MCP server config |
 | Cline / Continue | Add to MCP settings |
 
+**Config provided, not verified by us:**
+
+| Agent | Setup |
+|-------|-------|
+| DeepSeek Harness (dsh) | Copy [`examples/dsh.cordis.yml`](examples/dsh.cordis.yml) into your dsh config — see below |
+
+### DeepSeek Harness
+
+dsh deliberately ships no memory layer of its own. Its design notes reject
+per-provider plugins outright, on the grounds that they repeat "auth,
+configuration, lifecycle, and tool wrappers that MCP already standardizes" — so
+the supported path is a Cordis overlay pointing its generic MCP client at
+whatever server you want.
+
+That means mneme needs no dsh plugin and no adapter code. It already speaks
+stdio MCP, which is the only thing the overlay requires. The integration is a
+config file: [`examples/dsh.cordis.yml`](examples/dsh.cordis.yml).
+
+Two caveats worth reading before you wire it up:
+
+- **The overlay uses `node <abs-path>/mcp-server.mjs`, not a bare command.**
+  mneme is not on npm with a `bin`, so there is nothing on PATH to invoke. You
+  need a checkout.
+- **Set `EMBEDDING_API_*`.** Without them mneme starts, answers, and gives you
+  FTS5 keyword search only. Hybrid recall is the reason to run it; losing it is
+  not an error, just a quieter and worse result set.
+
+The overlay is provided as a starting point and is **not covered by this repo's
+test suite** — the CI here exercises mneme's own MCP server, not dsh's loader.
+Reports of it working (or not) are welcome.
+
 ---
 
 ## Features
