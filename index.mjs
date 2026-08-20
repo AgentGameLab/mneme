@@ -1889,7 +1889,6 @@ export function recallMemories(opts = {}) {
     const ftsScore = opts._legacyFtsScoring
       ? (row.fts_rank ? Math.min(1, Math.abs(row.fts_rank) / 10) : 0)
       : normalizedFtsScore(row.fts_rank, maxFtsMagnitude)
-    const importanceScore = row.importance / 10
     // migration 004 (v2.2): age based on event_time when set, else created_at fallback.
     // Lets temporal queries ("what did I do last June?") match by when the event happened,
     // not when it was recorded.
@@ -1902,7 +1901,10 @@ export function recallMemories(opts = {}) {
     const accessScore = Math.min(1, Math.log1p(row.access_count || 0) / Math.log1p(20))
     const levelWeight = LEVEL_WEIGHT[row.memory_level] || 1.0
 
-    const baseScore = (ftsScore * 0.55) + (accessScore * 0.2) + (timeScore * 0.15) + (importanceScore * 0.1)
+    // Dropped here too — same measurement, and this path weighted it twice as
+    // heavily as the hybrid one. Weights renormalized across the three surviving
+    // signals so the score keeps its 0-1 shape.
+    const baseScore = (ftsScore * 0.61) + (accessScore * 0.22) + (timeScore * 0.17)
     // migration 003: decay_score as multiplier (periodically updated by runDecayCycle)
     // Defaults to 1.0 for records that haven't been through a decay cycle — backward compatible
     const decay = (row.decay_score != null) ? row.decay_score : 1.0
@@ -2198,7 +2200,6 @@ export async function recallMemoriesHybrid(opts = {}) {
     dropped: Math.max(0, rrfScores.size - fusedCandidates.length),
   })
   let merged = fusedCandidates.map(({ row, rrf, sources }) => {
-    const importanceScore = row.importance / 10
     // migration 004 (v2.2): age based on event_time when set, else created_at fallback
     const effectiveTime = row.event_time != null ? row.event_time : row.created_at
     const age = now - effectiveTime
@@ -2214,7 +2215,22 @@ export async function recallMemoriesHybrid(opts = {}) {
     // recalled->access++->ranked-higher loop), now the primary structural tiebreak.
     const freqScore = Math.min(1, Math.log1p(row.access_count || 0) / Math.log1p(20))
     const decay = (row.decay_score != null) ? row.decay_score : 1.0
-    const score = (rrf * 10 + freqScore * 0.10 + timeScore * 0.06 + importanceScore * 0.05) * decay
+    // importance is NOT in this sum, deliberately. It was demoted to 0.05 rather
+    // than removed, on the reasoning that a weak prior is harmless. Measured
+    // against RRF's actual spacing it is not: adjacent ranks differ by ~0.0026,
+    // so 0.05 buys imp8-over-imp7 two places and imp9-over-imp7 four. In a top-8
+    // injection, four places decides whether a row is seen at all.
+    //
+    // And the field it spent that leverage on carries no signal: on a live
+    // 8.6k-row store, rows ever recalled average importance 7.70 and rows never
+    // recalled 7.36 — a 0.34 gap on a 1-10 scale, 90% of the corpus at >=7. A
+    // self-rated number that does not predict use should not move results past
+    // genuine retrieval evidence.
+    //
+    // importance keeps what it is good at: the min_importance filter,
+    // surface-cold thresholds, display. Filtering on it is a caller stating a
+    // floor; ranking on it is the store guessing.
+    const score = (rrf * 10 + freqScore * 0.10 + timeScore * 0.06) * decay
     const temporalMetadata = temporalWindow
       ? { temporal_match: isInTemporalWindow(row, temporalWindow) }
       : {}

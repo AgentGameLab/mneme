@@ -58,6 +58,11 @@ jobs:
           TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-injection-hygiene.db
         run: node injection-hygiene.integration.test.mjs
 
+      - name: Integration test (ranking — importance filters, does not rank)
+        env:
+          TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-ranking-importance.db
+        run: node ranking-importance.integration.test.mjs
+
       - name: Integration test (encoding-damage detection, both write paths)
         env:
           TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-encoding-damage.db
