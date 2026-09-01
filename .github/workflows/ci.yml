@@ -113,5 +113,10 @@ jobs:
           TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-query-rewrite.db
         run: node query-rewrite.test.mjs
 
+      - name: Integration test (cold pool selects by reuse, not self-rated importance)
+        env:
+          TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-cold-pool.db
+        run: node cold-pool-gate.test.mjs
+
       - name: Adapter test (codex-recovery-proxy fault injection)
         run: node adapters/codex-recovery-proxy/proxy.test.mjs

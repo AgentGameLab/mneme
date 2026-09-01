@@ -20,10 +20,15 @@ ALTER TABLE memories ADD COLUMN decay_score REAL NOT NULL DEFAULT 1.0;
 -- 2. prior_versions -- paper trail; on supersede, push old content/summary/ts into this array
 ALTER TABLE memories ADD COLUMN prior_versions TEXT NOT NULL DEFAULT '[]';
 
--- 3. Index for surfaced_random cold pool (small subset; index accelerates RANDOM() sampling)
+-- 3. Index for surfaced_random cold pool (index accelerates RANDOM() sampling).
+-- 2026-09-01: was ON (importance, last_accessed, decay_score) partial on
+-- `importance >= 8`. The pool no longer filters on importance -- it selects by
+-- staleness + decay, which is reuse-derived rather than self-rated -- so the old
+-- index could not serve the query. Leads on last_accessed, which the pool
+-- range-filters. index.mjs carries a matching guarded rebuild for existing DBs.
 CREATE INDEX IF NOT EXISTS idx_mem_surface_pool
-  ON memories(importance, last_accessed, decay_score)
-  WHERE deleted_at IS NULL AND superseded_by IS NULL AND importance >= 8;
+  ON memories(last_accessed, decay_score)
+  WHERE deleted_at IS NULL AND superseded_by IS NULL;
 
 -- Verify:
 --   PRAGMA table_info(memories);

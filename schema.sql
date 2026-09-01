@@ -93,10 +93,13 @@ CREATE INDEX IF NOT EXISTS idx_mem_superseded_by
   ON memories(superseded_by)
   WHERE superseded_by IS NOT NULL AND deleted_at IS NULL;
 
--- v2.1: Surfaced-random cold pool index (importance >= 8 AND 30d untouched AND decay >= 0.3)
+-- v2.1: Surfaced-random cold pool index (30d untouched AND decay >= 0.3).
+-- 2026-09-01: dropped the importance leg. The pool selects by staleness + decay
+-- (reuse-derived) rather than by self-rated importance, so an importance-keyed
+-- partial index could not serve the query.
 CREATE INDEX IF NOT EXISTS idx_mem_surface_pool
-  ON memories(importance, last_accessed, decay_score)
-  WHERE deleted_at IS NULL AND superseded_by IS NULL AND importance >= 8;
+  ON memories(last_accessed, decay_score)
+  WHERE deleted_at IS NULL AND superseded_by IS NULL;
 
 -- FTS5 virtual table (full-text search)
 -- Default tokenize='unicode61' (built-in, zero-dependency — boots on any SQLite,
