@@ -118,5 +118,10 @@ jobs:
           TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-cold-pool.db
         run: node cold-pool-gate.test.mjs
 
+      - name: Integration test (embedding timeout — hot path degrades instead of hanging)
+        env:
+          TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-embedding-timeout.db
+        run: node embedding-timeout.integration.test.mjs
+
       - name: Adapter test (codex-recovery-proxy fault injection)
         run: node adapters/codex-recovery-proxy/proxy.test.mjs
