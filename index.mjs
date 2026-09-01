@@ -348,7 +348,22 @@ export function initMemory() {
     log('Migration: added prior_versions column')
   } catch {}
   try {
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_surface_pool ON memories(importance, last_accessed, decay_score) WHERE deleted_at IS NULL AND superseded_by IS NULL AND importance >= 8`)
+    // Partial index for the cold pool. Rebuilt 2026-09-01: the old definition led
+    // on importance and was partial on `importance >= 8`. With that term gone from
+    // the pool query, SQLite can no longer use it and falls back to a scan. The
+    // new one leads on last_accessed, which is what the query range-filters.
+    //
+    // This whole migration block re-runs on every initMemory(), so the DROP is
+    // guarded on the old definition actually being present — otherwise every
+    // process start would rebuild the index, and that cost grows with the library.
+    const surfaceIdx = db.prepare(
+      `SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_mem_surface_pool'`
+    ).get()
+    if (surfaceIdx?.sql && /importance/i.test(surfaceIdx.sql)) {
+      db.exec(`DROP INDEX idx_mem_surface_pool`)
+      log('Migration: rebuilt idx_mem_surface_pool (was keyed on importance)')
+    }
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_surface_pool ON memories(last_accessed, decay_score) WHERE deleted_at IS NULL AND superseded_by IS NULL`)
   } catch {}
   // migration 008 (v2.6): is_anchor / is_pinned scarcity-as-structure layer.
   // Ombre-Brain inspired: importance 1-10 is a weak prior that gets inflated
@@ -1941,7 +1956,7 @@ export function recallMemories(opts = {}) {
   let result = filtered.slice(0, limit)
 
   // migration 003: surfaced_random — when result < limit, 25% chance of pulling
-  // 1-3 records from the cold pool (importance >= 8 AND 30d untouched AND decay >= 0.3)
+  // 1-3 records from the cold pool (30d untouched AND decay >= 0.3 — see selectColdPoolCandidates)
   // Skipped when called internally by recallMemoriesHybrid (avoid double-surfacing)
   if (!opts._internal && queryText && result.length < limit) {
     const surfaced = surfaceRandomMemories(db, result.map(r => r.rowid), limit - result.length, now)
@@ -2635,21 +2650,34 @@ export async function buildMemoryContext(opts = {}) {
 
 // ── migration 003: surfaced_random pool ─────────────────────
 // When recall result count < limit, with 25% probability, surface 1-3 records
-// from the cold pool: importance >= 8 AND last_accessed < (now - 30d)
-//   AND decay_score >= 0.3 AND deleted_at IS NULL AND superseded_by IS NULL.
+// from the cold pool: last_accessed < (now - 30d) AND decay_score >= 0.3
+//   AND deleted_at IS NULL AND superseded_by IS NULL.
 // Models the "I just remembered something" feeling — covers cold-recall blind
-// spots and lets long-decayed but still-important memories resurface.
+// spots and lets long-decayed but still-useful memories resurface.
+//
+// 2026-09-01: dropped the importance >= 8 term. It was meant to read as "still
+// important", but importance is self-rated at write time and 89% of the library
+// sits at >= 7, so it was not selecting for importance — it was excluding 441 of
+// 1124 eligible rows on the basis of a number nobody calibrated. The excluded set
+// was led by the single most-recalled memory in the database (access_count=1879,
+// importance=5).
+//
+// The decay floor already does this job, and does it on earned signal: decay is
+// w(age) * reuseBoost(access_count), so a row that has been cold for 30 days only
+// still holds decay_score >= 0.3 if it was reused heavily. Measured on the same
+// library, every row reaching the pool had access_count >= 8 (avg 135). Selecting
+// by reuse is what "still worth remembering" was always trying to approximate.
 const SURFACE_RANDOM_PROB = 0.25
 const SURFACE_RANDOM_MAX = 3
 const SURFACE_AGE_MS = 30 * 86400_000
 const SURFACE_DECAY_FLOOR = 0.3
-const SURFACE_IMPORTANCE_MIN = 8
 
-function surfaceRandomMemories(db, excludeRowids, slotsAvailable, nowMs) {
-  if (slotsAvailable <= 0) return []
-  if (Math.random() > SURFACE_RANDOM_PROB) return []
-  const cutoff = nowMs - SURFACE_AGE_MS
-  const take = Math.min(SURFACE_RANDOM_MAX, slotsAvailable)
+/**
+ * The cold-pool query, split out from the probability roll so it can be tested
+ * without fighting Math.random() or ORDER BY RANDOM().
+ */
+export function selectColdPoolCandidates(db, { excludeRowids, take, nowMs } = {}) {
+  const cutoff = (nowMs ?? Date.now()) - SURFACE_AGE_MS
   const excludeClause = excludeRowids?.length
     ? `AND rowid NOT IN (${excludeRowids.map(() => '?').join(',')})`
     : ''
@@ -2658,13 +2686,12 @@ function surfaceRandomMemories(db, excludeRowids, slotsAvailable, nowMs) {
       SELECT rowid, * FROM memories
       WHERE deleted_at IS NULL
         AND superseded_by IS NULL
-        AND importance >= ?
         AND last_accessed < ?
         AND decay_score >= ?
         ${excludeClause}
       ORDER BY RANDOM()
       LIMIT ?
-    `).all(SURFACE_IMPORTANCE_MIN, cutoff, SURFACE_DECAY_FLOOR, ...(excludeRowids || []), take)
+    `).all(cutoff, SURFACE_DECAY_FLOOR, ...(excludeRowids || []), take ?? SURFACE_RANDOM_MAX)
     return rows.map(r => ({
       ...r,
       score: 0,
@@ -2673,9 +2700,19 @@ function surfaceRandomMemories(db, excludeRowids, slotsAvailable, nowMs) {
       recall_source: 'surfaced_random',  // callers can distinguish from query matches
     }))
   } catch (e) {
-    log(`surfaceRandomMemories failed: ${e.message}`)
+    log(`selectColdPoolCandidates failed: ${e.message}`)
     return []
   }
+}
+
+function surfaceRandomMemories(db, excludeRowids, slotsAvailable, nowMs) {
+  if (slotsAvailable <= 0) return []
+  if (Math.random() > SURFACE_RANDOM_PROB) return []
+  return selectColdPoolCandidates(db, {
+    excludeRowids,
+    take: Math.min(SURFACE_RANDOM_MAX, slotsAvailable),
+    nowMs,
+  })
 }
 
 // ── Memory Management ───────────────────────────────────────
