@@ -39,6 +39,9 @@ jobs:
       - name: Unit tests (meta-gate)
         run: node meta-gate.test.mjs
 
+      - name: Unit tests (series detection — keeps timelines out of the supersede band)
+        run: node series-detection.test.mjs
+
       - name: Integration test (meta-gate write-gate)
         env:
           TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-meta-gate.db

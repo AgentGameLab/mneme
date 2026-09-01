@@ -80,8 +80,21 @@ export const DEFAULTS = Object.freeze({
   // recall_log analytics window in days.
   recallLogDays: 7,
   // Minimum frequency at which a repeat query surfaces as a "you keep looking
-  // this up — maybe store the answer" candidate.
+  // this up — maybe store the answer" candidate. Frequency alone is not
+  // evidence of a gap: a query can repeat because recall answers it well and
+  // the topic is hot. Only repeats whose recall actually comes back thin are
+  // reported — see repeatQueryMaxAvgHits.
   repeatQueryMin: 3,
+  // A repeating query is a sediment gap only if it typically returns less than
+  // this many rows. Measured 2026-09-01: every freq>=3 query in a 7d window
+  // averaged 5-20 hits, i.e. the un-filtered signal was 100% false positive.
+  repeatQueryMaxAvgHits: 1,
+  // Two rows written inside this window are treated as one working session: a
+  // log, a request and its reply, a decision and its refinement — not two
+  // drafts of one fact. Calibrated on 10 hand-classified pairs (2026-09-01);
+  // the closest true rewrite in that set sat 5 days apart, the widest
+  // same-session false positive 6.8h.
+  seriesSameSessionHours: 8,
   // A recall_log source must have written at least this many rows historically
   // before its silence is treated as a stall. Below it, "no rows this week" is
   // just a quiet occasional caller — one-off CLI probes and debug labels live
@@ -252,6 +265,7 @@ export function detectIntegrity(db, opts = {}) {
 export function detectBlindspot(db, opts = {}) {
   const days = opts.recallLogDays ?? DEFAULTS.recallLogDays
   const minFreq = opts.repeatQueryMin ?? DEFAULTS.repeatQueryMin
+  const maxAvgHits = opts.repeatQueryMaxAvgHits ?? DEFAULTS.repeatQueryMaxAvgHits
   const since = Date.now() - days * 86400_000
   // Not every mneme deployment writes to recall_log — it's optional
   // instrumentation. Skip cleanly if the table is missing.
@@ -286,11 +300,19 @@ export function detectBlindspot(db, opts = {}) {
   const bySource = db.prepare(`SELECT source, COUNT(*) c FROM recall_log WHERE ts > ? GROUP BY source ORDER BY c DESC`).all(since)
   const strictZero = db.prepare(`SELECT COUNT(*) c FROM recall_log WHERE ts > ? AND hit_count = 0`).get(since).c
   const finalZero = db.prepare(`SELECT COUNT(*) c FROM recall_log WHERE ts > ? AND final_hit_count = 0`).get(since).c
-  const repeats = db.prepare(`
+  // A repeating query is only evidence of a missing memory if recall keeps
+  // coming back thin. Frequency on its own measures how hot a topic is, not
+  // whether it is answered — and hot-and-answered is the normal case: hooks
+  // fire recall on every prompt containing the word. Reporting those as
+  // "sediment-worthy" sends you off to write a card that already exists.
+  const repeatsRaw = db.prepare(`
     SELECT query, COUNT(*) freq, SUM(hit_count) hits
     FROM recall_log WHERE ts > ? AND query IS NOT NULL AND length(query) > 0
     GROUP BY query HAVING freq >= ? ORDER BY freq DESC LIMIT 30
   `).all(since, minFreq).filter(r => !isNoiseQuery(r.query))
+  const avgHits = (r) => (r.freq > 0 ? (r.hits ?? 0) / r.freq : 0)
+  const repeats = repeatsRaw.filter(r => avgHits(r) < maxAvgHits)
+  const repeatsAnswered = repeatsRaw.length - repeats.length
   const zeroQueries = db.prepare(`
     SELECT DISTINCT query FROM recall_log
     WHERE ts > ? AND (hit_count = 0 OR final_hit_count = 0) AND query IS NOT NULL AND length(query) > 0
@@ -299,7 +321,11 @@ export function detectBlindspot(db, opts = {}) {
   return {
     available: true, window_days: days, total_calls: total,
     by_source: bySource, strict_zero: strictZero, final_zero: finalZero,
-    repeat_queries: repeats.slice(0, 15).map(r => ({ q: clip(r.query, 60), freq: r.freq, hits: r.hits })),
+    repeat_queries: repeats.slice(0, 15).map(r => ({
+      q: clip(r.query, 60), freq: r.freq, hits: r.hits,
+      avg_hits: +(avgHits(r)).toFixed(1),
+    })),
+    repeat_queries_answered: repeatsAnswered,
     zero_hit_real_queries: zeroQueries,
     stalled_sources: detectStalledSources(db, opts),
   }
@@ -441,14 +467,10 @@ export function detectNearDup(db, opts = {}) {
           // dropped — an old plain row next to an anchor is still a valid
           // supersede target, and only the reviewer can tell which side is which.
           if (band === 'supersede') {
-            // Two concrete_trace rows that look alike are almost never an
-            // iteration of one fact — they are two runs of the same routine
-            // (nightly metric snapshots, repeated ops logs). By our own level
-            // semantics those are one-off traces that decay is supposed to bury,
-            // so superseding them would destroy a legitimate time series.
-            // Flagged rather than dropped: the reviewer still sees the pair.
-            const likelySeries = items[i].memory_level === 'concrete_trace'
-              && items[j].memory_level === 'concrete_trace'
+            // Time series masquerade as rewrites at this cosine band. See
+            // isLikelySeries for the three signals and what calibrated them.
+            // Flagged rather than dropped: the reviewer still sees the count.
+            const likelySeries = isLikelySeries(items[i], items[j])
             entry.detail = {
               a: sideDetail(items[i], t0), b: sideDetail(items[j], t0),
               newer_rowid: (items[i].created_at ?? 0) >= (items[j].created_at ?? 0) ? items[i].rowid : items[j].rowid,
@@ -622,6 +644,61 @@ function defaultDbPath() {
 }
 
 // ============================================================
+// Series detection — keeps timelines out of the supersede band
+// ============================================================
+
+// Matches a temporal or ordinal marker anywhere in a summary: ISO dates,
+// clock times, slash dates, CJK dates. Rows whose summaries lead with one of
+// these are almost always entries in a series (nightly snapshots, timestamped
+// log lines) rather than drafts of a single fact.
+const TEMPORAL_MARKER = /(?:20\d{2}-\d{1,2}-\d{1,2}|\d{1,2}:\d{2}|\d{1,2}\/\d{1,2}|\d{1,2}月\d{1,2}日)/g
+
+function temporalMarkers(text) {
+  if (typeof text !== 'string' || !text) return null
+  const found = text.match(TEMPORAL_MARKER)
+  return found && found.length ? new Set(found) : null
+}
+
+/**
+ * True when a near-duplicate pair is a point in a time series rather than a
+ * stale rewrite of one fact.
+ *
+ * The supersede band exists to catch "an already-replaced version stays active
+ * and can be recalled as if current". A time series has no replaced version —
+ * every entry is still true about its own moment, and superseding one destroys
+ * the sequence. Reported separately instead of dropped, so the count stays
+ * visible.
+ *
+ * Three signals, any one of which is sufficient:
+ *   1. both rows are concrete_trace — two runs of one routine, which decay is
+ *      already supposed to bury
+ *   2. written inside one working session — a log or a request/reply pair
+ *   3. both summaries carry a temporal marker and the markers differ — a dated
+ *      series whose entries can sit arbitrarily far apart
+ *
+ * Signal 3 requires the markers to DIFFER: two rows citing the same date are
+ * one event described twice, which is exactly the rewrite we want to surface.
+ */
+export function isLikelySeries(a, b, opts = {}) {
+  if (a?.memory_level === 'concrete_trace' && b?.memory_level === 'concrete_trace') return true
+
+  // Missing timestamps must not read as a zero gap — that would swallow every
+  // pair with an unset created_at into "same session".
+  const ta = a?.created_at, tb = b?.created_at
+  if (Number.isFinite(ta) && Number.isFinite(tb)) {
+    const windowMs = (opts.sameSessionHours ?? DEFAULTS.seriesSameSessionHours) * 3600_000
+    if (Math.abs(ta - tb) < windowMs) return true
+  }
+
+  const ma = temporalMarkers(a?.summary), mb = temporalMarkers(b?.summary)
+  if (ma && mb) {
+    for (const m of ma) if (!mb.has(m)) return true
+    for (const m of mb) if (!ma.has(m)) return true
+  }
+  return false
+}
+
+// ============================================================
 // Text render — human-readable report from the JSON return
 // ============================================================
 export function renderTextReport(report, opts = {}) {
@@ -674,7 +751,8 @@ export function renderTextReport(report, opts = {}) {
   L.push(`  Not a duplicate scan — these are pairs whose wording drifted, which is where`)
   L.push(`  an already-replaced version stays active and can be recalled as if current.`)
   if (scSeries.length) {
-    L.push(`  (${scSeries.length} concrete_trace pairs hidden — repeated runs of one routine, not iterations; decay buries those)`)
+    L.push(`  (${scSeries.length} time-series pairs hidden — same-session logs, dated snapshots, repeated routine runs.`)
+    L.push(`   Every entry is still true about its own moment, so superseding one destroys the sequence.)`)
   }
   if (!sc.length) L.push(`  (none)`)
   for (const c of sc.slice(0, 40)) {
@@ -728,8 +806,11 @@ export function renderTextReport(report, opts = {}) {
       L.push(`  real zero-hit queries (noise filtered): ${bs.zero_hit_real_queries.map(q => `"${clip(q, 30)}"`).join(', ')}`)
     }
     if (bs.repeat_queries.length) {
-      L.push(`  repeat queries (freq>=${DEFAULTS.repeatQueryMin}, sediment-worthy):`)
-      for (const r of bs.repeat_queries) L.push(`    freq=${r.freq} "${r.q}"`)
+      L.push(`  repeat queries that recall answers thinly (freq>=${DEFAULTS.repeatQueryMin}, avg hits<${DEFAULTS.repeatQueryMaxAvgHits}) — these are the sediment gaps:`)
+      for (const r of bs.repeat_queries) L.push(`    freq=${r.freq} avg_hits=${r.avg_hits} "${r.q}"`)
+    }
+    if (bs.repeat_queries_answered) {
+      L.push(`  (${bs.repeat_queries_answered} more repeat queries hidden — recall answers them, so they are hot topics, not gaps)`)
     }
   }
 
