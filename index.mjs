@@ -622,10 +622,41 @@ export function initMemory() {
 
 // ── Embedding (Optional) ────────────────────────────────────
 
+// How long a single embedding call may hold a caller before we give up on it.
+//
+// Chosen from the hybrid latency distribution over a 14-day recall log
+// (1416 calls, 2026-09-01), which is bimodal with an empty middle:
+//
+//   p50   501ms   p70   919ms   p80  2290ms   |   p85 10695ms   p90 10734ms
+//
+// Nothing lives between ~3s and ~10s. A 2.5s bound therefore cuts the entire
+// upstream-stall cluster (282 of the 286 calls it touches) while costing one
+// legitimately slow embed. Tightening to 1s would start eating real ones (84
+// more) and buys nothing — the stall cluster is already gone by then.
+//
+// Giving up is cheap here. FTS runs in the same Promise.all and is synchronous,
+// so hybrid already holds its rows; losing the vector leg costs ranking quality
+// on that one call, not the answer itself.
+// Read per call, not at module load. Capturing env at import time makes the
+// knob untunable by anything that configures itself after the import — which is
+// every embedder of this library, and every test. Same trap as the DB path.
+const embeddingTimeoutMs = () => {
+  const n = parseInt(process.env.EMBEDDING_TIMEOUT_MS || '', 10)
+  return Number.isFinite(n) && n > 0 ? n : 2500
+}
+
+/** Lets the hot path tell "upstream was slow" apart from "upstream was broken". */
+const EMBED_TIMEOUT = Symbol('embedding-timeout')
+
 /**
- * Generate embedding vector (OpenAI-compatible API)
+ * Generate embedding vector (OpenAI-compatible API).
+ *
+ * Returns null on any failure — every caller guards on falsy and degrades to
+ * full-text search. Pass `{ signalTimeout: true }` to get EMBED_TIMEOUT back
+ * instead of null specifically when the deadline was hit, so a caller that
+ * cares can record *why* it degraded rather than reporting a normal result.
  */
-async function generateEmbedding(text) {
+export async function generateEmbedding(text, { signalTimeout = false } = {}) {
   if (!_embeddingConfig) return null
   try {
     const res = await fetch(`${_embeddingConfig.baseUrl}/embeddings`, {
@@ -640,12 +671,17 @@ async function generateEmbedding(text) {
         dimensions: _embeddingConfig.dimension,
         encoding_format: 'float',
       }),
+      signal: AbortSignal.timeout(embeddingTimeoutMs()),
     })
     const data = await res.json()
     return data?.data?.[0]?.embedding || null
   } catch (e) {
-    log(`Embedding failed: ${e.message}`)
-    return null
+    // A stalling upstream is the common case and should not read as a broken one.
+    const timedOut = e?.name === 'TimeoutError' || e?.name === 'AbortError'
+    log(timedOut
+      ? `Embedding timed out after ${embeddingTimeoutMs()}ms — degrading to FTS for this call`
+      : `Embedding failed: ${e.message}`)
+    return timedOut && signalTimeout ? EMBED_TIMEOUT : null
   }
 }
 
@@ -2119,8 +2155,8 @@ export async function recallMemoriesHybrid(opts = {}) {
 
   // Parallel: vector query (get embedding) + FTS query
   // _internal=true so the FTS path doesn't also surface random records (hybrid surfaces once at the end)
-  const [queryEmbedding, ftsRows] = await Promise.all([
-    generateEmbedding(queryText),
+  const [rawEmbedding, ftsRows] = await Promise.all([
+    generateEmbedding(queryText, { signalTimeout: true }),
     Promise.resolve(recallMemories({
       ...opts,
       limit: candidateLimit,
@@ -2129,6 +2165,13 @@ export async function recallMemoriesHybrid(opts = {}) {
       _trace: trace,
     })),
   ])
+
+  // A timed-out embedding is a degradation, not a normal hybrid call. It gets
+  // the same _degradeReason the early-bail branch sets, so a caller inspecting
+  // the result sees one consistent story instead of a silently vector-less
+  // "hybrid" answer. Silent degradation is the failure this guards against.
+  const embedTimedOut = rawEmbedding === EMBED_TIMEOUT
+  const queryEmbedding = embedTimedOut ? null : rawEmbedding
 
   // Vector path: KNN top N
   let vecRows = []
@@ -2300,7 +2343,14 @@ export async function recallMemoriesHybrid(opts = {}) {
     effectiveLimit: limit,
   })
   if (ownsTrace) persistRecallTrace(trace, result.map(row => row.rowid))
-  return attachRecallTrace(result, trace)
+  const out = attachRecallTrace(result, trace)
+  if (embedTimedOut && Array.isArray(out)) {
+    // Non-enumerable, matching the early-bail branch: invisible to
+    // JSON.stringify / spread, readable by callers that ask.
+    Object.defineProperty(out, '_degradedTo', { value: 'fts-only', enumerable: false })
+    Object.defineProperty(out, '_degradeReason', { value: 'embedding-timeout', enumerable: false })
+  }
+  return out
 }
 
 // ── Conversation History Retrieval ──────────────────────────
