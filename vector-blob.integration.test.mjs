@@ -31,7 +31,19 @@ const DB_PATH = process.env.TOKENMEM_DB_PATH
         ? resolve(__dirname_at, 'engram.db')
         : resolve(__dirname_at, 'tokenmem.db'))
 
+// initMemory() builds the FTS5 table with the libsimple Chinese tokenizer when
+// that extension is present (it is in the deployed runtime, not in CI). A second
+// raw connection must load it too, or the FTS trigger on INSERT fails with
+// "no such tokenizer: simple". Same helper as cold-pool-gate.test.mjs.
+const SIMPLE_EXT_PATH = resolve(__dirname_at, 'lib', 'libsimple-windows-x64', 'simple')
+function tryLoadSimple(conn) {
+  try {
+    if (existsSync(SIMPLE_EXT_PATH + '.dll') || existsSync(SIMPLE_EXT_PATH)) conn.loadExtension(SIMPLE_EXT_PATH)
+  } catch {}
+}
+
 const db = new Database(DB_PATH)
+tryLoadSimple(db)
 
 let pass = 0, fail = 0
 const ok = (name, cond) => {
