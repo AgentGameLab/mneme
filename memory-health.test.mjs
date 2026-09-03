@@ -8,6 +8,18 @@ import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { existsSync, unlinkSync } from 'node:fs'
 
+// initMemory() builds the FTS5 table with the libsimple Chinese tokenizer when
+// that extension is present (deployed runtime, not CI). Every raw connection
+// this test opens must load it too, or INSERTs fail with "no such tokenizer:
+// simple". Same helper as cold-pool-gate.test.mjs.
+const __simple_ext = resolve(dirname(fileURLToPath(import.meta.url)), 'lib', 'libsimple-windows-x64', 'simple')
+function tryLoadSimple(conn) {
+  try {
+    if (existsSync(__simple_ext + '.dll') || existsSync(__simple_ext)) conn.loadExtension(__simple_ext)
+  } catch {}
+  return conn
+}
+
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const DB_PATH = process.env.TOKENMEM_DB_PATH
 if (!DB_PATH) {
@@ -57,7 +69,7 @@ function check(label, cond, detail = '') {
   storeMemory({ content: 'concrete rule violation', memoryLevel: 'concrete_trace', importance: 8, memoryType: 'long_term' })
   // Age some rows backward via raw SQL to trip surface-cold / dead-knowledge.
   const Database = (await import('better-sqlite3')).default
-  const db = new Database(DB_PATH)
+  const db = tryLoadSimple(new Database(DB_PATH))
   db.prepare('UPDATE memories SET last_accessed = ?, created_at = ? WHERE content LIKE ?').run(now - D45, now - D45, '%stale meta%')
   db.prepare('UPDATE memories SET last_accessed = ?, decay_score = 0.2 WHERE content LIKE ?').run(now - D45, '%op log%')
   db.close()
@@ -117,7 +129,7 @@ function check(label, cond, detail = '') {
 // ── --consolidate --dry-run: no writes ──
 {
   const Database = (await import('better-sqlite3')).default
-  const dbBefore = new Database(DB_PATH, { readonly: true })
+  const dbBefore = tryLoadSimple(new Database(DB_PATH, { readonly: true }))
   const active_before = dbBefore.prepare('SELECT COUNT(*) c FROM memories WHERE deleted_at IS NULL').get().c
   dbBefore.close()
 
@@ -131,7 +143,7 @@ function check(label, cond, detail = '') {
   check('--consolidate --dry-run marks dryRun=true', result?.dryRun === true)
   check('--consolidate --dry-run reports level_migrate', typeof result?.level_migrate === 'object')
 
-  const dbAfter = new Database(DB_PATH, { readonly: true })
+  const dbAfter = tryLoadSimple(new Database(DB_PATH, { readonly: true }))
   const active_after = dbAfter.prepare('SELECT COUNT(*) c FROM memories WHERE deleted_at IS NULL').get().c
   dbAfter.close()
   check('--consolidate --dry-run did NOT mutate', active_before === active_after, `${active_before} -> ${active_after}`)
@@ -163,7 +175,7 @@ function check(label, cond, detail = '') {
 {
   // Age enough meta rows to have at least one demotion candidate again.
   const Database = (await import('better-sqlite3')).default
-  const db = new Database(DB_PATH)
+  const db = tryLoadSimple(new Database(DB_PATH))
   const D45 = 45 * 86400_000
   db.prepare('UPDATE memories SET last_accessed = ?, created_at = ?, memory_level = ?, access_count = 0 WHERE rowid = (SELECT MIN(rowid) FROM memories WHERE deleted_at IS NULL)')
     .run(Date.now() - D45, Date.now() - D45, 'meta_knowledge')
@@ -202,7 +214,7 @@ function check(label, cond, detail = '') {
 {
   const Database = (await import('node:module')).createRequire(import.meta.url)('better-sqlite3')
   const { detectNearDup } = await import('./memory-health.mjs')
-  const db = new Database(DB_PATH)
+  const db = tryLoadSimple(new Database(DB_PATH))
 
   const DAY = 86400_000
   const now = Date.now()
@@ -262,7 +274,7 @@ function check(label, cond, detail = '') {
 {
   const { detectShrinkVictims } = await import('./memory-health.mjs')
   const Database = (await import('better-sqlite3')).default
-  const db = new Database(DB_PATH)
+  const db = tryLoadSimple(new Database(DB_PATH))
 
   const OPS = 'ops entry: http://10.0.0.5:9000 root, /api/svc/v1 routes, SVC_TOKEN and SVC_URL env, '
     + 'code at C:/work/svc/, handler src/http.mjs, schema src/db.mjs. '
@@ -330,7 +342,7 @@ function check(label, cond, detail = '') {
 {
   const { detectBlindspot } = await import('./memory-health.mjs')
   const Database = (await import('better-sqlite3')).default
-  const db = new Database(DB_PATH)
+  const db = tryLoadSimple(new Database(DB_PATH))
 
   // Assert the branch, not the build. Whether recall_log exists at this point
   // depends on which engine created DB_PATH — a build that instruments recall
