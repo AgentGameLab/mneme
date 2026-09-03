@@ -55,7 +55,13 @@ CREATE TABLE IF NOT EXISTS memories (
   -- Extended metadata
   metadata TEXT DEFAULT '{}',
 
-  -- Vector (JSON array, optional, application-layer cosine similarity)
+  -- Vector: Float32 BLOB since v2.10 (host byte order; see vector-codec.mjs).
+  -- Column keeps TEXT affinity on purpose — SQLite stores BLOBs verbatim in a
+  -- TEXT column, so no schema change was needed; typeof() = 'text' rows are
+  -- pre-2.10 JSON arrays that Migration 013 converts in place. Readers accept
+  -- both. Optional. Read only by application-layer cosine (the near-duplicate
+  -- write gate and memory-health); sqlite-vec KNN uses the separate memories_vec
+  -- table, populated from the same embedding at write time, and never reads this.
   content_vector TEXT,
 
   -- Timestamps & access stats

@@ -123,5 +123,10 @@ jobs:
           TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-embedding-timeout.db
         run: node embedding-timeout.integration.test.mjs
 
+      - name: Integration test (vector storage — Float32 BLOB codec + Migration 013)
+        env:
+          TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-vector-blob.db
+        run: node vector-blob.integration.test.mjs
+
       - name: Adapter test (codex-recovery-proxy fault injection)
         run: node adapters/codex-recovery-proxy/proxy.test.mjs

@@ -445,6 +445,9 @@ TOKENMEM_COMPACT_SUMMARY="..." node index.mjs --store-compact-summary
 # Backfill embeddings for existing memories
 node backfill-embeddings.mjs --concurrency 3
 node backfill-embeddings.mjs --dry-run  # count only
+
+# Convert pre-2.10 JSON vectors to Float32 BLOBs in one go (see "Vector storage format")
+node index.mjs --migrate-vectors
 ```
 
 ---
@@ -454,6 +457,17 @@ node backfill-embeddings.mjs --dry-run  # count only
 ### `backfill-embeddings.mjs`
 
 Batch-generates embedding vectors for existing memories that don't have them yet. Useful when first enabling vector search on an existing database.
+
+### Vector storage format (v2.10)
+
+`memories.content_vector` holds a little-endian **Float32 BLOB**, one 4-byte lane per dimension (`vector-codec.mjs`). Before 2.10 it held a JSON array of the same numbers, which cost about 5x the bytes for no extra precision: the embedding API returns float32 values, and on a 10,920-row library every one of 2,048,000 sampled stored values was float32-exact. That library went from 226 MB of vector text to 43 MB of BLOBs.
+
+- **Migration 013** converts legacy rows in place. It runs as a background loop inside the long-lived MCP server (200-row transactions, yielding to requests between them) — never inside hook children or ordinary CLI calls, which run under a spawn timeout where bulk work gets killed half-done and taxes every turn. `PRAGMA user_version = 13` marks completion so a finished library never re-scans.
+- `node index.mjs --migrate-vectors` runs it to completion immediately (idempotent, resumable; safe to re-run after a `SQLITE_BUSY`). Run `VACUUM` afterwards to hand the freed pages back to the filesystem — the migration deliberately does not, since VACUUM takes an exclusive lock.
+- The completion marker is one-way. If legacy JSON rows reappear later (restoring a pre-2.10 backup, an import that bypasses the codec), the server's automatic loop will not notice. They still read fine, and `--migrate-vectors` ignores the marker and converts them.
+- Every reader decodes both formats, so a partially migrated library is fully functional.
+- Text that does not decode as a finite numeric array is set to NULL so the self-heal sweep re-embeds it, instead of the `!= ''` coverage checks counting it as vectorised forever.
+- The column keeps TEXT affinity; SQLite stores BLOBs verbatim in it, so no schema change was needed. `typeof(content_vector)` distinguishes the two eras.
 
 ### `migrate-claude-memories.mjs`
 

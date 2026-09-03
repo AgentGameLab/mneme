@@ -23,6 +23,7 @@ import { readFileSync, existsSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
+import { encodeVector } from './vector-codec.mjs'
 
 const require = createRequire(import.meta.url)
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -142,7 +143,7 @@ async function processOne(row) {
   try {
     const vec = await embed(row.content)
     if (!vec || vec.length !== EMBED_DIM) throw new Error(`invalid vector (len=${vec?.length})`)
-    writeTxn(row.rowid, JSON.stringify(vec), new Float32Array(vec))
+    writeTxn(row.rowid, encodeVector(vec), new Float32Array(vec))
     processed++
   } catch (e) {
     failed++

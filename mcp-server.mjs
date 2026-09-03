@@ -46,6 +46,7 @@ import {
   listLocations,
   deleteLocation,
 } from './index.mjs'
+import { migrateVectorsToBlob } from './index.mjs'   // Migration 013 background runner (below)
 import { parseHostTokens, resolveAuthMode, resolveHost } from './auth.mjs'
 import { recallClaudeMarkdownMemory } from './lib/claude-markdown-memory.mjs'
 
@@ -83,6 +84,31 @@ initMemory()
 embedMissingVectors(500).then(r => {
   if (r.embedded || r.failed) console.error(`[mneme] startup self-heal: embedded ${r.embedded}, failed ${r.failed}, scanned ${r.scanned}`)
 }).catch(e => console.error(`[mneme] startup self-heal failed: ${e.message}`))
+
+// Migration 013 background runner: memories.content_vector JSON -> Float32 BLOB
+// (vector-codec.mjs). It lives here rather than in initMemory() because this is
+// the one long-lived process: hook children are spawnSync-killed at ~2.8 s, and
+// bulk work there gets SIGTERM'd half-done and taxes every turn until it drains.
+// 200-row transactions with a yield between them keep request latency flat; a
+// 10k-row backlog drains in a few seconds. skipIfComplete turns every later
+// start into a single PRAGMA read — no typeof() scan of a finished table.
+;(function runVectorMigration() {
+  let converted = 0, skipped = 0
+  const tick = () => {
+    try {
+      const r = migrateVectorsToBlob({ limit: 200, skipIfComplete: true })
+      converted += r.converted; skipped += r.skipped
+      if (r.drained) {
+        if (converted || skipped) console.error(`[mneme] Migration 013: ${converted} vector(s) -> Float32 BLOB, ${skipped} unparseable cleared — complete`)
+        return
+      }
+      setTimeout(tick, 25).unref()          // yield to in-flight requests between batches
+    } catch (e) {
+      console.error(`[mneme] Migration 013 paused: ${e.message} (resumes on next start; readers accept both formats)`)
+    }
+  }
+  setTimeout(tick, 1000).unref()            // let startup settle before the first batch
+})()
 
 const SERVER_NAME = 'mneme'
 const SERVER_VERSION = '2.8.0'
