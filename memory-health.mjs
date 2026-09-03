@@ -43,6 +43,7 @@ import { dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createRequire } from 'node:module'
 import { extractHighSignalTokens, isStillCarried } from './high-signal-tokens.mjs'
+import { decodeVector } from './vector-codec.mjs'
 
 const require = createRequire(import.meta.url)
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -149,8 +150,10 @@ export function isNoiseQuery(q) {
 }
 
 // ── Vector helpers (pre-normalized cosine = dot product) ──
-function parseVec(json) {
-  try { const v = JSON.parse(json); return Array.isArray(v) ? v : null } catch { return null }
+function parseVec(stored) {
+  // Float32 BLOB (v2.10+) or legacy JSON text — vector-codec.mjs reads both,
+  // so this scan is correct on a half-migrated library.
+  return decodeVector(stored)
 }
 function normalize(v) {
   let n = 0

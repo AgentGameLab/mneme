@@ -29,6 +29,7 @@ import { expandRecallQuery } from './query-rewrite.mjs'
 import { checkSupersedeShrink } from './high-signal-tokens.mjs'
 import { HOST_LABEL_RE } from './auth.mjs'
 import { normalizedFtsScore } from './recall-scoring.mjs'
+import { encodeVector, decodeVector } from './vector-codec.mjs'
 import {
   MAX_RECALL_CANDIDATES,
   MAX_RECALL_CONTEXT_CHARS,
@@ -513,6 +514,14 @@ export function initMemory() {
     log('Migration 012: memories_quarantine table ready')
   } catch (e) { log(`Migration 012 (quarantine) failed: ${e.message}`) }
 
+  // Migration 013 (memories.content_vector JSON -> Float32 BLOB) is deliberately
+  // NOT run here. initMemory() executes inside hook children that spawnSync
+  // kills at ~2.8 s, and inside every CLI invocation; bulk conversion in those
+  // processes gets SIGTERM'd half-done and taxes every turn until it drains.
+  // It runs as a background loop in the long-lived MCP server (mcp-server.mjs,
+  // beside the self-heal sweep) and on demand via `--migrate-vectors`.
+  // Readers accept both formats, so nothing depends on it having run.
+
   // Migration: memories.source CHECK constraint add 'compression'
   // SQLite doesn't support ALTER CHECK -> check if current CHECK includes 'compression', rebuild if not
   try {
@@ -906,7 +915,7 @@ export async function recordConversationAsync(msg) {
   if (embedding) {
     try {
       getDb().prepare(`UPDATE conversations SET content_vector = ? WHERE rowid = ?`)
-        .run(JSON.stringify(embedding), id)
+        .run(encodeVector(embedding), id)   // same Float32 BLOB codec as memories (v2.10)
     } catch {}
   }
   return id
@@ -1531,9 +1540,21 @@ function findNearDuplicates(db, embedding, excludeId, { topK = 5, threshold = 0.
         AND m.content_vector IS NOT NULL AND m.content_vector != ''
     `).all(new Float32Array(embedding), topK + 1, excludeId)
   } catch { return [] }
+  return rankNearDuplicateCandidates(embedding, cands, { threshold })
+}
+
+/**
+ * Pure half of findNearDuplicates: decode each candidate's stored vector
+ * (Float32 BLOB or legacy JSON — vector-codec.mjs) and rank by exact cosine.
+ * Split out so the dual-format read is testable without sqlite-vec loaded.
+ * @param {number[]} embedding
+ * @param {{id:number, content_vector:any, summary?:string, content?:string}[]} cands
+ */
+export function rankNearDuplicateCandidates(embedding, cands, { threshold = 0.92 } = {}) {
   const out = []
   for (const c of cands) {
-    let v; try { v = JSON.parse(c.content_vector) } catch { continue }
+    const v = decodeVector(c.content_vector)
+    if (!v) continue
     const cos = cosineSim(embedding, v)
     if (cos >= threshold) out.push({ id: c.id, cosine: +cos.toFixed(4), summary: c.summary || (c.content || '').slice(0, 60) })
   }
@@ -1553,9 +1574,13 @@ export async function storeMemoryAsync(mem, opts = {}) {
   if (embedding) {
     const db = getDb()
     try {
-      // Store JSON string in memories.content_vector (cross-tool visible + backup)
+      // Float32 BLOB (v2.10, vector-codec.mjs). This was a JSON string "for
+      // cross-tool visibility" — but no other process reads this database's
+      // column (a project-wide grep found only a sibling engine copy with its
+      // own DB, ad-hoc scripts that never parse it, and a worktree of this
+      // repo), and JSON cost 5x the bytes to spell out the same float32 values.
       db.prepare(`UPDATE memories SET content_vector = ? WHERE rowid = ?`)
-        .run(JSON.stringify(embedding), id)
+        .run(encodeVector(embedding), id)
     } catch {}
 
     // Sync to sqlite-vec virtual table (for KNN queries)
@@ -1577,6 +1602,80 @@ export async function storeMemoryAsync(mem, opts = {}) {
     }
   }
   return id
+}
+
+/**
+ * Migration 013 worker: convert legacy JSON-text vectors to Float32 BLOBs.
+ *
+ * Idempotent and resumable: converted rows become typeof 'blob' and drop out
+ * of the WHERE, so every batch makes progress and re-running is a no-op.
+ * Text that does not decode to a finite numeric array was never a usable
+ * vector; it is set to NULL so embedMissingVectors() re-embeds that row
+ * instead of the `!= ''` coverage checks counting it as vectorised forever.
+ *
+ * Never runs COUNT(*) unless asked: typeof() cannot use an index, so counting
+ * is a full table scan — the exact cost this function exists to bound. Whether
+ * the backlog is drained is known from the loop itself (a short batch).
+ *
+ * @param {object} [opts]
+ * @param {import('better-sqlite3').Database} [opts.db]   defaults to getDb()
+ * @param {number}  [opts.limit=Infinity]    max rows to scan this call
+ * @param {number}  [opts.budgetMs=Infinity] stop starting new batches after this
+ * @param {number}  [opts.batch=200]         rows per transaction
+ * @param {boolean} [opts.count=false]       if cut short, also COUNT what is left (full scan)
+ * @param {boolean} [opts.skipIfComplete=false]  honour the PRAGMA user_version marker: return
+ *   drained immediately, without any scan, once a previous run has drained. The
+ *   server's background loop passes this; the CLI does not, so an explicit run
+ *   still converts legacy rows that appear after completion (restored backup, import).
+ * @returns {{scanned:number, converted:number, skipped:number, drained:boolean, remaining:number|null, ms:number}}
+ *   remaining: 0 when drained; the exact count when `count` was requested; else null.
+ */
+export function migrateVectorsToBlob({ db: dbArg = null, limit = Infinity, budgetMs = Infinity, batch = 200, count = false, skipIfComplete = false } = {}) {
+  const db = dbArg || getDb()
+  const t0 = Date.now()
+  const out = { scanned: 0, converted: 0, skipped: 0, drained: false, remaining: null, ms: 0 }
+  if (skipIfComplete) {
+    let uv = 0
+    try { uv = db.pragma('user_version', { simple: true }) } catch {}
+    if (uv >= 13) { out.drained = true; out.remaining = 0; out.ms = Date.now() - t0; return out }
+  }
+  const selectBatch = db.prepare(`
+    SELECT rowid, content_vector AS v FROM memories
+    WHERE typeof(content_vector) = 'text' AND content_vector != ''
+    LIMIT ?
+  `)
+  // Both writes re-check typeof inside the transaction: a row another process
+  // converted (or re-embedded) between our SELECT and our UPDATE is left alone
+  // instead of being overwritten with a stale decode.
+  const update = db.prepare(`UPDATE memories SET content_vector = ? WHERE rowid = ? AND typeof(content_vector) = 'text'`)
+  const clear  = db.prepare(`UPDATE memories SET content_vector = NULL WHERE rowid = ? AND typeof(content_vector) = 'text'`)
+  const convertBatch = db.transaction((rows) => {
+    for (const r of rows) {
+      out.scanned++
+      const blob = encodeVector(decodeVector(r.v))   // null if undecodable OR non-finite
+      if (!blob) { if (clear.run(r.rowid).changes) out.skipped++; continue }
+      if (update.run(blob, r.rowid).changes) out.converted++
+    }
+  })
+  for (;;) {
+    if (out.scanned >= limit || (Date.now() - t0) >= budgetMs) break
+    const want = Math.max(1, Math.min(batch, limit - out.scanned))
+    const rows = selectBatch.all(want)
+    if (rows.length === 0) { out.drained = true; break }
+    convertBatch(rows)
+    if (rows.length < want) { out.drained = true; break }   // short batch: table exhausted
+  }
+  if (out.drained) {
+    out.remaining = 0
+    // Completion marker read by the MCP server's background runner.
+    try { if (db.pragma('user_version', { simple: true }) < 13) db.pragma('user_version = 13') } catch {}
+  } else if (count) {
+    out.remaining = db.prepare(
+      `SELECT COUNT(*) AS c FROM memories WHERE typeof(content_vector) = 'text' AND content_vector != ''`
+    ).get().c
+  }
+  out.ms = Date.now() - t0
+  return out
 }
 
 /**
@@ -1604,7 +1703,7 @@ export async function embedMissingVectors(limit = 200) {
     try {
       const vec = await generateEmbedding(row.content)
       if (!vec || vec.length !== dim) { failed++; continue }  // 维度不符 → 拒绝写脏向量
-      updateStmt.run(JSON.stringify(vec), row.rowid)
+      updateStmt.run(encodeVector(vec), row.rowid)
       if (_vecLoaded) {
         try {
           db.prepare(`INSERT OR REPLACE INTO memories_vec(memory_rowid, embedding) VALUES (?, ?)`)
@@ -4104,6 +4203,23 @@ if (_isMain) {
             process.exitCode = 1
           }
         }
+      }
+
+    } else if (hasFlag('--migrate-vectors')) {
+      // v2.10: run Migration 013 to completion in this process. (The MCP server
+      // also drains it in the background; hooks and other CLI calls never do.)
+      // Idempotent and resumable, so a SQLITE_BUSY from a concurrent writer is
+      // reported cleanly and the command is simply re-run. Follow with `VACUUM`
+      // to hand the freed pages back to the filesystem — the migration itself
+      // does not, because VACUUM takes an exclusive lock and that is an
+      // operator's call.
+      try {
+        const r = migrateVectorsToBlob({ count: true })
+        process.stdout.write(JSON.stringify(r) + '\n')
+        process.exitCode = r.drained ? 0 : 1
+      } catch (e) {
+        process.stderr.write(`--migrate-vectors failed: ${e.message} (safe to re-run; converted rows stay converted)\n`)
+        process.exitCode = 1
       }
 
     } else if (getFlag('--context') !== null) {
