@@ -173,7 +173,10 @@ const post = async (body, init = {}) => {
     ch.stdout.on('data', d => stdout += d)
     ch.stderr.on('data', d => stderr += d)
     ch.on('close', status => res({ status, stdout, stderr }))
-    ch.stdin.end(JSON.stringify({ session_id: 'with-server', prompt: 'omega calibration 的 token 和端口 配置在哪' }))
+    ch.stdin.end(JSON.stringify({
+      session_id: 'with-server',
+      prompt: '正好测试下KOS和Mneme和memory现在的召回和注入逻辑，之前尤其是KOS的recall一直欠佳',
+    }))
   })
   check('hook exits 0 against a live server', r.status === 0, `status=${r.status}`)
   check('hook took the HTTP path instead of spawning the CLI',

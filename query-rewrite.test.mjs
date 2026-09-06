@@ -34,7 +34,11 @@ try {
   })
   for (let i = 0; i < 12; i++) {
     storeMemory({
-      content: `Please serve dinner this weekend with ingredients from supermarket menu ${i}.`,
+      // One lexical overlap is enough to crowd the unexpanded top 10. Giving
+      // every distractor five exact query terms would correctly outrank the
+      // implicit evidence even after expansion, which tests ranking strength
+      // rather than whether expansion recovers the missing concept.
+      content: `Weekend supermarket menu ${i}.`,
       memoryType: 'long_term',
       category: 'general',
       importance: 5,
@@ -43,13 +47,13 @@ try {
 
   const withoutExpansion = recallMemories({
     query: 'What should I serve for dinner this weekend with my homegrown ingredients?',
-    limit: 10,
+    limit: 20,
     _internal: true,
     _noQueryExpansion: true,
   })
   const withExpansion = recallMemories({
     query: 'What should I serve for dinner this weekend with my homegrown ingredients?',
-    limit: 10,
+    limit: 20,
     _internal: true,
   })
   check('concept expansion recovers implicit garden evidence missed by lexical-only query',

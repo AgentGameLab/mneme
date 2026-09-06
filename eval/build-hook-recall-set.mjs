@@ -42,6 +42,7 @@
 // Usage: node eval/build-hook-recall-set.mjs [--size 60] [--out <path>]
 
 import Database from 'better-sqlite3'
+import { shouldTriggerPromptRecall } from '../hooks/prompt-recall-trigger.mjs'
 import { createHash } from 'node:crypto'
 import { writeFileSync, existsSync, mkdirSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
@@ -57,18 +58,6 @@ const argOf = (flag, dflt) => {
 }
 const SIZE = parseInt(argOf('--size', '60'), 10)
 const OUT = resolve(argOf('--out', resolve(__dirname, 'hook-recall-set-v1.json')))
-
-// Kept byte-identical to hooks/mneme-recall.mjs shouldTrigger(). If that gate
-// changes, this must change with it — otherwise the eval set drifts away from
-// the population the hook actually sees.
-const TRIGGER = /怎么|如何|为什么|为啥|能不能|可不可以|是不是|哪里|帮我|设计|方案|怎么办|排查|根治|优化|实现|对比|区别|要不要|\?|？/
-function shouldTrigger(p) {
-  if (!p) return false
-  const len = p.trim().length
-  if (len < 12) return false
-  if (len > 2000) return false
-  return TRIGGER.test(p)
-}
 
 // The conversations table stores harness-injected text under role='user' too:
 // task notifications, the per-turn "current reality" block, system reminders,
@@ -100,7 +89,7 @@ const candidates = []
 for (const r of rows) {
   const content = String(r.content).trim()
   if (MACHINE_PROMPT.test(content)) continue
-  if (!shouldTrigger(content)) continue
+  if (!shouldTriggerPromptRecall(content)) continue
   const h = sha(content)
   if (seen.has(h)) continue           // exact duplicates would double-weight a question
   seen.add(h)

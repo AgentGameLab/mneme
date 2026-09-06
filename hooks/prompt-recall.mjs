@@ -43,6 +43,7 @@ import { spawnSync } from 'node:child_process'
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { shouldTriggerPromptRecall } from './prompt-recall-trigger.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const HOME = process.env.USERPROFILE || process.env.HOME || __dirname
@@ -98,31 +99,6 @@ const CFG = {
   minConsensus: intEnv('MNEME_MIN_CONSENSUS', 2),
   stateDir: process.env.MNEME_STATE_DIR || resolve(HOME, '.claude', 'hooks'),
   timeoutMs: intEnv('MNEME_TIMEOUT_MS', 2800),
-}
-
-// Generic trigger set. Covers "how do I / where is / what's the path" style
-// lookups — the shape that benefits most from persistent memory. Kept
-// deliberately narrow to avoid db pressure on every prompt.
-const TRIGGERS = [
-  // How-to / where-is / operations
-  /\bhow\s+(?:to|do|does|can)\b/i,
-  /\bwhere\s+(?:is|are|do|does)\b/i,
-  /\bwhat(?:'s| is)\s+the\s+(?:path|port|config|command|key|token|url|endpoint)\b/i,
-  /怎么(?:启|跑|运行|开|连|装|配|改|修|登|连接|设置)/,
-  /(?:在|放在|位于|装在)哪/,
-  /如何(?:启动|运行|配置|连接|登录|使用|安装)/,
-
-  // Infrastructure / config nouns
-  /\b(?:path|port|token|api[\s_-]?key|env|environment|config|settings?)\b/i,
-  /\b(?:daemon|service|process|script|binary|executable)\b/i,
-  /\b(?:restart|start|stop|spawn|launch)\b/i,
-  /(?:路径|目录|位置|端口|凭证|密钥|环境变量|配置|脚本|工具|命令|启动|重启|守护进程)/,
-]
-
-function shouldTrigger(prompt) {
-  if (!prompt || prompt.length < 4) return false
-  if (prompt.length > 1500) return false  // long paste — probably not a lookup
-  return TRIGGERS.some(re => re.test(prompt))
 }
 
 function stateFilePath(sessionId) {
@@ -235,7 +211,7 @@ process.stdin.on('end', async () => {
   const sessionId = payload.session_id || payload.sessionId || 'unknown'
   const prompt = (payload.prompt || '').trim()
 
-  if (!shouldTrigger(prompt)) process.exit(0)
+  if (!shouldTriggerPromptRecall(prompt)) process.exit(0)
 
   const query = prompt.slice(0, 500)
   const recalled = await runRecall(query, sessionId)
