@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ============================================================
-// mneme MCP Server v2.8.0
+// mneme MCP Server
 // Exposes recall/store/inspect/audit tools over MCP.
 // On-demand recall for any MCP-compatible AI agent — saves 80-90% memory token costs
 //
@@ -111,7 +111,9 @@ embedMissingVectors(500).then(r => {
 })()
 
 const SERVER_NAME = 'mneme'
-const SERVER_VERSION = '2.8.0'
+const { version: SERVER_VERSION } = JSON.parse(
+  readFileSync(resolve(__dirname, 'package.json'), 'utf8')
+)
 
 // ── Channel auth (migration 011) — token -> host map, resolved once at startup ──
 // Multiple agent runtimes (cc / codex / ...) share this endpoint; each carries
