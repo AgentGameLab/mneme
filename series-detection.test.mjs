@@ -27,14 +27,14 @@ const row = (level, hoursAgo, summary) => ({
 
 test('same-session log entries minutes apart are a timeline, not a rewrite', () => {
   // #9782/#9787 — one person narrating a decision then refining it 3 min later
-  const a = row('semi_abstract', 100, '小毛 20:22 决策路径: 直接开游戏录真实运行 (不装 Godot)')
-  const b = row('semi_abstract', 99.9, '小毛 20:25 细化: 优先 hyperbeam native 60fps MP4')
+  const a = row('semi_abstract', 100, 'Alex 20:22 决策路径: 直接开游戏录真实运行 (不装 Godot)')
+  const b = row('semi_abstract', 99.9, 'Alex 20:25 细化: 优先 hyperbeam native 60fps MP4')
   assert.equal(isLikelySeries(a, b), true)
 })
 
 test('a request and its reply written in the same minute are not versions of each other', () => {
   // #2640/#2641 — desktop asks, group session answers
-  const a = row('semi_abstract', 200, '桌面→群聊 千夏 V4-B promote 进展 query · 5/17 03:30')
+  const a = row('semi_abstract', 200, '桌面→群聊 Robin V4-B promote 进展 query · 5/17 03:30')
   const b = row('semi_abstract', 200, '群聊→桌面 V4-B promote query 回包: 5 答 evidence-first')
   assert.equal(isLikelySeries(a, b), true)
 })
@@ -78,8 +78,8 @@ test('the existing concrete_trace rule still holds on its own', () => {
 test('one fact restated days later is a genuine supersede candidate', () => {
   // #49/#272 — this is what (a2) exists to surface. 5 days apart, no temporal
   // marker in either summary, neither is a routine trace.
-  const a = row('semi_abstract', 5 * 24, '千夏不爱吃香菜')
-  const b = row('meta_knowledge', 0, '千夏讨厌香菜的味道')
+  const a = row('semi_abstract', 5 * 24, 'Robin不爱吃香菜')
+  const b = row('meta_knowledge', 0, 'Robin讨厌香菜的味道')
   assert.equal(isLikelySeries(a, b), false)
 })
 
@@ -100,7 +100,7 @@ test('missing summaries do not crash or silently classify as series', () => {
 test('missing timestamps fall back to the marker rule instead of matching at zero gap', () => {
   // created_at null on both sides would read as a 0ms gap and swallow every
   // pair into "same session". Guard against that.
-  const a = { memory_level: 'semi_abstract', created_at: null, summary: '千夏不爱吃香菜' }
-  const b = { memory_level: 'semi_abstract', created_at: null, summary: '千夏讨厌香菜的味道' }
+  const a = { memory_level: 'semi_abstract', created_at: null, summary: 'Robin不爱吃香菜' }
+  const b = { memory_level: 'semi_abstract', created_at: null, summary: 'Robin讨厌香菜的味道' }
   assert.equal(isLikelySeries(a, b), false)
 })
