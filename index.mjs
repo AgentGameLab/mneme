@@ -4292,6 +4292,26 @@ if (_isMain) {
       const category = getFlag('--category') || 'general'
       const memoryType = getFlag('--type') || 'long_term'
       const memoryLevel = getFlag('--level') || 'semi_abstract'
+      // Correction path: --supersedes points the old records' superseded_by at
+      // this new one. Fail loud on ids that are missing/already superseded —
+      // a partial supersede leaves the stale version live and recallable.
+      const supersedesRaw = getFlag('--supersedes')
+      let supersedes = []
+      if (supersedesRaw !== null) {
+        supersedes = supersedesRaw.split(',').map(s => s.trim()).filter(Boolean)
+        const bad = supersedes.filter(s => !/^\d+$/.test(s))
+        if (bad.length) {
+          process.stderr.write(`Error: --supersedes takes comma-separated rowids, got: ${bad.join(', ')}\n`)
+          process.exit(1)
+        }
+        const live = getMemoriesByIds(supersedes).map(r => String(r.rowid))
+        const missing = supersedes.filter(s => !live.includes(s))
+        if (missing.length) {
+          process.stderr.write(`Error: --supersedes target(s) not live (deleted, already superseded, or nonexistent): ${missing.join(', ')}\n`)
+          process.exit(1)
+        }
+      }
+      const out = {}
       const id = storeMemory({
         content: content.trim(),
         memoryType,
@@ -4300,8 +4320,21 @@ if (_isMain) {
         importance,
         source: 'manual',
         tags: ['cli', 'manual'],
-      })
+        ...(supersedes.length ? { supersedes } : {}),
+      }, { out })
       process.stdout.write(`stored: ${id}\n`)
+      if (id && supersedes.length) process.stdout.write(`superseded: ${supersedes.join(', ')}\n`)
+      // Surface the write-time guards the CLI used to swallow into the log stream.
+      if (out.metaDowngrade) {
+        process.stdout.write(`⚠ level ${out.metaDowngrade.fromLevel} → ${out.metaDowngrade.toLevel}: ${out.metaDowngrade.reasons.join(' | ')}\n`)
+      }
+      if (out.supersedeShrink?.length) {
+        process.stdout.write(`⚠ supersede shrink — the new version stopped carrying:\n`)
+        for (const s of out.supersedeShrink) process.stdout.write(`  - ${typeof s === 'string' ? s : JSON.stringify(s)}\n`)
+      }
+      if (out.quotaRejected?.length) {
+        process.stdout.write(`⚠ quota rejected: ${out.quotaRejected.join(', ')}\n`)
+      }
 
     } else if (getFlag('--store-compact-summary') !== null) {
       const summary = process.env.TOKENMEM_COMPACT_SUMMARY
@@ -4406,6 +4439,7 @@ if (_isMain) {
         '    [--importance 1-10] [--category general|people|project|...]',
         '    [--type working|short_term|long_term|permanent]',
         '    [--level concrete_trace|semi_abstract|meta_knowledge]  abstraction level (default semi_abstract)',
+        '    [--supersedes 123,456]  replace those live rowids with this record (fails if any is not live)',
         '  node index.mjs --compress <chat_id>      Compress old conversations (requires claude CLI)',
         '    [--days 30]',
         '  node index.mjs --compress-all             Batch compress all old conversations',
