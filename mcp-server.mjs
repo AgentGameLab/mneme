@@ -455,6 +455,9 @@ function createServer(hostId = DEFAULT_HOST) {
         `Dead knowledge (30d unaccessed): ${stats.deadKnowledge}${stats.deadKnowledge > 10 ? ' (consider cleanup)' : ''}`,
         `Search misses (7d): ${stats.recentSearchMisses}${stats.recentSearchMisses > 5 ? ' (knowledge blind spots detected)' : ''}`,
         `Vector search: ${stats.embeddingConfigured ? 'configured' : 'not configured (FTS5 only)'}`,
+        stats.embedding
+          ? `Embedding calls since start: ${stats.embedding.calls} (memo hits ${stats.embedding.memoHits}, deadline-clamped ${stats.embedding.clamped}, timeouts ${stats.embedding.timeouts}, failures ${stats.embedding.failures})`
+          : 'Embedding calls since start: n/a',
       ].join('\n')
       return { content: [{ type: 'text', text }] }
     }
@@ -588,18 +591,19 @@ if (useHttp) {
       for (const entry of sessions.values()) {
         if (now - entry.lastUsed > SESSION_IDLE_MS) idleCount++
       }
-      // Expose embedding config + vector coverage so watchdogs can alert
-      // proactively instead of waiting for someone to run memory_stats.
-      let embeddingConfigured = null, vectorCoverage = null
-      try { const st = getMemoryStats(); embeddingConfigured = st.embeddingConfigured; vectorCoverage = st.vectorCoverage } catch {}
+      // Liveness only. This used to call getMemoryStats() to expose
+      // embeddingConfigured + vectorCoverage — three full scans, one of which
+      // reads every embedding blob, so the cost grew with the file. At 581 MB
+      // /health measured 3.4–3.6 s and crossed a supervisor's 2.5 s budget: a
+      // live server kept being declared dead and respawned (6 false restarts in
+      // one day). A liveness probe must be O(1). The census moved to GET /stats.
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({
         ok: true, server: SERVER_NAME, version: SERVER_VERSION, transport: 'http',
         active_sessions: sessions.size,
         idle_pending_cleanup: idleCount,
         idle_timeout_ms: SESSION_IDLE_MS,
-        embeddingConfigured,
-        vectorCoverage,
+        statsEndpoint: '/stats',
       }))
       return
     }
@@ -615,6 +619,20 @@ if (useHttp) {
     //
     // Deliberately NOT MCP: a hook is a 30-line script that should not have to
     // speak a session-oriented protocol to ask one question.
+    // Full census — intentionally NOT on /health (see the note there). Cost
+    // scales with DB size (three full scans, one of them reads every embedding
+    // blob). Poll this on a slow cadence, never on a liveness path. Includes
+    // `embedding` (calls / memoHits / timeouts / clamped / failures since start)
+    // so the deadline clamp and the query memo are countable, not inferred.
+    if (req.url === '/stats' && req.method === 'GET') {
+      const t0 = Date.now()
+      let stats = null, error = null
+      try { stats = getMemoryStats() } catch (e) { error = String(e && e.message || e) }
+      res.writeHead(error ? 500 : 200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ ok: !error, tookMs: Date.now() - t0, error, ...(stats || {}) }))
+      return
+    }
+
     if (req.url === '/recall' && req.method === 'POST') {
       const auth = resolveHost(req.headers['authorization'], HOST_TOKENS, { mode: AUTH_MODE, defaultHost: DEFAULT_HOST })
       if (!auth.ok) {
@@ -645,6 +663,11 @@ if (useHttp) {
             minImportance: Number.isFinite(p.min_importance) ? p.min_importance : 0,
             levels: Array.isArray(p.levels) ? p.levels : (typeof p.level === 'string' && p.level ? p.level.split(',') : []),
             requireVec: !!p.require_vec,
+            // The caller's remaining budget. The server clamps its embedding
+            // wait to fit, degrading to FTS *inside* the budget instead of the
+            // caller aborting first and re-doing the work cold. See
+            // recallMemoriesHybrid for the accounting.
+            deadlineMs: Number.isFinite(p.deadline_ms) && p.deadline_ms > 0 ? Math.floor(p.deadline_ms) : null,
             // Provenance stays channel-derived: the caller may label WHICH hook
             // it is, but the host comes from the token, never from the body.
             source: typeof p.source === 'string' ? p.source.slice(0, 64) : 'http',

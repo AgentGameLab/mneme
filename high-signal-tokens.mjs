@@ -71,14 +71,37 @@ export function extractHighSignalTokens(text) {
 // (a different file), while `memory/index.mjs` is carried by `E:/x/memory/index.mjs`.
 export function isStillCarried(token, newTokens) {
   if (newTokens.has(token)) return true
+  // A path the new text spells more precisely (longer, same trailing
+  // segments, a separator at the boundary) is still carried.
   for (const t of newTokens) {
     if (t.length > token.length && t.endsWith(token)) {
       const boundary = t[t.length - token.length - 1]
       if (boundary === '/' || boundary === '\\') return true
     }
   }
+  // The reverse: the new text refers to the same file by its bare name.
+  // "scripts/pull-qishe-river-assets.py" -> "pull-qishe-river-assets.py" is a
+  // rewording, not a dropped identifier (2026-09-14: that exact false positive
+  // flagged an actively-recalled chain, which is how a guard gets ignored).
+  // Only for distinctive, file-shaped basenames — a bare "a.js" names too much.
+  const cut = Math.max(token.lastIndexOf('/'), token.lastIndexOf('\\'))
+  if (cut > 0) {
+    const base = token.slice(cut + 1)
+    if (base.length >= 8 && /[.-]/.test(base) && !GENERIC_BASENAMES.has(base.toLowerCase()) && newTokens.has(base)) return true
+  }
   return false
 }
+
+// Long enough and file-shaped is not the same as distinctive. "frontend/package.json"
+// superseded by text that only names "backend/package.json" has dropped a real fact,
+// and every Node project has one of each of these — so the bare name proves nothing.
+const GENERIC_BASENAMES = new Set([
+  'package.json', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'tsconfig.json',
+  'readme.md', 'changelog.md', 'license.md', 'dockerfile', 'makefile', '.env.local', '.env.example',
+  'index.js', 'index.mjs', 'index.cjs', 'index.ts', 'index.tsx', 'index.html',
+  'main.js', 'main.mjs', 'main.ts', 'main.py', 'app.js', 'app.ts', 'app.py',
+  'config.json', 'config.js', 'config.mjs', 'config.ts', 'settings.json', 'schema.sql',
+])
 
 export function checkSupersedeShrink(newContent, olds) {
   const warnings = []

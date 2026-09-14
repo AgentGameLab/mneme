@@ -82,10 +82,14 @@ const CFG = {
   //
   // null when the caller pinned a DB but not a URL — see resolveHttpUrl().
   httpUrl: resolveHttpUrl(),
-  // Deliberately much shorter than the CLI budget: a healthy server answers in
-  // single-digit ms, so anything slower means it is unwell and we should be
-  // spawning already rather than paying both costs.
-  httpTimeoutMs: intEnv('MNEME_HTTP_TIMEOUT_MS', 800),
+  // 1500 (was 800). The 800 came from the FTS-only era, when a healthy server
+  // answered in single-digit ms and anything slower meant it was unwell. With
+  // hybrid recall a healthy answer includes one embedding round trip
+  // (170–480 ms measured), and since v2.11 we send this budget as deadline_ms
+  // so the server degrades to FTS *inside* it — a longer wait can no longer
+  // turn into a zombie call. Still under the CLI spawn budget, so the
+  // fallback fits after it. Kept in sync with prompt-recall.mjs.
+  httpTimeoutMs: intEnv('MNEME_HTTP_TIMEOUT_MS', 1500),
   indexPath: process.env.MNEME_INDEX_PATH || resolve(__dirname, '..', 'index.mjs'),
   minImportance: intEnv('MNEME_TOOL_MIN_IMPORTANCE', 6),
   level: process.env.MNEME_TOOL_LEVEL || 'meta_knowledge,semi_abstract',
@@ -203,6 +207,10 @@ async function runRecall(query, sessionId) {
     level: CFG.level,
     source: 'mneme-tool-recall',
     session_id: sessionId,
+    // Same contract as prompt-recall.mjs: our remaining budget, so the server
+    // degrades inside it rather than us aborting into a cold spawn. This hook
+    // fires per tool call, so it mattered at least as much as the prompt one.
+    deadline_ms: Math.max(300, CFG.httpTimeoutMs - 100),
   })
   if (viaHttp) return viaHttp
 

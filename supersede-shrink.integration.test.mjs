@@ -253,6 +253,23 @@ dbRead.close()
   check('a bare substring is not carried either',
     !isStillCarried('index.mjs', new Set(['reindex.mjs'])))
 
+  // The reverse of the path-suffix rule: a path now mentioned by its bare file
+  // name is a rewording, not a dropped identifier. Real case (2026-09-14): a
+  // supersede that replaced a 5-step recipe with a 1-step one still named every
+  // script it retired — by basename — and the guard flagged all four as lost.
+  check('a path referred to by its bare file name is still carried',
+    isStillCarried('scripts/pull-qishe-river-assets.py', new Set(['pull-qishe-river-assets.py'])))
+  check('a Windows-separated path is carried by its bare file name too',
+    isStillCarried('scripts\\pull-render-model-packs.mjs', new Set(['pull-render-model-packs.mjs'])))
+  check('a short or generic basename does not count as carried',
+    !isStillCarried('lib/a.js', new Set(['a.js'])) && !isStillCarried('src/helpers', new Set(['helpers'])))
+  // Long and file-shaped is not distinctive: every Node project has one of these.
+  // "frontend/package.json" -> "package.json" (which may be backend/) is a dropped fact.
+  check('a universally generic basename is NOT carried even when long enough',
+    !isStillCarried('frontend/package.json', new Set(['package.json'])) &&
+    !isStillCarried('memory/index.mjs', new Set(['index.mjs'])) &&
+    !isStillCarried('docs/README.md', new Set(['README.md'])))
+
   const oldContent = 'runner lives at memory/index.mjs and the log rotates via scripts/run.sh, token in API_TOKEN, see https://ops.example.com/dash'
   const newContent = 'runner lives at C:/work/ws/memory/index.mjs and the log rotates via C:/tools/scripts/run.sh, token in API_TOKEN, see https://ops.example.com/dash — now also covers the nightly path'
   const clean = checkSupersedeShrink(newContent, [{ id: '1', content: oldContent }])
