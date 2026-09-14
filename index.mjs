@@ -665,8 +665,49 @@ const EMBED_TIMEOUT = Symbol('embedding-timeout')
  * instead of null specifically when the deadline was hit, so a caller that
  * cares can record *why* it degraded rather than reporting a normal result.
  */
-export async function generateEmbedding(text, { signalTimeout = false } = {}) {
+// Query-embedding memo. Measured on a 10-day recall_log (2026-09-14): 23% of
+// recall queries recur within 10 minutes — the same question asked again, a
+// prompt re-sent, a second session asking what the first just asked. These are
+// sequential repeats: a hit only exists once an earlier call has resolved.
+// Two calls for the same text in flight at the same instant both go upstream
+// (no coalescing; the window that matters is minutes, not milliseconds).
+// Embeddings are deterministic for a given model, so the repeat is pure
+// latency and upstream load. Opt-in (`memo: true`); the recall path uses it,
+// the store paths do not (content rarely repeats and the map should stay
+// small). Entries carry no model tag: _embeddingConfig is set once per
+// process, so a model change means a restart, which empties the map.
+const EMBED_MEMO_TTL_MS = 10 * 60_000
+const EMBED_MEMO_MAX = 512
+const _embedMemo = new Map()   // text -> { vec, at }; Map keeps insertion order for FIFO eviction
+const _embedStats = { calls: 0, memoHits: 0, timeouts: 0, clamped: 0, failures: 0 }
+
+/** Counters since process start — surfaced by getMemoryStats() so a caller can see, not guess, whether the memo and deadline clamp are doing anything. */
+export function getEmbeddingStats() { return { ..._embedStats, memoSize: _embedMemo.size } }
+
+/**
+ * @param {string} text
+ * @param {object} [o]
+ * @param {boolean} [o.signalTimeout=false] return EMBED_TIMEOUT (not null) when the deadline hit
+ * @param {number|null} [o.timeoutMs=null] per-call ceiling; the effective timeout is
+ *   min(EMBEDDING_TIMEOUT_MS, timeoutMs). A caller with a hard budget (a hook with
+ *   1.5 s before it gives up) passes its remaining time so the server degrades
+ *   to FTS *inside* that budget instead of the caller aborting and re-doing the
+ *   work cold while this call runs on as a zombie.
+ * @param {boolean} [o.memo=false] serve from / fill the 10-minute query memo
+ */
+export async function generateEmbedding(text, { signalTimeout = false, timeoutMs = null, memo = false } = {}) {
   if (!_embeddingConfig) return null
+  const input = text.slice(0, 8000)
+  if (memo) {
+    const hit = _embedMemo.get(input)
+    if (hit && Date.now() - hit.at < EMBED_MEMO_TTL_MS) { _embedStats.memoHits++; return hit.vec }
+    if (hit) _embedMemo.delete(input)
+  }
+  const envTimeout = embeddingTimeoutMs()
+  const clamped = Number.isFinite(timeoutMs) && timeoutMs > 0 && timeoutMs < envTimeout
+  const effectiveTimeout = clamped ? Math.max(100, Math.floor(timeoutMs)) : envTimeout
+  _embedStats.calls++
+  if (clamped) _embedStats.clamped++
   try {
     const res = await fetch(`${_embeddingConfig.baseUrl}/embeddings`, {
       method: 'POST',
@@ -676,19 +717,30 @@ export async function generateEmbedding(text, { signalTimeout = false } = {}) {
       },
       body: JSON.stringify({
         model: _embeddingConfig.model,
-        input: text.slice(0, 8000),
+        input,
         dimensions: _embeddingConfig.dimension,
         encoding_format: 'float',
       }),
-      signal: AbortSignal.timeout(embeddingTimeoutMs()),
+      signal: AbortSignal.timeout(effectiveTimeout),
     })
     const data = await res.json()
-    return data?.data?.[0]?.embedding || null
+    const vec = data?.data?.[0]?.embedding || null
+    // Only a well-formed vector is worth remembering for ten minutes: an empty
+    // array or a wrong-dimension reply is a one-off upstream hiccup today and
+    // must not become sticky for that query text.
+    const wellFormed = Array.isArray(vec) && vec.length > 0
+      && (!_embeddingConfig.dimension || vec.length === _embeddingConfig.dimension)
+    if (memo && wellFormed) {
+      if (_embedMemo.size >= EMBED_MEMO_MAX) _embedMemo.delete(_embedMemo.keys().next().value)
+      _embedMemo.set(input, { vec, at: Date.now() })
+    }
+    return vec
   } catch (e) {
     // A stalling upstream is the common case and should not read as a broken one.
     const timedOut = e?.name === 'TimeoutError' || e?.name === 'AbortError'
+    if (timedOut) _embedStats.timeouts++; else _embedStats.failures++
     log(timedOut
-      ? `Embedding timed out after ${embeddingTimeoutMs()}ms — degrading to FTS for this call`
+      ? `Embedding timed out after ${effectiveTimeout}ms${clamped ? ' (caller deadline)' : ''} — degrading to FTS for this call`
       : `Embedding failed: ${e.message}`)
     return timedOut && signalTimeout ? EMBED_TIMEOUT : null
   }
@@ -970,6 +1022,8 @@ function _parseEventTime(v) {
  * @param {boolean} [o.requireVec] keep only rows with vector evidence
  * @param {string} [o.source] recall_log label
  * @param {string} [o.sessionId] recall_log session
+ * @param {number} [o.deadlineMs] the caller's remaining budget in ms; bounds the
+ *   embedding wait so the call degrades to FTS inside it (see recallMemoriesHybrid)
  * @returns {Promise<Object>} { hits, count, requested_limit, effective_limit, candidate_limit, capped, trace_id }
  */
 export async function recallForClients(o = {}) {
@@ -989,6 +1043,7 @@ export async function recallForClients(o = {}) {
     limit: candidatePoolSize,
     _source: o.source || 'unknown',
     _sessionId: o.sessionId || null,
+    deadlineMs: Number.isFinite(o.deadlineMs) && o.deadlineMs > 0 ? o.deadlineMs : null,
     _filterLevel: levels.length ? levels.join(',') : null,
     _minImportance: minImportance > 0 ? minImportance : null,
     _out: out,
@@ -2194,6 +2249,14 @@ function findEntityMatchedMemories(db, queryText, limit) {
   return rows.map(r => ({ ...r, tags: safeJsonParse(r.tags, []), metadata: safeJsonParse(r.metadata, {}) }))
 }
 
+/**
+ * Hybrid recall: FTS5 + vector KNN (+ entity path) fused by RRF.
+ * Accepts every recallMemories option plus:
+ * @param {number} [opts.deadlineMs] the caller's remaining budget in ms. The
+ *   embedding wait is bounded to deadlineMs − 150 (floor 200, never above
+ *   EMBEDDING_TIMEOUT_MS); on timeout the call degrades to FTS-only and marks
+ *   the result `_degradeReason = 'embedding-timeout'`. Absent → env timeout.
+ */
 export async function recallMemoriesHybrid(opts = {}) {
   const { query: queryText, limit: requestedLimit = 10 } = opts
 
@@ -2254,8 +2317,25 @@ export async function recallMemoriesHybrid(opts = {}) {
 
   // Parallel: vector query (get embedding) + FTS query
   // _internal=true so the FTS path doesn't also surface random records (hybrid surfaces once at the end)
+  // The caller's remaining budget bounds the embedding wait. A hook that will
+  // abort at 1.5 s must not wait 2.5 s here: on the 10-day recall_log before
+  // this, 49% of hook-side hybrid work finished after the hook had already
+  // given up, and 47% of those were followed by the hook re-embedding the same
+  // query in a cold spawned process.
+  //
+  // Budget accounting, in one place so the two margins are seen together:
+  //   caller: deadline_ms = its own timeout − 100   (transit, hooks/*.mjs)
+  //   here:   embedding   = deadline_ms − 150       (fusion + serialisation +
+  //           the synchronous SQLite work of *other* requests on this single
+  //           event loop; FTS itself runs concurrently below and is sub-10 ms)
+  // With the bundled hooks' 1500 ms default that leaves 1250 ms for the
+  // embedding — comfortably above the 170–480 ms the API takes. Below 200 ms
+  // an embedding cannot succeed, so that is the floor.
+  const embedTimeoutMs = Number.isFinite(opts.deadlineMs) && opts.deadlineMs > 0
+    ? Math.max(200, Math.floor(opts.deadlineMs) - 150)
+    : null
   const [rawEmbedding, ftsRows] = await Promise.all([
-    generateEmbedding(queryText, { signalTimeout: true }),
+    generateEmbedding(queryText, { signalTimeout: true, timeoutMs: embedTimeoutMs, memo: true }),
     Promise.resolve(recallMemories({
       ...opts,
       limit: candidateLimit,
@@ -3203,6 +3283,10 @@ export function getMemoryStats() {
       recentSearchMisses: recentMisses,
       embeddingConfigured: !!_embeddingConfig,
       vectorCoverage,
+      // Since process start: calls / memoHits / timeouts / clamped / failures.
+      // Lets an operator see whether the query memo and caller deadlines are
+      // doing anything, instead of inferring it from latency distributions.
+      embedding: getEmbeddingStats(),
     }
   } catch (e) {
     return { error: e.message }

@@ -46,6 +46,10 @@ When configured with an embedding API, mneme now runs **dual-path retrieval**:
 
 Falls back gracefully to FTS5-only when sqlite-vec or embedding API is not configured.
 
+**Caller deadlines (v2.11).** `POST /recall` accepts `deadline_ms`: the caller's remaining budget. The server bounds its embedding wait to `deadline_ms − 150` (floor 200 ms, never above `EMBEDDING_TIMEOUT_MS`) and degrades to FTS-only *inside* that budget. Without it, a hook that aborts at 1.5 s while the server waits 2.5 s for the embedding throws the whole call away and re-runs it cold — on one 10-day log that was 49% of hook-side hybrid work. Both bundled hooks send it (their HTTP default is now 1500 ms, up from the FTS-era 800: a longer wait can no longer become a zombie call). `GET /stats` (`embedding.clamped`) shows how often it bites; `/health` is liveness-only since v2.11 and the full census lives at `/stats`. One operational note: the server reads `.env.local` fill-only, so a supervisor that respawns it must pass the *current* file's values, not its own startup snapshot — otherwise a raised `EMBEDDING_TIMEOUT_MS` never reaches the process.
+
+**Query memo (v2.11).** Query embeddings are memoised for 10 minutes (512 entries, opt-in on the recall path only). 23% of recall queries recur within that window — the same prompt fanning out to several hooks and sessions — and embeddings are deterministic, so the repeat is pure latency. `/stats` (`embedding.memoHits`) counts them.
+
 **Performance**: ~150ms total (FTS5 <10ms + one embedding API call ~120ms). sqlite-vec KNN is sub-millisecond locally.
 
 ### Compression Pipeline

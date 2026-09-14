@@ -88,10 +88,14 @@ const CFG = {
   //
   // null when the caller pinned a DB but not a URL — see resolveHttpUrl().
   httpUrl: resolveHttpUrl(),
-  // Deliberately much shorter than the CLI budget: a healthy server answers in
-  // single-digit ms, so anything slower means it is unwell and we should be
-  // spawning already rather than paying both costs.
-  httpTimeoutMs: intEnv('MNEME_HTTP_TIMEOUT_MS', 800),
+  // 1500 (was 800). The 800 came from the FTS-only era, when a healthy server
+  // answered in single-digit ms and anything slower meant it was unwell. With
+  // hybrid recall a healthy answer includes one embedding round trip
+  // (170–480 ms measured), and since v2.11 we send this budget as deadline_ms
+  // so the server degrades to FTS *inside* it — a longer wait can no longer
+  // turn into a zombie call, so there is no reason to keep it tight. Still
+  // well under the CLI spawn budget below, so the fallback fits after it.
+  httpTimeoutMs: intEnv('MNEME_HTTP_TIMEOUT_MS', 1500),
   indexPath: process.env.MNEME_INDEX_PATH || resolve(__dirname, '..', 'index.mjs'),
   minImportance: intEnv('MNEME_MIN_IMPORTANCE', 6),
   level: process.env.MNEME_LEVEL || 'meta_knowledge',
@@ -164,6 +168,12 @@ async function runRecall(query, sessionId) {
     level: CFG.level,
     source: 'mneme-prompt-recall',
     session_id: sessionId,
+    // Tell the server how long we will actually wait, so a slow embedding
+    // degrades to an FTS answer inside our budget instead of us aborting and
+    // re-doing the whole recall in a cold spawned CLI. 100 ms covers transit;
+    // the server takes its own 150 ms for fusion (see recallMemoriesHybrid),
+    // so the embedding gets httpTimeoutMs − 250 — 1250 ms at the default.
+    deadline_ms: Math.max(300, CFG.httpTimeoutMs - 100),
   })
   if (viaHttp) return viaHttp
 
