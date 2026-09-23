@@ -1027,6 +1027,8 @@ function _parseEventTime(v) {
  * @param {number} [o.minImportance=0] importance floor (0 = no filter)
  * @param {string[]} [o.levels] memory_level allowlist
  * @param {boolean} [o.requireVec] keep only rows with vector evidence
+ * @param {boolean} [o.preferVec] keep only rows with vector evidence when any exist;
+ *   otherwise return the unfiltered rows (no embeddings / degraded to FTS)
  * @param {string} [o.source] recall_log label
  * @param {string} [o.sessionId] recall_log session
  * @param {number} [o.deadlineMs] the caller's remaining budget in ms; bounds the
@@ -1077,6 +1079,14 @@ export async function recallForClients(o = {}) {
   // callers need the vec rows to survive. With embedding down this yields 0 rows —
   // fail-closed is correct for inject paths.
   if (o.requireVec) memories = memories.filter(m => typeof m.vec_distance === 'number')
+  // preferVec: same filter, but fail-open. Lets a caller get vector-backed rows
+  // when embeddings are up and plain FTS rows when they are not, in one round
+  // trip — the alternative (require, then retry on zero) doubles latency on
+  // every zero-config install.
+  else if (o.preferVec) {
+    const withVec = memories.filter(m => typeof m.vec_distance === 'number')
+    if (withVec.length > 0) memories = withVec
+  }
   memories = memories.slice(0, limit)
 
   if (memories.length > 0) {
@@ -4354,6 +4364,7 @@ if (_isMain) {
       const res = await recallForClients({
         query, limit, minImportance, levels: levelFilter,
         requireVec: hasFlag('--require-vec'),
+        preferVec: hasFlag('--prefer-vec'),
         source: getFlag('--source') || 'cli',
         sessionId: getFlag('--session-id') || null,
       })

@@ -168,16 +168,18 @@ async function recallOverHttp(body) {
   } catch { return null }
 }
 async function runRecall(query, sessionId) {
-  const httpReq = (requireVec) => recallOverHttp({
+  const viaHttp = await recallOverHttp({
     query: query,
     limit: CFG.limit,
     min_importance: CFG.minImportance,
     level: CFG.level,
-    // Filter to rows with vector evidence BEFORE the server trims to `limit`.
+    // Prefer rows with vector evidence BEFORE the server trims to `limit`.
     // Otherwise the few slots go to character-level FTS and entity matches —
     // on CJK text that is mostly generic rows sharing one common noun — and the
-    // semantically relevant rows sit just below the cut.
-    require_vec: requireVec,
+    // semantically relevant rows sit just below the cut. Fail-open: with no
+    // embeddings the server returns plain FTS rows in the same round trip.
+    // (Servers older than 2.11.1 ignore the field and behave as before.)
+    prefer_vec: true,
     source: 'mneme-prompt-recall',
     session_id: sessionId,
     // Tell the server how long we will actually wait, so a slow embedding
@@ -187,11 +189,6 @@ async function runRecall(query, sessionId) {
     // so the embedding gets httpTimeoutMs − 250 — 1250 ms at the default.
     deadline_ms: Math.max(300, CFG.httpTimeoutMs - 100),
   })
-  // Zero rows under require_vec means no embeddings configured, the embedding
-  // call degraded, or genuinely nothing — ask again without it so zero-config
-  // installs keep the plain FTS behaviour (and the consensus gate below).
-  let viaHttp = await httpReq(true)
-  if (viaHttp && viaHttp.hits.length === 0) viaHttp = await httpReq(false)
   if (viaHttp) return viaHttp
 
   const args = [
@@ -202,6 +199,7 @@ async function runRecall(query, sessionId) {
     '--level', CFG.level,
     '--limit', String(CFG.limit),
     '--source', 'mneme-prompt-recall',
+    '--prefer-vec',
     '--session-id', sessionId,
   ]
   const r = spawnSync(process.execPath, args, {

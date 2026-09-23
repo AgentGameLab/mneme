@@ -32,4 +32,6 @@ test('only user-authored text reaches the trigger and the query', async () => {
   // Plain prompts pass through untouched.
   assert.equal(userPromptText('  how to restart the daemon '), 'how to restart the daemon')
   assert.equal(userPromptText(undefined), '')
+  // A truncated reminder is not user input either.
+  assert.equal(userPromptText('<system-reminder>\nThe user started task X and the text was cut'), '')
 })

@@ -663,6 +663,7 @@ if (useHttp) {
             minImportance: Number.isFinite(p.min_importance) ? p.min_importance : 0,
             levels: Array.isArray(p.levels) ? p.levels : (typeof p.level === 'string' && p.level ? p.level.split(',') : []),
             requireVec: !!p.require_vec,
+            preferVec: !!p.prefer_vec,
             // The caller's remaining budget. The server clamps its embedding
             // wait to fit, degrading to FTS *inside* the budget instead of the
             // caller aborting first and re-doing the work cold. See

@@ -50,6 +50,14 @@ check('every returned row was bumped', [...returned].every(id => bumped.includes
 check('no row outside the result was bumped', bumped.every(id => returned.has(id)),
   `bumped=${bumped} returned=${[...returned]}`)
 
+// preferVec is the fail-open twin of requireVec. This temp DB has no embedding
+// config, i.e. the zero-config install: requireVec must return nothing and
+// preferVec must fall back to the FTS rows in the same call.
+const strict = await recallForClients({ query: marker, limit: 2, minImportance: 1, requireVec: true, source: 'test' })
+const lenient = await recallForClients({ query: marker, limit: 2, minImportance: 1, preferVec: true, source: 'test' })
+check('requireVec without embeddings returns nothing', strict.hits.length === 0, `got ${strict.hits.length}`)
+check('preferVec without embeddings falls back to FTS rows', lenient.hits.length === 2, `got ${lenient.hits.length}`)
+
 closeMemory()
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'}: ${pass} passed / ${fail} failed`)
 process.exit(fail === 0 ? 0 : 1)

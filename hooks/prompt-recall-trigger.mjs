@@ -30,13 +30,16 @@ const TRIGGERS = [
 // wrapper text, and those reports are dense with exactly the infrastructure
 // nouns the triggers below look for.
 //
-// Returns '' when nothing user-authored remains.
+// Returns '' when nothing user-authored remains. Known trade-off: a user who
+// pastes text that itself starts with one of these tags gets no recall for it.
 const NOT_USER_INPUT = /^<(task-notification|cross-session-message)\b/
 
 export function userPromptText(raw) {
   if (!raw || typeof raw !== 'string') return ''
   const text = raw.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
-  if (NOT_USER_INPUT.test(text)) return ''
+  // An unterminated block (truncated upstream) would otherwise survive whole
+  // and be sent as the query.
+  if (NOT_USER_INPUT.test(text) || text.startsWith('<system-reminder')) return ''
   return text
 }
 
