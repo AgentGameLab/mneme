@@ -25,7 +25,9 @@
 //   MNEME_DB_PATH          alias for TOKENMEM_DB_PATH; where mneme's engram.db lives
 //   MNEME_INDEX_PATH       override for index.mjs (default: ../index.mjs)
 //   MNEME_MIN_IMPORTANCE   floor for hits (default: 6)
-//   MNEME_LEVEL            recall level filter (default: meta_knowledge)
+//   MNEME_LEVEL            recall level filter (default: meta_knowledge,semi_abstract)
+//   MNEME_MAX_VEC_DISTANCE drop hits farther than this when the server returned
+//                          vector evidence (default: 0.95; ignored without embeddings)
 //   MNEME_LIMIT            max recall candidates (default: 5)
 //   MNEME_MIN_CONSENSUS    hide injection if hits < this (default: 2)
 //   MNEME_STATE_DIR        session-dedup file dir (default: ~/.claude/hooks)
@@ -43,7 +45,7 @@ import { spawnSync } from 'node:child_process'
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { shouldTriggerPromptRecall } from './prompt-recall-trigger.mjs'
+import { shouldTriggerPromptRecall, userPromptText } from './prompt-recall-trigger.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const HOME = process.env.USERPROFILE || process.env.HOME || __dirname
@@ -98,7 +100,12 @@ const CFG = {
   httpTimeoutMs: intEnv('MNEME_HTTP_TIMEOUT_MS', 1500),
   indexPath: process.env.MNEME_INDEX_PATH || resolve(__dirname, '..', 'index.mjs'),
   minImportance: intEnv('MNEME_MIN_IMPORTANCE', 6),
-  level: process.env.MNEME_LEVEL || 'meta_knowledge',
+  // semi_abstract is in the default on purpose. The triggers are operational
+  // (paths, ports, restarts, config), and the write-time meta gate downgrades
+  // anything carrying a path, port or version to semi_abstract — so under a
+  // meta-only filter the answers this hook exists to find could never match.
+  level: process.env.MNEME_LEVEL || 'meta_knowledge,semi_abstract',
+  maxVecDistance: (() => { const n = Number(process.env.MNEME_MAX_VEC_DISTANCE); return Number.isFinite(n) && n > 0 ? n : 0.95 })(),
   limit: intEnv('MNEME_LIMIT', 5),
   minConsensus: intEnv('MNEME_MIN_CONSENSUS', 2),
   stateDir: process.env.MNEME_STATE_DIR || resolve(HOME, '.claude', 'hooks'),
@@ -161,11 +168,16 @@ async function recallOverHttp(body) {
   } catch { return null }
 }
 async function runRecall(query, sessionId) {
-  const viaHttp = await recallOverHttp({
+  const httpReq = (requireVec) => recallOverHttp({
     query: query,
     limit: CFG.limit,
     min_importance: CFG.minImportance,
     level: CFG.level,
+    // Filter to rows with vector evidence BEFORE the server trims to `limit`.
+    // Otherwise the few slots go to character-level FTS and entity matches —
+    // on CJK text that is mostly generic rows sharing one common noun — and the
+    // semantically relevant rows sit just below the cut.
+    require_vec: requireVec,
     source: 'mneme-prompt-recall',
     session_id: sessionId,
     // Tell the server how long we will actually wait, so a slow embedding
@@ -175,6 +187,11 @@ async function runRecall(query, sessionId) {
     // so the embedding gets httpTimeoutMs − 250 — 1250 ms at the default.
     deadline_ms: Math.max(300, CFG.httpTimeoutMs - 100),
   })
+  // Zero rows under require_vec means no embeddings configured, the embedding
+  // call degraded, or genuinely nothing — ask again without it so zero-config
+  // installs keep the plain FTS behaviour (and the consensus gate below).
+  let viaHttp = await httpReq(true)
+  if (viaHttp && viaHttp.hits.length === 0) viaHttp = await httpReq(false)
   if (viaHttp) return viaHttp
 
   const args = [
@@ -219,7 +236,7 @@ process.stdin.on('end', async () => {
   try { payload = JSON.parse(input || '{}') } catch { process.exit(0) }
 
   const sessionId = payload.session_id || payload.sessionId || 'unknown'
-  const prompt = (payload.prompt || '').trim()
+  const prompt = userPromptText(payload.prompt || '')
 
   if (!shouldTriggerPromptRecall(prompt)) process.exit(0)
 
@@ -227,8 +244,16 @@ process.stdin.on('end', async () => {
   const recalled = await runRecall(query, sessionId)
   if (!recalled || !Array.isArray(recalled.hits)) process.exit(0)
 
-  const hits = recalled.hits
-  if (hits.length < CFG.minConsensus) process.exit(0)
+  // With vector evidence present, relevance is measurable — gate on it and
+  // skip the count heuristic. Without it (no embeddings), fall back to
+  // requiring agreement between several FTS hits.
+  let hits = recalled.hits
+  if (hits.some(h => typeof h.vec_distance === 'number')) {
+    hits = hits.filter(h => typeof h.vec_distance === 'number' && h.vec_distance <= CFG.maxVecDistance)
+    if (hits.length === 0) process.exit(0)
+  } else if (hits.length < CFG.minConsensus) {
+    process.exit(0)
+  }
 
   const injected = loadInjected(sessionId)
   const fresh = hits.filter(h => !injected.has(h.id))

@@ -206,9 +206,10 @@ MCP tool 是 pull 模式——Agent 自己决定何时 `recall_memory`。有些 
 | `MNEME_DB_PATH` | mneme 自带 `engram.db` | `TOKENMEM_DB_PATH` 的别名，选 DB 文件 |
 | `MNEME_INDEX_PATH` | `<mneme>/index.mjs` | 覆盖引擎入口 |
 | `MNEME_MIN_IMPORTANCE` | `6` | prompt-recall 命中门槛 |
-| `MNEME_LEVEL` | `meta_knowledge` | prompt-recall level 过滤 |
+| `MNEME_LEVEL` | `meta_knowledge,semi_abstract` | prompt-recall level 过滤 |
+| `MNEME_MAX_VEC_DISTANCE` | `0.95` | 有向量时，prompt-recall 丢弃距离大于此值的命中 |
 | `MNEME_LIMIT` | `5` | prompt-recall 候选上限 |
-| `MNEME_MIN_CONSENSUS` | `2` | prompt-recall 少于此数就不注入 |
+| `MNEME_MIN_CONSENSUS` | `2` | prompt-recall 少于此数就不注入（仅在没有向量证据时生效） |
 | `MNEME_TOOL_MIN_IMPORTANCE` | `6` | tool-recall 命中门槛 |
 | `MNEME_TOOL_LEVEL` | `meta_knowledge,semi_abstract` | tool-recall level 过滤 |
 | `MNEME_TOOL_LIMIT` | `4` | tool-recall 候选上限 |

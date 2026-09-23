@@ -64,7 +64,14 @@ try {
 //      the pre-rename era — silent migration would create a split-brain second
 //      DB; we'd rather keep using the populated one)
 //   3. tokenmem.db (default for fresh installs)
-const DB_PATH = process.env.TOKENMEM_DB_PATH
+//
+// Resolved at call time, not import time. A host that imports this module and
+// then loads its own env file sets TOKENMEM_DB_PATH too late for a module-level
+// const — ES imports are hoisted above the host's body — so the store silently
+// opened the fallback DB. With more than one tenant per machine that means
+// writes land in the wrong store. getDb() first runs inside initMemory(), after
+// the host's env is ready.
+const resolveDbPath = () => process.env.TOKENMEM_DB_PATH
   || (existsSync(resolve(__dirname, 'engram.db'))
         ? resolve(__dirname, 'engram.db')
         : resolve(__dirname, 'tokenmem.db'))
@@ -98,7 +105,7 @@ let _writesSinceRecallTraceSweep = 0
 function getDb() {
   if (_db) return _db
   const Database = require('better-sqlite3')
-  _db = new Database(DB_PATH)
+  _db = new Database(resolveDbPath())
   _db.pragma('journal_mode = WAL')
   _db.pragma('foreign_keys = ON')
   _db.pragma('busy_timeout = 5000')  // wait 5s on concurrent writes instead of immediate error
@@ -156,7 +163,7 @@ export function initMemory() {
     }
   }
 
-  log(`Initialized — DB at ${DB_PATH}`)
+  log(`Initialized — DB at ${resolveDbPath()}`)
 
   // ── FTS migration: if simple extension loaded but FTS uses old tokenizer, rebuild ──
   if (_simpleLoaded) {
@@ -1046,6 +1053,10 @@ export async function recallForClients(o = {}) {
     deadlineMs: Number.isFinite(o.deadlineMs) && o.deadlineMs > 0 ? o.deadlineMs : null,
     _filterLevel: levels.length ? levels.join(',') : null,
     _minImportance: minImportance > 0 ? minImportance : null,
+    // The pool is over-fetched (up to 30) and trimmed below; bump access only
+    // for the rows actually returned, same contract as buildMemoryContext
+    // (#7). Without this every candidate got +1 per hook call.
+    _deferAccessBump: true,
     _out: out,
   })
 
@@ -1067,6 +1078,15 @@ export async function recallForClients(o = {}) {
   // fail-closed is correct for inject paths.
   if (o.requireVec) memories = memories.filter(m => typeof m.vec_distance === 'number')
   memories = memories.slice(0, limit)
+
+  if (memories.length > 0) {
+    try {
+      const now = Date.now()
+      const stmt = getDb().prepare(`UPDATE memories SET last_accessed = ?, access_count = access_count + 1 WHERE rowid = ?`)
+      const tx = getDb().transaction((rows) => { for (const m of rows) stmt.run(now, m.rowid) })
+      tx(memories)
+    } catch {}
+  }
 
   // hit_count is the raw pool; final_hit_count is what survived filtering and
   // actually reached the caller. Without this the utilization stats read as if
@@ -2467,7 +2487,14 @@ export async function recallMemoriesHybrid(opts = {}) {
     // importance keeps what it is good at: the min_importance filter,
     // surface-cold thresholds, display. Filtering on it is a caller stating a
     // floor; ranking on it is the store guessing.
-    const score = (rrf * 10 + freqScore * 0.10 + timeScore * 0.06) * decay
+    //
+    // freqScore is 0.02 for the same reason. It saturates at 20 accesses, so on a
+    // long-lived store it is effectively binary: a row surfaced 20+ times beat a
+    // fresh one by 0.10 — about 38 rank positions at RRF's spacing. Combined with
+    // recallForClients bumping its whole candidate pool, the loop fed itself: on
+    // one 10k-row store a single row reached 46% of two weeks of hook recalls.
+    // At 0.02 it stays a tiebreak (~8 positions at most).
+    const score = (rrf * 10 + freqScore * 0.02 + timeScore * 0.06) * decay
     const temporalMetadata = temporalWindow
       ? { temporal_match: isInTemporalWindow(row, temporalWindow) }
       : {}

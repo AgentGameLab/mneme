@@ -22,6 +22,24 @@ const TRIGGERS = [
   /(?:路径|目录|位置|端口|凭证|密钥|环境变量|配置|脚本|工具|命令|启动|重启|守护进程)/,
 ]
 
+// UserPromptSubmit carries more than what the user typed. In Claude Code,
+// background-agent reports arrive as <task-notification>, messages from other
+// sessions as <cross-session-message>, and app notices get prepended as
+// <system-reminder>. Recalling on the raw prompt means recalling on that
+// wrapper text: on one store, 631 of 688 fast-path queries over two weeks were
+// wrapper text, and those reports are dense with exactly the infrastructure
+// nouns the triggers below look for.
+//
+// Returns '' when nothing user-authored remains.
+const NOT_USER_INPUT = /^<(task-notification|cross-session-message)\b/
+
+export function userPromptText(raw) {
+  if (!raw || typeof raw !== 'string') return ''
+  const text = raw.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
+  if (NOT_USER_INPUT.test(text)) return ''
+  return text
+}
+
 export function shouldTriggerPromptRecall(prompt) {
   if (!prompt || prompt.length < 4) return false
   if (prompt.length > 1500) return false

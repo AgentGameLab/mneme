@@ -234,9 +234,10 @@ be re-injected within one Claude Code session.
 | `MNEME_DB_PATH` | mneme's own `engram.db` | Alias for `TOKENMEM_DB_PATH`; picks the DB file |
 | `MNEME_INDEX_PATH` | `<mneme>/index.mjs` | Override the engine entry point |
 | `MNEME_MIN_IMPORTANCE` | `6` | Floor for prompt-recall hits |
-| `MNEME_LEVEL` | `meta_knowledge` | Prompt-recall level filter |
+| `MNEME_LEVEL` | `meta_knowledge,semi_abstract` | Prompt-recall level filter |
+| `MNEME_MAX_VEC_DISTANCE` | `0.95` | Prompt-recall drops hits farther than this when vectors are available |
 | `MNEME_LIMIT` | `5` | Prompt-recall candidate cap |
-| `MNEME_MIN_CONSENSUS` | `2` | Prompt-recall skip if fewer hits |
+| `MNEME_MIN_CONSENSUS` | `2` | Prompt-recall skip if fewer hits (only when no vector evidence) |
 | `MNEME_TOOL_MIN_IMPORTANCE` | `6` | Floor for tool-recall hits |
 | `MNEME_TOOL_LEVEL` | `meta_knowledge,semi_abstract` | Tool-recall level filter |
 | `MNEME_TOOL_LIMIT` | `4` | Tool-recall candidate cap |
