@@ -66,6 +66,16 @@ jobs:
           TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-ranking-importance.db
         run: node ranking-importance.integration.test.mjs
 
+      - name: Integration test (access bump — only returned rows, not the candidate pool)
+        env:
+          TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-access-bump.db
+        run: node access-bump-scope.integration.test.mjs
+
+      - name: Integration test (DB path read at open time, not import time)
+        env:
+          TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-late-db.db
+        run: node db-path-late-env.integration.test.mjs
+
       - name: Integration test (encoding-damage detection, both write paths)
         env:
           TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-encoding-damage.db
