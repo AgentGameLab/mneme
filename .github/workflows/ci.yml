@@ -42,6 +42,14 @@ jobs:
       - name: Unit tests (series detection — keeps timelines out of the supersede band)
         run: node series-detection.test.mjs
 
+      - name: Unit tests (tag-leak repair — sibling fields leaked into content)
+        run: node tag-leak-repair.test.mjs
+
+      - name: Integration test (tag-leak repair through store_memory)
+        env:
+          TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-tag-leak.db
+        run: node tag-leak.integration.test.mjs
+
       - name: Integration test (meta-gate write-gate)
         env:
           TOKENMEM_DB_PATH: ${{ runner.temp }}/mneme-ci-meta-gate.db

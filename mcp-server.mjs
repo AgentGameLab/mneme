@@ -48,6 +48,7 @@ import {
 } from './index.mjs'
 import { migrateVectorsToBlob } from './index.mjs'   // Migration 013 background runner (below)
 import { parseHostTokens, resolveAuthMode, resolveHost } from './auth.mjs'
+import { repairTagLeak } from './tag-leak-repair.mjs'
 import { recallClaudeMarkdownMemory } from './lib/claude-markdown-memory.mjs'
 
 // ── Load .env.local BEFORE initMemory() ────────────────────────────────
@@ -256,6 +257,19 @@ function createServer(hostId = DEFAULT_HOST) {
     async ({ content, summary, importance = 6, memory_type = 'long_term', memory_level = 'semi_abstract', category = 'general', tags = [], supersedes, event_time, is_anchor, is_pinned }) => {
       const out = {}
 
+      // Close-tag leak: sibling fields parsed into content/summary as raw XML
+      // while the real fields fell back to zod defaults. Split them back out
+      // before anything else sees the args — see tag-leak-repair.mjs.
+      const leak = repairTagLeak({ content, summary, importance, memory_type, memory_level, category, tags, supersedes, event_time, is_anchor, is_pinned })
+      if (leak.repaired) {
+        ({ content, summary, importance, memory_type, memory_level, category, tags, supersedes, event_time, is_anchor, is_pinned } = leak.args)
+      }
+      const leakNote = leak.repaired
+        ? `\n🩹 close-tag leak repaired: ${leak.moved.join(', ') || '(no valid fields)'} moved back out of ${leak.from.join(' + ')} — a field was closed with the wrong tag; each <parameter> must end with </parameter>`
+        : leak.suspect
+          ? `\n⚠️ possible close-tag leak: content/summary contains a closing tag followed by a field tag, but it didn't parse cleanly — recall_by_id this row and check its tail`
+          : ''
+
       // v2.9: not-yet-trusted hosts write into quarantine — a separate table
       // the recall pool never reads. Requested supersedes are recorded but
       // execute only if the reviewer approves.
@@ -273,6 +287,7 @@ function createServer(hostId = DEFAULT_HOST) {
         if (!qid) return { content: [{ type: 'text', text: 'Quarantine storage failed' }] }
         let qtext = `🔒 Quarantined (qid: ${qid}, host: ${hostId}) — pending review by '${PRIMARY_HOST}'. Not recallable until approved.`
         if (is_anchor || is_pinned) qtext += `\n(anchor/pinned flags are dropped for quarantined writes — the reviewer can re-add them after merge)`
+        qtext += leakNote
         if (out.encodingWarning) {
           const e = out.encodingWarning
           qtext += `\n⚠️ ENCODING DAMAGE: ${e.qmarkCount} '?' chars (longest run ${e.maxRun}). CJK was likely lost to a non-UTF-8 code page (cp936) — this is IRREVERSIBLE, not a display glitch. If you just wrote Chinese, it did NOT save; re-store via a UTF-8-safe path (codex exec / CC-side), not Codex Desktop.`
@@ -309,7 +324,7 @@ function createServer(hostId = DEFAULT_HOST) {
       if (is_anchor && !out.quotaRejected?.find(q => q.flag === 'is_anchor')) flags.push('anchor')
       if (is_pinned && !out.quotaRejected?.find(q => q.flag === 'is_pinned')) flags.push('pinned')
       const flagStr = flags.length ? `, flags: [${flags.join(', ')}]` : ''
-      let text = `Stored memory (id: ${id}, importance: ${importance}, type: ${memory_type}, level: ${finalLevel}${flagStr})`
+      let text = `Stored memory (id: ${id}, importance: ${importance}, type: ${memory_type}, level: ${finalLevel}${flagStr})` + leakNote
       // First among the warnings on purpose: the others say a policy adjusted the
       // write, this one says the content that landed is already damaged.
       if (out.encodingWarning) {
