@@ -38,7 +38,7 @@ or come with a `--dry-run` mode.
 | `runMemoryHealth()` / `--health` | `memory-health.mjs`, also `index.mjs --health` | Five readonly scans — inflation, dead-concrete, integrity, blindspot, near-dup. Never mutates. |
 | `--surface-cold` | `index.mjs` | Lists high-importance rows untouched for N days, ordered by `decay_score`. Readonly — the caller decides supersede/merge. |
 | `expireMemories()` | `index.mjs` | Soft-deletes rows past their `expires_at` TTL. Idempotent. |
-| `runDecayCycle({ tauHours })` | `index.mjs` | Refreshes `decay_score` for every active row using power-law decay over `last_accessed`. Idempotent. |
+| `runDecayCycle({ tauHours })` | `index.mjs` | Recomputes `decay_score` for every active row using power-law decay over `last_accessed`, and writes back only the rows that moved by at least 1e-4. Idempotent. |
 | `runLevelMigration({ limit, anchorPath, dryRun })` | `index.mjs` | Frequency-driven `memory_level` migration: demote unused `meta` back to `semi`, promote well-used `concrete` to `semi`. Writes a JSONL rollback anchor first when `anchorPath` is passed. |
 | `extractMissingEntities()` | `index.mjs` | Backfills the entity layer for rows without it. Only runs when `ENTITY_LLM_*` is configured. |
 | `--consolidate` | `index.mjs` | Composes `expireMemories` + `runDecayCycle` + `runLevelMigration` into one nightly call. `--dry-run` previews without writing. |
