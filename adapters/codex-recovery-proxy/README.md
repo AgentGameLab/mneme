@@ -16,7 +16,7 @@ Codex Desktop 有一个未修复的上游 bug（[openai/codex#32470](https://git
 - proxy 内部把每次 `tools/list` 或 `tools/call` 转成一次**独立的 HTTP session** 打到真 mneme server
 - 每次调用**结束即 DELETE session**，30 秒有界 timeout
 - **写调用绝不自动重试**（保 at-most-once 语义，不会导致重复 store_memory）
-- `Authorization: Bearer <token>` header 逐调用透传，mneme server 看到的 bearer 与直连模式**完全一致**（proxy 不修改、不缓存、不加工 auth header）
+- `Authorization: Bearer <token>` header 逐调用透传，mneme server 看到的 bearer 与直连模式**完全一致**（proxy 不修改、不缓存、不加工 auth header）。server 侧据此推导 `source_host`、决定写入是否进 quarantine 的逻辑，经 proxy 与直连时一致，见下方 [Provenance 与 quarantine](#provenance-与-quarantine)
 
 **架构效果**：单次 tool call 如果 wedge，只污染那一次；下次调用是全新 session，不受影响。
 
@@ -71,6 +71,15 @@ node adapters/codex-recovery-proxy/proxy.test.mjs
 | `MNEME_TOKEN_CODEX` | **必填** | Bearer token — proxy 逐调用透传给 mneme HTTP endpoint |
 | `MNEME_PROXY_TIMEOUT_MS` | `30000` | 单次请求 timeout |
 | `MNEME_PROXY_CLOSE_TIMEOUT_MS` | `2000` | 关闭 remote session 的 timeout |
+
+## Provenance 与 quarantine
+
+proxy 自己不实现、也不改变这两层，只保证 bearer 原样到达 mneme server；其余都是 server 的既有行为，与 codex 直连时一样：
+
+- **`source_host` 来自 bearer，不来自 proxy 或客户端自报。** server 在**建立 session 时**用该请求的 bearer，按 `MNEME_HOST_TOKENS`（`host=token` 对，如 `cc=tok1,codex=tok2`）查出 host，这个 session 上的写入都打这个 host 的 `source_host`。proxy 每次调用都是新 session，所以 host 每次都按当次 bearer 重新推导。
+- **`MNEME_TOKEN_CODEX` 应填 `MNEME_HOST_TOKENS` 里映射给 codex 的那个 token。** token 命中该表时，任何模式下都映射为对应 host；没命中时由 server 的 `MNEME_AUTH` 决定：`soft`（配了 `MNEME_HOST_TOKENS` 时的默认）和 `off`（没配时的默认）仍然服务，但按默认 host（`MNEME_DEFAULT_HOST`，默认 `cc`）记账；`enforce` 返回 401。
+- **quarantine 按同一个 host 生效。** 如果 codex 的 host 列在 server 的 `MNEME_QUARANTINE_HOSTS` 里，经 proxy 的 `store_memory` 会写进 `memories_quarantine`（recall 看不到），等 primary host（`MNEME_PRIMARY_HOST`，默认同 `MNEME_DEFAULT_HOST`）用 `resolve_quarantine` 批准后才进主库。
+- **`tools/list` 也是用同一个 bearer 开的新 session**，所以 codex 看到的工具集与该 host 直连时一致：只有该 session 的 host（含上一条按默认 host 兜底的情况）恰好是 primary host 时，才会注册 `resolve_quarantine`。
 
 ## 归档策略（上游修好后）
 
