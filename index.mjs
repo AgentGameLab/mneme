@@ -3053,7 +3053,10 @@ export function promoteMemories() {
 // Options:
 //   { tauHours = 24, bBase = 0.7, dryRun = false }
 // Returns:
-//   { processed, distribution: {high, mid, low, cold}, sample? }
+//   { processed, skipped, scanned, distribution: {high, mid, low, cold} }
+//     processed = rows written (score moved by >= 1e-4), skipped = rows left as
+//     stored, scanned = processed + skipped.
+//   dry run: { processed (= rows scanned), distribution, sample, dryRun: true }
 export function runDecayCycle(opts = {}) {
   const { tauHours = 24, bBase = 0.7, dryRun = false } = opts
   const db = getDb()
@@ -3065,7 +3068,7 @@ export function runDecayCycle(opts = {}) {
 
   try {
     const rows = db.prepare(`
-      SELECT rowid, importance, access_count, created_at, last_accessed
+      SELECT rowid, importance, access_count, created_at, last_accessed, decay_score
       FROM memories
       WHERE deleted_at IS NULL AND superseded_by IS NULL
     `).all()
@@ -3082,23 +3085,51 @@ export function runDecayCycle(opts = {}) {
       else if (score >= 0.3) distribution.mid++
       else if (score >= 0.1) distribution.low++
       else distribution.cold++
-      return { rowid: r.rowid, score }
+      const stored = (r.decay_score != null) ? r.decay_score : 1.0
+      return { rowid: r.rowid, score, stored }
     })
 
     if (dryRun) {
       const stride = Math.max(1, Math.floor(items.length / 10))
-      for (let i = 0; i < items.length; i += stride) sample.push(items[i])
+      for (let i = 0; i < items.length; i += stride) sample.push({ rowid: items[i].rowid, score: items[i].score })
       return { processed: items.length, distribution, sample, dryRun: true }
     }
 
+    // Write only rows whose score actually moved. Rewriting every active row
+    // each cycle costs one full-table transaction (and its WAL) every 30 minutes
+    // for values that did not change: rows capped at 1.0 by min(1, ...) stay
+    // unchanged while capped, and most others drift by less than EPS between cycles.
+    //
+    // Compare against the STORED value, never the previous cycle's computed one:
+    // against the stored value the error is bounded by EPS, against the previous
+    // computation it would accumulate across cycles.
+    //
+    // Nothing relies on decay_score having just been written. Every reader uses
+    // the value (recall multiplier, cold-pool gate, maintenance listings), and
+    // trg_mem_fts_update fires only on UPDATE OF content, summary, tags, so a
+    // decay_score write never touched FTS in the first place.
+    //
+    // A move smaller than EPS is still written when it crosses a band edge
+    // (0.7 / 0.3 / 0.1). Readers compare against those edges -- the cold-pool
+    // gate is decay_score >= 0.3 -- so skipping such a row would leave it on the
+    // wrong side of the gate while the returned distribution already counts it on
+    // the new side. A non-finite score is also kept in the write set, so a bad
+    // computation fails loudly (NOT NULL constraint) instead of being skipped.
+    const DECAY_WRITE_EPS = 1e-4
+    const band = (v) => (v >= 0.7 ? 3 : v >= 0.3 ? 2 : v >= 0.1 ? 1 : 0)
+    const dirty = items.filter(it =>
+      !Number.isFinite(it.score) ||
+      Math.abs(it.score - it.stored) >= DECAY_WRITE_EPS ||
+      band(it.score) !== band(it.stored))
     const updateStmt = db.prepare(`UPDATE memories SET decay_score = ? WHERE rowid = ?`)
     const tx = db.transaction((batch) => {
       for (const it of batch) updateStmt.run(it.score, it.rowid)
     })
-    tx(items)
-    processed = items.length
-    log(`runDecayCycle: ${processed} memories updated (high=${distribution.high} mid=${distribution.mid} low=${distribution.low} cold=${distribution.cold})`)
-    return { processed, distribution }
+    tx(dirty)
+    processed = dirty.length
+    const skipped = items.length - dirty.length
+    log(`runDecayCycle: ${processed} memories updated, ${skipped} unchanged (<${DECAY_WRITE_EPS}, same band) of ${items.length} scanned (high=${distribution.high} mid=${distribution.mid} low=${distribution.low} cold=${distribution.cold})`)
+    return { processed, skipped, scanned: items.length, distribution }
   } catch (e) {
     log(`runDecayCycle failed: ${e.message}`)
     return { processed, distribution, error: e.message }
