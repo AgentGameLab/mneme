@@ -4466,9 +4466,16 @@ if (_isMain) {
         process.exit(1)
       }
       const db = getDb()
+      // Dedup on (source_id, content_hash), not source_id alone. A compact summary is a
+      // running total of the session so far, so the first one is the narrowest: keying on
+      // source_id kept exactly that one and silently dropped every later, wider summary of
+      // a session that compacts more than once. Identical content still short-circuits, so
+      // a resume replaying the same summary stays a no-op. The hash is the one storeMemory
+      // writes for `content`.
+      const contentHash = createHash('sha256').update(String(summary)).digest('hex').slice(0, 16)
       const existing = db.prepare(
-        `SELECT rowid FROM memories WHERE source = 'compression' AND source_id = ? AND deleted_at IS NULL LIMIT 1`
-      ).get(sessionId)
+        `SELECT rowid FROM memories WHERE source = 'compression' AND source_id = ? AND content_hash = ? AND deleted_at IS NULL LIMIT 1`
+      ).get(sessionId, contentHash)
       if (existing) {
         process.stdout.write(`already stored (rowid ${existing.rowid})\n`)
         return
