@@ -38,7 +38,7 @@
 // you can compose them from your own tooling without spawning a child.
 // ============================================================
 
-import { existsSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createRequire } from 'node:module'
@@ -880,7 +880,19 @@ Flags:
   --help, -h              Show this help
 `
 
-if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
+// 入口判定按真实路径比：经 Windows junction / 符号链接启动时，import.meta.url 已解析成目标盘的真实路径，
+// 和 argv[1] 的链接路径字面不等，旧写法会让 CLI 静默零输出（2026-10-12 小梦 dream-pass 复现）。
+function isDirectRun() {
+  const entry = process.argv[1]
+  if (!entry) return false
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(entry)
+  } catch {
+    return import.meta.url === pathToFileURL(entry).href
+  }
+}
+
+if (isDirectRun()) {
   const opts = parseArgs(process.argv.slice(2))
   if (opts.help) {
     process.stdout.write(HELP)
