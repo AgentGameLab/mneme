@@ -236,8 +236,8 @@ let pass = 0, fail = 0
       req.on('end', () => {
         sawRequest = true
         res.writeHead(200, { 'Content-Type': 'application/json' })
-        // two hits: prompt-recall only injects once it has minConsensus of them
-        res.end(JSON.stringify({ hits: [hit(999801, 'ZZSTUBMARKER one'), hit(999802, 'ZZSTUBMARKER two')],
+        // Include the query anchor: unrelated rows must not auto-inject.
+        res.end(JSON.stringify({ hits: [hit(999801, 'ZZSTUBMARKER zzpinmarker one'), hit(999802, 'ZZSTUBMARKER zzpinmarker two')],
           count: 2, requested_limit: 5, effective_limit: 5, candidate_limit: 30, capped: false, trace_id: null }))
       })
     })

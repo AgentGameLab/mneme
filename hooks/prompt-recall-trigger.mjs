@@ -48,3 +48,35 @@ export function shouldTriggerPromptRecall(prompt) {
   if (prompt.length > 1500) return false
   return TRIGGERS.some((re) => re.test(prompt))
 }
+
+// Automatic injection needs a query anchor in each hit. Several FTS results
+// are not independent relevance evidence. Explicit semantic recall is unchanged.
+const segmenter = new Intl.Segmenter('zh', { granularity: 'word' })
+const questionWords = new Set([
+  'how', 'what', 'where', 'why', 'does', 'the', 'this', 'that', 'please',
+  '看下', '看看', '为何', '这么', '这么多', '一下', '这个', '那个', '什么',
+  '怎么', '如何', '哪里', '在哪', '帮我', '需要', '问题', '为什么', '现在', '可以', '是否', '请问',
+])
+
+export function selectPromptRecallHits(query, hits, maxVecDistance) {
+  const normalized = String(query).normalize('NFKC').toLowerCase()
+  const words = [...segmenter.segment(normalized)]
+    .filter(part => part.isWordLike)
+    .map(part => part.segment)
+  // ICU can split domain words such as 端口 into single characters.
+  const bigrams = [...normalized.matchAll(/\p{Script=Han}+/gu)].flatMap(([run]) => {
+    const chars = [...run]
+    return chars.slice(1).map((char, index) => chars[index] + char)
+  })
+  const terms = [...new Set([...words, ...bigrams])]
+    .filter(term => [...term].length >= 2 && !questionWords.has(term))
+  if (!terms.length) return []
+  return hits.filter(hit => {
+    if (hit.vec_distance != null && (
+      !Number.isFinite(hit.vec_distance) || hit.vec_distance < 0 || hit.vec_distance > maxVecDistance
+    )) return false
+    const text = [hit.summary, ...(Array.isArray(hit.tags) ? hit.tags : []), hit.content]
+      .filter(Boolean).join(' ').normalize('NFKC').toLowerCase()
+    return terms.some(term => text.includes(term))
+  })
+}

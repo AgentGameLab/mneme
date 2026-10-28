@@ -29,7 +29,6 @@
 //   MNEME_MAX_VEC_DISTANCE drop hits farther than this when the server returned
 //                          vector evidence (default: 0.95; ignored without embeddings)
 //   MNEME_LIMIT            max recall candidates (default: 5)
-//   MNEME_MIN_CONSENSUS    hide injection if hits < this (default: 2)
 //   MNEME_STATE_DIR        session-dedup file dir (default: ~/.claude/hooks)
 //   MNEME_TIMEOUT_MS       spawn timeout (default: 2800)
 //
@@ -45,7 +44,7 @@ import { spawnSync } from 'node:child_process'
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { shouldTriggerPromptRecall, userPromptText } from './prompt-recall-trigger.mjs'
+import { shouldTriggerPromptRecall, userPromptText, selectPromptRecallHits } from './prompt-recall-trigger.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const HOME = process.env.USERPROFILE || process.env.HOME || __dirname
@@ -107,7 +106,6 @@ const CFG = {
   level: process.env.MNEME_LEVEL || 'meta_knowledge,semi_abstract',
   maxVecDistance: (() => { const n = Number(process.env.MNEME_MAX_VEC_DISTANCE); return Number.isFinite(n) && n > 0 ? n : 0.95 })(),
   limit: intEnv('MNEME_LIMIT', 5),
-  minConsensus: intEnv('MNEME_MIN_CONSENSUS', 2),
   stateDir: process.env.MNEME_STATE_DIR || resolve(HOME, '.claude', 'hooks'),
   timeoutMs: intEnv('MNEME_TIMEOUT_MS', 2800),
 }
@@ -242,16 +240,8 @@ process.stdin.on('end', async () => {
   const recalled = await runRecall(query, sessionId)
   if (!recalled || !Array.isArray(recalled.hits)) process.exit(0)
 
-  // With vector evidence present, relevance is measurable — gate on it and
-  // skip the count heuristic. Without it (no embeddings), fall back to
-  // requiring agreement between several FTS hits.
-  let hits = recalled.hits
-  if (hits.some(h => typeof h.vec_distance === 'number')) {
-    hits = hits.filter(h => typeof h.vec_distance === 'number' && h.vec_distance <= CFG.maxVecDistance)
-    if (hits.length === 0) process.exit(0)
-  } else if (hits.length < CFG.minConsensus) {
-    process.exit(0)
-  }
+  const hits = selectPromptRecallHits(query, recalled.hits, CFG.maxVecDistance)
+  if (hits.length === 0) process.exit(0)
 
   const injected = loadInjected(sessionId)
   const fresh = hits.filter(h => !injected.has(h.id))
