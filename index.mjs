@@ -3988,7 +3988,12 @@ export function closeMemory() {
 
 // ── CLI Mode ────────────────────────────────────────────────
 import { fileURLToPath as _ftu } from 'node:url'
-const _isMain = process.argv[1] && resolve(process.argv[1]) === resolve(_ftu(import.meta.url))
+import { realpathSync as _realpath } from 'node:fs'
+// Compare real paths: Node resolves symlinks in import.meta.url but not in
+// argv[1], so running through a symlinked checkout (E:/project/mneme ->
+// G:/project/mneme) made _isMain false and every CLI call exited 0 silently.
+const _real = (p) => { try { return _realpath(p) } catch { return resolve(p) } }
+const _isMain = process.argv[1] && _real(process.argv[1]) === _real(_ftu(import.meta.url))
 
 if (_isMain) {
   ;(async () => {
